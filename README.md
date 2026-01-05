@@ -14,3 +14,6 @@ Create virtual environment
 Activate virtual environment
 
 > .venv\Scripts\activate
+
+Install Dependencies:
+> pip install -r requirements.txt
