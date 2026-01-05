@@ -13,6 +13,7 @@ def data_worker(conn):
             note = row[6]
             id = row[0]
             nlp_result = nlp_analysis(id, note)
+            print(nlp_result)
             llm_result = llm_analysis(id, note)
             
 
