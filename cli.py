@@ -1,4 +1,5 @@
 import argparse
+import sys
 from pathlib import Path
 
 from database import create_db, ingest_csv
@@ -9,7 +10,7 @@ from nlp_worker import nlp_worker
 def setup_parser():
     """Configure and return the argument parser."""
     parser = argparse.ArgumentParser(description="Ingest CSV into SQLite and print contents")
-    parser.add_argument("csv_file", type=Path, nargs="?", help="Path to input CSV file")
+    parser.add_argument("--csv", type=Path, help="Path to input CSV file")
     parser.add_argument("--db", type=Path, default=Path("data.db"), help="SQLite database file")
     parser.add_argument("--print", action="store_true", help="Print database contents without ingesting CSV")
     parser.add_argument("--go", action="store_true", help="Run the NLP worker function")
@@ -38,19 +39,22 @@ def main():
     parser = setup_parser()
     args = parser.parse_args()
 
+    # If no arguments provided, show help and exit
+    if not args.go and not args.print and not args.csv:
+        parser.print_help()
+        sys.exit(0)
+
     # Create database connection
     conn = create_db(args.db)
     
     try:
         # Route to appropriate handler based on arguments
         if args.go:
-            handle_nlp_worker_mode(conn, args.csv_file)
+            handle_nlp_worker_mode(conn, args.csv)
         elif args.print:
             handle_print_mode(conn)
-        elif args.csv_file:
-            handle_csv_ingest_mode(conn, args.csv_file)
-        else:
-            parser.error("Either provide a CSV file or use --print to display database contents")
+        elif args.csv:
+            handle_csv_ingest_mode(conn, args.csv)
     finally:
         conn.close()
 
