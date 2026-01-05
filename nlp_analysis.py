@@ -1,11 +1,9 @@
 import re
 import spacy
 
-# ---------- NLP ----------
 nlp = spacy.blank("en")
 nlp.add_pipe("sentencizer")
 
-# ---------- Number normalization ----------
 NUMBER_WORDS = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
     "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10
@@ -17,25 +15,23 @@ def normalize_number(text: str):
         return int(t)
     return NUMBER_WORDS.get(t)
 
-# ---------- Regex ----------
 BIOPSY_COUNT_RE = re.compile(
     r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b"
-    r"\s+(?:random\s+)?biops(?:y|ies)",
+    r".{0,40}?\bbiops",
     re.I
 )
 
 SCOPE_RE = re.compile(
-    r"\b(Olympus|Pentax|Fujifilm)\s+([A-Za-z0-9\- ]{2,30})\s+"
-    r"(?:endoscope|gastroscope)",
+    r"\b(Olympus|Pentax|Fujifilm)\s+([A-Za-z0-9\- ]{2,30})",
     re.I
 )
 
-# ---------- Semantic vocab ----------
 UPPER_PROC_TERMS = {"upper endoscopy", "egd"}
 COLON_PROC_TERMS = {"colonoscopy"}
 
 DUODENUM_TERMS = {"duodenum", "duodenal", "bulb"}
-BIOPSY_TERMS = {"biopsy", "biopsies"}
+BIOPSY_TERMS = {"biopsy", "biopsies", "biopsied"}
+NEGATION_TERMS = {"no", "not", "none", "without"}
 
 PROCEDURE_VERBS = {
     "placed", "intubated", "advanced", "inserted",
@@ -51,9 +47,12 @@ COLON_EXCLUDE_TERMS = {
 def contains_any(text: str, terms: set) -> bool:
     return any(t in text for t in terms)
 
-# ---------- Main ----------
+def has_negation(text: str) -> bool:
+    return any(n in text for n in NEGATION_TERMS)
+
 def nlp_analysis(id: int, note: str):
     doc = nlp(note)
+    sents = list(doc.sents)
 
     result = {
         "id": id,
@@ -69,10 +68,12 @@ def nlp_analysis(id: int, note: str):
         "FellowInformation": None,
     }
 
-    for sent in doc.sents:
+    duodenum_sentence_idxs = set()
+    biopsy_count_candidates = []
+
+    for i, sent in enumerate(sents):
         s = sent.text.lower()
 
-        # ---------- Endoscopy (procedural only, set once) ----------
         if (
             result["Endoscopy"] == 0
             and contains_any(s, UPPER_PROC_TERMS)
@@ -81,33 +82,26 @@ def nlp_analysis(id: int, note: str):
             result["Endoscopy"] = 1
             result["EndoscopyInformation"] = sent.text
 
-        # ---------- Colonoscopy ----------
         if result["Colonoscopy"] == 0 and contains_any(s, COLON_PROC_TERMS):
             result["Colonoscopy"] = 1
             result["ColonoscopyInformation"] = sent.text
 
-        # ---------- Scope Type (upper only) ----------
         if result["ScopeType"] is None and "endoscope" in s:
             if not contains_any(s, COLON_EXCLUDE_TERMS):
                 m = SCOPE_RE.search(sent.text)
                 if m:
                     result["ScopeType"] = f"{m.group(1)} {m.group(2)}".strip()
 
-        # ---------- Duodenal biopsies ----------
-        if (
-            contains_any(s, BIOPSY_TERMS)
-            and contains_any(s, DUODENUM_TERMS)
-            and result["NumberOfDuodenalBiopsies"] == 0
-        ):
+        if contains_any(s, DUODENUM_TERMS):
+            duodenum_sentence_idxs.add(i)
+
+        if contains_any(s, BIOPSY_TERMS) and not has_negation(s):
             m = BIOPSY_COUNT_RE.search(sent.text)
             if m:
                 count = normalize_number(m.group(1))
                 if count:
-                    result["NumberOfDuodenalBiopsies"] = count
-                    result["DuodenalBiopsiesTaken"] = 1
-                    result["DuodenalBiopsiesInformation"] = sent.text
+                    biopsy_count_candidates.append((count, i, sent.text))
 
-        # ---------- Fellow (footer only, no negation) ----------
         if (
             result["FellowPresent"] == 0
             and "fellow" in s
@@ -116,5 +110,20 @@ def nlp_analysis(id: int, note: str):
         ):
             result["FellowPresent"] = 1
             result["FellowInformation"] = sent.text
+
+    for count, idx, text in biopsy_count_candidates:
+        if any(abs(idx - d) <= 2 for d in duodenum_sentence_idxs):
+            result["NumberOfDuodenalBiopsies"] = count
+            result["DuodenalBiopsiesTaken"] = 1
+            result["DuodenalBiopsiesInformation"] = text
+            break
+
+    if result["DuodenalBiopsiesTaken"] == 0:
+        for i in duodenum_sentence_idxs:
+            s = sents[i].text.lower()
+            if contains_any(s, BIOPSY_TERMS) and not has_negation(s):
+                result["DuodenalBiopsiesTaken"] = 1
+                result["DuodenalBiopsiesInformation"] = sents[i].text
+                break
 
     return result
