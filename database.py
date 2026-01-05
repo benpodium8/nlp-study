@@ -15,6 +15,28 @@ CREATE TABLE IF NOT EXISTS notes (
 );
 """
 
+RESULTS_TABLE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS results (
+    id INTEGER PRIMARY KEY,
+    ScopeTypeNLP TEXT,
+    ColonoscopyNLP INTEGER,
+    ColonoscopyInformationNLP TEXT,
+    NumberOfDuodenalBiopsiesNLP INTEGER,
+    DuodenalBiopsiesInformationNLP TEXT,
+    FellowPresentNLP INTEGER,
+    FellowInformationNLP TEXT,
+    ScopeTypeLLM TEXT,
+    ColonoscopyLLM INTEGER,
+    ColonoscopyInformationLLM TEXT,
+    NumberOfDuodenalBiopsiesLLM INTEGER,
+    DuodenalBiopsiesInformationLLM TEXT,
+    FellowPresentLLM INTEGER,
+    FellowInformationLLM TEXT,
+    AllDataInAgreement INTEGER,
+    FOREIGN KEY (id) REFERENCES notes(id)
+);
+"""
+
 
 INSERT_SQL = """
 INSERT INTO notes (
@@ -42,6 +64,7 @@ def create_db(db_path: Path):
     conn = sqlite3.connect(db_path)
     with conn:
         conn.execute(TABLE_SCHEMA)
+        conn.execute(RESULTS_TABLE_SCHEMA)
     return conn
 
 
