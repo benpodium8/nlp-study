@@ -1,5 +1,3 @@
-import spacy
-import medspacy
 from database import SELECT_ALL_SQL
 from nlp_analysis import nlp_analysis
 from llm_analysis import llm_analysis
