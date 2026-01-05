@@ -1,5 +1,7 @@
 # nlp-study
 
+## Setup
+
 Python version: Python 3.12.10
 
 If at any point you get an error similar to
