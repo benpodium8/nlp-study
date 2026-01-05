@@ -4,7 +4,7 @@ from pathlib import Path
 
 from database import create_db, ingest_csv
 from display import print_db_contents
-from nlp_worker import nlp_worker
+from data_worker import data_worker
 
 
 def setup_parser():
@@ -17,11 +17,11 @@ def setup_parser():
     return parser
 
 
-def handle_nlp_worker_mode(conn, csv_file):
+def handle_data_worker_mode(conn, csv_file):
     """Handle --go mode: ingest CSV if provided, then run NLP worker."""
     if csv_file:
         ingest_csv(csv_file, conn)
-    nlp_worker(conn)
+    data_worker(conn)
 
 
 def handle_print_mode(conn):
@@ -50,7 +50,7 @@ def main():
     try:
         # Route to appropriate handler based on arguments
         if args.go:
-            handle_nlp_worker_mode(conn, args.csv)
+            handle_data_worker_mode(conn, args.csv)
         elif args.print:
             handle_print_mode(conn)
         elif args.csv:
