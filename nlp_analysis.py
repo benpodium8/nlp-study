@@ -15,9 +15,13 @@ def normalize_number(text: str):
         return int(t)
     return NUMBER_WORDS.get(t)
 
-BIOPSY_COUNT_RE = re.compile(
-    r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b"
-    r".{0,40}?\bbiops",
+BIOPSY_COUNT_PREFIX_RE = re.compile(
+    r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b.{0,40}?\bbiops",
+    re.I
+)
+
+BIOPSY_COUNT_SUFFIX_RE = re.compile(
+    r"\bbiops(?:y|ies)\b.{0,40}?\b(\d+)\b",
     re.I
 )
 
@@ -90,13 +94,22 @@ def nlp_analysis(id: int, note: str):
             if not contains_any(s, COLON_EXCLUDE_TERMS):
                 m = SCOPE_RE.search(sent.text)
                 if m:
-                    result["ScopeType"] = f"{m.group(1)} {m.group(2)}".strip()
+                    scope = f"{m.group(1)} {m.group(2)}".strip()
+                    scope = re.sub(r"\s+endoscope$", "", scope, flags=re.I)
+                    result["ScopeType"] = scope
+
+        if result["Endoscopy"] == 0:
+            if "esophagus" in s and "endoscope" in s and not contains_any(s, COLON_EXCLUDE_TERMS):
+                result["Endoscopy"] = 1
+                result["EndoscopyInformation"] = sent.text
 
         if contains_any(s, DUODENUM_TERMS):
             duodenum_sentence_idxs.add(i)
 
         if contains_any(s, BIOPSY_TERMS) and not has_negation(s):
-            m = BIOPSY_COUNT_RE.search(sent.text)
+            m = BIOPSY_COUNT_PREFIX_RE.search(sent.text)
+            if not m:
+                m = BIOPSY_COUNT_SUFFIX_RE.search(sent.text)
             if m:
                 count = normalize_number(m.group(1))
                 if count:
