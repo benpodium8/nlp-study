@@ -1,6 +1,7 @@
 from database import SELECT_ALL_SQL
 from nlp_analysis import nlp_analysis
 from llm_analysis import llm_analysis
+from display import print_nlp_results
 
 def data_worker(conn):
     print("Data worker started")
@@ -13,7 +14,8 @@ def data_worker(conn):
             note = row[6]
             id = row[0]
             nlp_result = nlp_analysis(id, note)
-            print(nlp_result)
+            print_nlp_results(nlp_result)
+            
             llm_result = llm_analysis(id, note)
             
 
