@@ -1,15 +1,10 @@
 import spacy
 import medspacy
 from database import SELECT_ALL_SQL
+from nlp_analysis import nlp_analysis
+from llm_analysis import llm_analysis
 
-def nlp_analysis(id: int, note: str):
-    print(id, note[0:10])
-    return {
-        "id": id,
-        "note": note,
-    }
-
-def data_worker(conn=None):
+def data_worker(conn):
     print("Data worker started")
 
     if conn is not None:
@@ -19,7 +14,9 @@ def data_worker(conn=None):
         for row in rows:
             note = row[6]
             id = row[0]
-            nlp_analysis(id, note)
+            nlp_result = nlp_analysis(id, note)
+            llm_result = llm_analysis(id, note)
+            
 
 
 
