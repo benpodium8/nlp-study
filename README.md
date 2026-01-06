@@ -21,3 +21,9 @@ Activate virtual environment
 
 Install Dependencies:
 > pip install -r requirements.txt
+
+Start program: 
+> python app.py
+> python app.py --csv ../../../Downloads/endoscopy_notes.csv
+> python app.py --print
+> python app.py --go

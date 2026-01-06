@@ -1,6 +1,6 @@
 import ollama
 
-MODEL = "gemma2:2b"
+LOCAL_MODEL = "gemma2:2b"
 
 
 def llm_analysis(id: int, note: str):
@@ -16,7 +16,7 @@ def llm_analysis(id: int, note: str):
         }
     ]
     # Send the request to the local Ollama service
-    response = ollama.chat(model='llama3', messages=messages)
+    response = ollama.chat(model=LOCAL_MODEL, messages=messages)
 
     # Print the model's response
     print(response['message']['content'])
