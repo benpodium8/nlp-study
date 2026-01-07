@@ -4,14 +4,14 @@ from rich.table import Table
 
 from database import fetch_all_notes
 
-def print_nlp_results(nlp_result):
-    print(f"ID: {nlp_result['id']}")
-    print(f"ScopeType: {nlp_result['ScopeType']}")
-    print(f"Colonoscopy: {nlp_result['Colonoscopy']}")
-    print(f"Endoscopy: {nlp_result['Endoscopy']}")
-    print(f"Number of Duodenal Biopsies: {nlp_result['NumberOfDuodenalBiopsies']}")
-    print(f"Duodenal Biopsies Taken: {nlp_result['DuodenalBiopsiesTaken']}")
-    print(f"Fellow Present: {nlp_result['FellowPresent']}")
+def print_nlp_llm_result(result):
+    print(f"ID: {result['id']}")
+    print(f"ScopeType: {result['ScopeType']}")
+    print(f"Colonoscopy: {result['Colonoscopy']}")
+    print(f"Endoscopy: {result['Endoscopy']}")
+    print(f"Number of Duodenal Biopsies: {result['NumberOfDuodenalBiopsies']}")
+    print(f"Duodenal Biopsies Taken: {result['DuodenalBiopsiesTaken']}")
+    print(f"Fellow Present: {result['FellowPresent']}")
     print("-" * 50)
 
 def print_db_contents(conn: sqlite3.Connection, include_note: bool = False):

@@ -1,52 +1,176 @@
+import json
 import ollama
 
 LOCAL_MODEL = "gemma2:2b"
 
+EXPECTED_FIELDS = {
+    "id": int,
+    "ScopeType": (str, type(None)),
+    "Colonoscopy": int,
+    "ColonoscopyInformation": (str, type(None)),
+    "Endoscopy": int,
+    "EndoscopyInformation": (str, type(None)),
+    "NumberOfDuodenalBiopsies": int,
+    "DuodenalBiopsiesTaken": int,
+    "DuodenalBiopsiesInformation": (str, type(None)),
+    "FellowPresent": int,
+    "FellowInformation": (str, type(None)),
+}
 
-def llm_analysis(id: int, note: str):
+import re
 
+JSON_FENCE_RE = re.compile(
+    r"^\s*```(?:json)?\s*(.*?)\s*```\s*$",
+    re.DOTALL | re.IGNORECASE
+)
+
+def _strip_markdown_fences(text: str) -> str:
+    """
+    Removes ``` or ```json fences if present.
+    Leaves content unchanged otherwise.
+    """
+    m = JSON_FENCE_RE.match(text)
+    if m:
+        return m.group(1).strip()
+    return text.strip()
+
+
+class LLMAnalysisError(Exception):
+    """Raised when LLM output is invalid or unreliable."""
+
+
+def _validate_llm_result(result: dict):
+    for field, expected_type in EXPECTED_FIELDS.items():
+        if field not in result:
+            raise LLMAnalysisError(f"Missing field: {field}")
+
+        if not isinstance(result[field], expected_type):
+            raise LLMAnalysisError(
+                f"Invalid type for '{field}': "
+                f"expected {expected_type}, got {type(result[field])}"
+            )
+
+
+def llm_analysis(id: int, note: str) -> dict:
     messages = [
-        {
-            'role': 'system',
-            'content': 
-            f'''
-            You are an API that parses through clinical notes and provides accurate and concise analysis. 
-            Return a single JSON object that contains the required information from the parsed data.
-            Replace all placeholder description values with the actual values found in the clinical note.
-            Your response should start with {{ and end with }}. 
+    {
+            "role": "system",
+            "content": """
+                You are a strict clinical information extraction API.
 
-            This is the data that you need to provide:
-            {{
-                "ScopeType": "The type of endoscope used for each procedure. Here we are looking for the type of endoscope used for each procedure. This will be something like "The patient's esophagus was easily intubated with an Olympus H190 endoscope" with the "Olympus H190" being the part I want extracted. Some notes will mention a colonoscope or the type of scopes using in colonoscopy. We do not want this colonoscope here.",
-                "Colonoscopy": "Was a colonoscopy performed yes or no. 1 for yes or 0 for no.",
-                "ColonoscopyInformation": "Extra information about the colonoscopy if it was performed.",
-                "Endoscopy": "Was an endoscopy performed yes or no. 1 for yes or 0 for no.",
-                "EndoscopyInformation": "Extra information about the endoscopy if it was performed.",
-                "NumberOfDuodenalBiopsies": "This is the most important field. Here we want the number of biopsies taken specifically from the part of the small intestine called the duodenum. Look for sentences like "6 biopsies were taken of the duodenum for histopathology." With the number being the only thing that needs to be reported. Watch for the term "bulb" or "bulb of the duodenum" this is also part of the duodenum and should be reported but may be included in the number reported earlier depending on the language used.",
-                "DuodenalBiopsiesTaken": "Was at least one biopsy of the duodenum taken yes or no. 1 for yes or 0 for no.",
-                "DuodenalBiopsiesInformation": "Extra information about duodenal biopsy or biopsies if taken",
-                "FellowPresent": "Was someone at the stage of training known as fellowship was present. Typically this would be at the end of each note and their name along with the attending physicians name would be present yes or no. 1 for yes or 0 for no.",
-                "FellowInformation": "Extra information about the fellow or fellows if present.",
-            }}
-            '''
+                CRITICAL OUTPUT RULES:
+                - Return ONLY valid JSON.
+                - No markdown, no explanations, no comments.
+                - The response MUST start with { and end with }.
+                - Do NOT guess or infer missing information.
+                - If information is not explicitly stated, use null or 0 as appropriate.
+                - Use integers 1 or 0 for all boolean fields.
+
+                MATCH THIS SCHEMA EXACTLY:
+                {
+                    "ScopeType": string | null,
+                    "Colonoscopy": 0 | 1,
+                    "ColonoscopyInformation": string | null,
+                    "Endoscopy": 0 | 1,
+                    "EndoscopyInformation": string | null,
+                    "NumberOfDuodenalBiopsies": integer,
+                    "DuodenalBiopsiesTaken": 0 | 1,
+                    "DuodenalBiopsiesInformation": string | null,
+                    "FellowPresent": 0 | 1,
+                    "FellowInformation": string | null
+                }
+
+                FIELD-SPECIFIC EXTRACTION RULES:
+
+                1) ScopeType
+                - Extract ONLY the brand + model of an UPPER endoscope.
+                - Examples: "Olympus H190", "Pentax EG-2990i"
+                - Look for phrases like:
+                - "intubated with an Olympus H190 endoscope"
+                - "advanced using a Fujifilm endoscope"
+                - EXCLUDE colonoscopes and colonoscopy scopes.
+                - If the scope is associated with colonoscopy or colon terms, DO NOT extract it.
+                - If unclear or absent, return null.
+
+                2) Colonoscopy
+                - Set to 1 ONLY if a colonoscopy was performed.
+                - Trigger terms include "colonoscopy".
+                - Otherwise set to 0.
+
+                3) ColonoscopyInformation
+                - If Colonoscopy == 1, include the most relevant sentence describing it.
+                - Otherwise return null.
+
+                4) Endoscopy
+                - Set to 1 ONLY if an UPPER endoscopy / EGD was performed.
+                - Trigger terms include:
+                - "upper endoscopy"
+                - "EGD"
+                - Esophagus + endoscope use
+                - Otherwise set to 0.
+
+                5) EndoscopyInformation
+                - If Endoscopy == 1, include the most relevant sentence describing it.
+                - Otherwise return null.
+
+                6) NumberOfDuodenalBiopsies (MOST IMPORTANT)
+                - Extract the NUMBER of biopsies taken from the duodenum.
+                - Duodenum includes:
+                - "duodenum"
+                - "duodenal"
+                - "bulb" or "bulb of the duodenum"
+                - Only report a number if the biopsies are clearly associated with the duodenum.
+                - If multiple biopsy numbers are mentioned, prefer the one closest to duodenal terms.
+                - If no explicit number is stated, return 0.
+                - Do NOT sum numbers unless explicitly stated as total duodenal biopsies.
+
+                7) DuodenalBiopsiesTaken
+                - Set to 1 if at least one duodenal biopsy was taken.
+                - Set to 0 otherwise.
+
+                8) DuodenalBiopsiesInformation
+                - If duodenal biopsies were taken, include the most relevant sentence.
+                - Otherwise return null.
+
+                9) FellowPresent
+                - Set to 1 ONLY if a fellow is explicitly mentioned.
+                - Fellow information typically appears near the END of the note.
+                - If the note explicitly states no fellow, set to 0.
+                - Otherwise set to 0.
+
+                10) FellowInformation
+                - If FellowPresent == 1, include the sentence mentioning the fellow.
+                - Otherwise return null.
+
+                ABSOLUTE RULE:
+                If a value is not explicitly stated in the text, DO NOT infer it.
+                """
         },
         {
-            'role': 'user',
-            'content': f'''
-                    Parse this clinical note, following the line break and contained in double quotes: 
-                    <br />
-                    "{note}".
+            "role": "user",
+            "content": f'''
+                Parse the following clinical note and extract the structured data.
+
+                "{note}"
             '''
         }
     ]
-    # Send the request to the local Ollama service
+
+
     response = ollama.chat(model=LOCAL_MODEL, messages=messages)
+    
 
-    # Print the model's response
-    print(response['message']['content'])
+    raw = response["message"]["content"]
+    clean = _strip_markdown_fences(raw)
 
+    try:
+        parsed = json.loads(clean)
+    except json.JSONDecodeError as e:
+        raise LLMAnalysisError(f"Invalid JSON returned by LLM: {e}")
 
-    return {
-        "id": id,
-        "note": note,
-    }
+    # Inject id explicitly (never trust the LLM for this)
+    parsed["id"] = id
+
+    _validate_llm_result(parsed)
+
+    return parsed
