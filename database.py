@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS notes (
 );
 """
 
-RESULTS_TABLE_SCHEMA = """
+WORKING_RESULTS_TABLE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS working_results (
     id INTEGER PRIMARY KEY,
     ScopeType_NLP TEXT,
@@ -68,11 +68,11 @@ WHERE mrn = ? AND encounter = ? AND note_csn_id = ?
 
 
 def create_db(db_path: Path):
-    """Creates SQLite database and tables (notes, results). Returns database connection."""
+    """Creates SQLite database and tables (notes, working_results). Returns database connection."""
     conn = sqlite3.connect(db_path)
     with conn:
         conn.execute(TABLE_SCHEMA)
-        conn.execute(RESULTS_TABLE_SCHEMA)
+        conn.execute(WORKING_RESULTS_TABLE_SCHEMA)
     return conn
 
 
