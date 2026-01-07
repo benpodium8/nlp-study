@@ -25,14 +25,33 @@ def data_worker(conn):
 
             llm_result = None
             raw_llm_response = None
-            try:
-                llm_result, raw_llm_response = llm_analysis(id, note)
-                print_nlp_llm_result(llm_result)
-            except LLMAnalysisError as e:
-                print(f"[LLM ERROR] id={id} → {e}")
-                # Continue to insert NLP results even if LLM fails
+            max_retries = 5
+            retry_count = 0
+            success = False
             
-            # Insert results into database
+            # Retry loop: attempt LLM analysis up to max_retries times for JSON errors
+            # No database operations occur during this loop
+            while retry_count < max_retries and not success:
+                try:
+                    llm_result, raw_llm_response = llm_analysis(id, note)
+                    print_nlp_llm_result(llm_result)
+                    success = True
+                except LLMAnalysisError as e:
+                    error_msg = str(e)
+                    # Check if this is a JSON error (as opposed to validation error)
+                    is_json_error = "Invalid JSON" in error_msg or "JSONDecodeError" in error_msg
+                    
+                    if is_json_error and retry_count < max_retries - 1:
+                        retry_count += 1
+                        print(f"[LLM JSON ERROR] id={id} → {e} (retry {retry_count}/{max_retries})")
+                    else:
+                        print(f"[LLM ERROR] id={id} → {e}")
+                        if is_json_error:
+                            print(f"[LLM ERROR] Failed after {max_retries} retry attempts")
+                        # Continue to insert NLP results even if LLM fails
+                        break
+            
+            # Database insertion only happens after retry loop completes (success or failure)
             insert_working_result(conn, id, nlp_result, llm_result, raw_llm_response)
             print(f"Inserted results for id={id}")
             

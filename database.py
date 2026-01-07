@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS working_results (
     FellowPresent_LLM INTEGER,
     FellowInformation_LLM TEXT,
     RawResponse_LLM TEXT,
-    AllDataInAgreement INTEGER,
+    AllHardDataInAgreement INTEGER,
     FOREIGN KEY (id) REFERENCES notes(id)
 );
 """
@@ -157,7 +157,7 @@ INSERT INTO working_results (
     FellowPresent_LLM,
     FellowInformation_LLM,
     RawResponse_LLM,
-    AllDataInAgreement
+    AllHardDataInAgreement
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 """
 
@@ -177,20 +177,20 @@ def insert_working_result(
     raw_llm_response: str = None
 ):
     """Inserts or updates working_result with NLP and optional LLM data. Returns None."""
-    # Calculate AllDataInAgreement if both results exist
-    all_in_agreement = None
+    # Calculate hard data agreement if both results exist
+    all_hard_data_in_agreement = None
     if llm_result is not None:
-        # Compare all fields except id and information fields
+        # Compare only numerical fields
         comparison_fields = [
-            "ScopeType", "Colonoscopy", "Endoscopy",
+            "Colonoscopy", "Endoscopy",
             "NumberOfDuodenalBiopsies", "DuodenalBiopsiesTaken", "FellowPresent"
         ]
-        all_in_agreement = 1
+        all_hard_data_in_agreement = 1
         for field in comparison_fields:
             nlp_val = nlp_result.get(field)
             llm_val = llm_result.get(field)
             if nlp_val != llm_val:
-                all_in_agreement = 0
+                all_hard_data_in_agreement = 0
                 break
     
     values = (
@@ -216,7 +216,7 @@ def insert_working_result(
         llm_result.get("FellowPresent") if llm_result else None,
         llm_result.get("FellowInformation") if llm_result else None,
         raw_llm_response,
-        all_in_agreement
+        all_hard_data_in_agreement
     )
     
     with conn:
