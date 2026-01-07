@@ -11,7 +11,6 @@ def setup_parser():
     """Configure and return the argument parser."""
     parser = argparse.ArgumentParser(description="Ingest CSV into SQLite and print contents")
     parser.add_argument("--csv", type=Path, help="Path to input CSV file")
-    parser.add_argument("--db", type=Path, default=Path("data.db"), help="SQLite database file")
     parser.add_argument("--print", action="store_true", help="Print database contents without ingesting CSV")
     parser.add_argument("--go", action="store_true", help="Run the NLP worker function")
     return parser
@@ -45,7 +44,7 @@ def main():
         sys.exit(0)
 
     # Create database connection
-    conn = create_db(args.db)
+    conn = create_db(Path("data.db"))
     
     try:
         # Route to appropriate handler based on arguments
