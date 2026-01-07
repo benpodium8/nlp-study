@@ -8,7 +8,7 @@ from data_worker import data_worker
 
 
 def setup_parser():
-    """Configure and return the argument parser."""
+    """Creates and configures command-line argument parser. Returns ArgumentParser instance."""
     parser = argparse.ArgumentParser(description="Ingest CSV into SQLite and print contents")
     parser.add_argument("--csv", type=Path, help="Path to input CSV file")
     parser.add_argument("--print", action="store_true", help="Print database contents without ingesting CSV")
@@ -17,37 +17,35 @@ def setup_parser():
 
 
 def handle_data_worker_mode(conn, csv_file):
-    """Handle --go mode: ingest CSV if provided, then run NLP worker."""
+    """Ingests CSV if provided, then runs NLP/LLM analysis on all notes. Returns None."""
     if csv_file:
         ingest_csv(csv_file, conn)
     data_worker(conn)
 
 
 def handle_print_mode(conn):
-    """Handle --print mode: display database contents with note column."""
+    """Prints all database contents including notes. Returns None."""
     print_db_contents(conn, include_note=True)
 
 
 def handle_csv_ingest_mode(conn, csv_file):
-    """Handle CSV ingestion mode: ingest CSV and display contents without note column."""
+    """Ingests CSV file into database and prints contents without notes. Returns None."""
     ingest_csv(csv_file, conn)
     print_db_contents(conn, include_note=False)
 
 
 def main():
+    """Main entry point: parses arguments and executes appropriate mode. Returns None."""
     parser = setup_parser()
     args = parser.parse_args()
 
-    # If no arguments provided, show help and exit
     if not args.go and not args.print and not args.csv:
         parser.print_help()
         sys.exit(0)
 
-    # Create database connection
     conn = create_db(Path("data.db"))
     
     try:
-        # Route to appropriate handler based on arguments
         if args.go:
             handle_data_worker_mode(conn, args.csv)
         elif args.print:

@@ -10,6 +10,7 @@ NUMBER_WORDS = {
 }
 
 def normalize_number(text: str):
+    """Converts text number (digit or word) to integer. Returns int or None if invalid."""
     t = text.lower()
     if t.isdigit():
         return int(t)
@@ -49,12 +50,15 @@ COLON_EXCLUDE_TERMS = {
 }
 
 def contains_any(text: str, terms: set) -> bool:
+    """Checks if text contains any term from set. Returns bool."""
     return any(t in text for t in terms)
 
 def has_negation(text: str) -> bool:
+    """Checks if text contains negation terms. Returns bool."""
     return any(n in text for n in NEGATION_TERMS)
 
 def nlp_analysis(id: int, note: str):
+    """Analyzes clinical note using NLP to extract structured data. Returns dict with extracted fields."""
     doc = nlp(note)
     sents = list(doc.sents)
 

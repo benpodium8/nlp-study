@@ -67,6 +67,7 @@ WHERE mrn = ? AND encounter = ? AND note_csn_id = ?
 
 
 def create_db(db_path: Path):
+    """Creates SQLite database and tables (notes, results). Returns database connection."""
     conn = sqlite3.connect(db_path)
     with conn:
         conn.execute(TABLE_SCHEMA)
@@ -75,6 +76,7 @@ def create_db(db_path: Path):
 
 
 def ingest_csv(csv_path: Path, conn: sqlite3.Connection):
+    """Reads CSV file and inserts rows into database, skipping duplicates. Returns None."""
     with csv_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
 
@@ -123,5 +125,5 @@ def ingest_csv(csv_path: Path, conn: sqlite3.Connection):
 
 
 def fetch_all_notes(conn: sqlite3.Connection):
-    """Fetch all notes from the database and return cursor with results."""
+    """Executes query to fetch all notes from database. Returns cursor."""
     return conn.execute(SELECT_ALL_SQL)

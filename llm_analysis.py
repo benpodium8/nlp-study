@@ -25,10 +25,7 @@ JSON_FENCE_RE = re.compile(
 )
 
 def _strip_markdown_fences(text: str) -> str:
-    """
-    Removes ``` or ```json fences if present.
-    Leaves content unchanged otherwise.
-    """
+    """Removes markdown code fences (```json ... ```) from text. Returns cleaned string."""
     m = JSON_FENCE_RE.match(text)
     if m:
         return m.group(1).strip()
@@ -36,10 +33,11 @@ def _strip_markdown_fences(text: str) -> str:
 
 
 class LLMAnalysisError(Exception):
-    """Raised when LLM output is invalid or unreliable."""
+    pass
 
 
 def _validate_llm_result(result: dict):
+    """Validates LLM result structure and field types. Raises LLMAnalysisError if invalid. Returns None."""
     for field, expected_type in EXPECTED_FIELDS.items():
         if field not in result:
             raise LLMAnalysisError(f"Missing field: {field}")
@@ -52,6 +50,7 @@ def _validate_llm_result(result: dict):
 
 
 def llm_analysis(id: int, note: str) -> dict:
+    """Analyzes clinical note using LLM to extract structured data. Returns dict with extracted fields."""
     messages = [
     {
             "role": "system",
@@ -168,7 +167,6 @@ def llm_analysis(id: int, note: str) -> dict:
     except json.JSONDecodeError as e:
         raise LLMAnalysisError(f"Invalid JSON returned by LLM: {e}")
 
-    # Inject id explicitly (never trust the LLM for this)
     parsed["id"] = id
 
     _validate_llm_result(parsed)
