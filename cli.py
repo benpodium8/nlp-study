@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 
 from database import create_db, ingest_csv
-from display import print_db_contents
+from display import print_db_contents, print_working_results
 from data_worker import data_worker
 
 
@@ -16,6 +16,7 @@ def setup_parser():
             Examples:
             %(prog)s --csv data.csv                    # Ingest CSV and display summary
             %(prog)s --print                           # Display all database contents
+            %(prog)s --results                          # Display working results table
             %(prog)s --analyze                         # Run NLP and LLM analysis on all notes
             %(prog)s --csv data.csv --analyze          # Ingest CSV then analyze
         """
@@ -41,6 +42,12 @@ def setup_parser():
         help="Run NLP and LLM analysis on all notes in the database"
     )
     
+    parser.add_argument(
+        "--results",
+        action="store_true",
+        help="Display working results table (NLP and LLM analysis results)"
+    )
+    
     return parser
 
 
@@ -62,12 +69,17 @@ def handle_csv_ingest_mode(conn, csv_file):
     print_db_contents(conn, include_note=False)
 
 
+def handle_results_mode(conn):
+    """Prints working results table. Returns None."""
+    print_working_results(conn)
+
+
 def main():
     """Main entry point: parses arguments and executes appropriate mode. Returns None."""
     parser = setup_parser()
     args = parser.parse_args()
 
-    if not args.analyze and not args.print and not args.csv:
+    if not args.analyze and not args.print and not args.csv and not args.results:
         parser.print_help()
         sys.exit(0)
 
@@ -83,6 +95,8 @@ def main():
             handle_data_worker_mode(conn, args.csv)
         elif args.print:
             handle_print_mode(conn)
+        elif args.results:
+            handle_results_mode(conn)
         elif args.csv:
             handle_csv_ingest_mode(conn, args.csv)
     finally:

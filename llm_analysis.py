@@ -1,4 +1,5 @@
 import json
+from typing import Tuple
 import ollama
 
 LOCAL_MODEL = "gemma2:2b"
@@ -49,8 +50,8 @@ def _validate_llm_result(result: dict):
             )
 
 
-def llm_analysis(id: int, note: str) -> dict:
-    """Analyzes clinical note using LLM to extract structured data. Returns dict with extracted fields."""
+def llm_analysis(id: int, note: str) -> Tuple[dict, str]:
+    """Analyzes clinical note using LLM to extract structured data. Returns tuple of (dict with extracted fields, raw response string)."""
     messages = [
     {
             "role": "system",
@@ -171,4 +172,4 @@ def llm_analysis(id: int, note: str) -> dict:
 
     _validate_llm_result(parsed)
 
-    return parsed
+    return parsed, raw

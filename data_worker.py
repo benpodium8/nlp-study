@@ -1,4 +1,4 @@
-from database import SELECT_ALL_SQL
+from database import SELECT_ALL_SQL, check_result_exists, insert_working_result
 from nlp_analysis import nlp_analysis
 from llm_analysis import llm_analysis, LLMAnalysisError
 from display import print_nlp_llm_result
@@ -14,15 +14,27 @@ def data_worker(conn):
         for row in rows:
             note = row[6]
             id = row[0]
+            
+            # Skip if result already exists
+            if check_result_exists(conn, id):
+                print(f"Skipping id={id} (result already exists)")
+                continue
+            
             nlp_result = nlp_analysis(id, note)
             print_nlp_llm_result(nlp_result)
 
+            llm_result = None
+            raw_llm_response = None
             try:
-                llm_result = llm_analysis(id, note)
+                llm_result, raw_llm_response = llm_analysis(id, note)
                 print_nlp_llm_result(llm_result)
             except LLMAnalysisError as e:
                 print(f"[LLM ERROR] id={id} → {e}")
-                continue
+                # Continue to insert NLP results even if LLM fails
+            
+            # Insert results into database
+            insert_working_result(conn, id, nlp_result, llm_result, raw_llm_response)
+            print(f"Inserted results for id={id}")
             
 
 

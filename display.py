@@ -50,3 +50,53 @@ def print_db_contents(conn: sqlite3.Connection, include_note: bool = False):
     
     console.print("\n")
     console.print(table)
+
+
+SELECT_WORKING_RESULTS_SQL = "SELECT * FROM working_results ORDER BY id;"
+
+
+def print_working_results(conn: sqlite3.Connection):
+    """Displays working_results table as formatted table. Returns None."""
+    cursor = conn.execute(SELECT_WORKING_RESULTS_SQL)
+    columns = [description[0] for description in cursor.description]
+    rows = cursor.fetchall()
+    
+    if not rows:
+        console = Console()
+        console.print("\n[bold yellow]No working results found in database.[/bold yellow]\n")
+        return
+    
+    console = Console()
+    table = Table(title="Working Results", show_header=True, header_style="bold cyan")
+    
+    # Add all columns
+    for col in columns:
+        table.add_column(col)
+    
+    # Add rows with appropriate truncation for long fields
+    for row in rows:
+        row_values = []
+        for i, value in enumerate(row):
+            if value is None:
+                row_values.append("")
+            elif columns[i] == "RawResponse_LLM":
+                # Truncate raw response (can be very long)
+                str_value = str(value)
+                if len(str_value) > 50:
+                    row_values.append(str_value[:47] + "...")
+                else:
+                    row_values.append(str_value)
+            elif "Information" in columns[i]:
+                # Truncate information fields
+                str_value = str(value)
+                if len(str_value) > 40:
+                    row_values.append(str_value[:37] + "...")
+                else:
+                    row_values.append(str_value)
+            else:
+                row_values.append(str(value))
+        
+        table.add_row(*row_values)
+    
+    console.print("\n")
+    console.print(table)

@@ -128,3 +128,96 @@ def ingest_csv(csv_path: Path, conn: sqlite3.Connection):
 def fetch_all_notes(conn: sqlite3.Connection):
     """Executes query to fetch all notes from database. Returns cursor."""
     return conn.execute(SELECT_ALL_SQL)
+
+
+CHECK_RESULT_EXISTS_SQL = "SELECT COUNT(*) FROM working_results WHERE id = ?;"
+
+
+INSERT_WORKING_RESULT_SQL = """
+INSERT INTO working_results (
+    id,
+    ScopeType_NLP,
+    Colonoscopy_NLP,
+    ColonoscopyInformation_NLP,
+    Endoscopy_NLP,
+    EndoscopyInformation_NLP,
+    NumberOfDuodenalBiopsies_NLP,
+    DuodenalBiopsiesTaken_NLP,
+    DuodenalBiopsiesInformation_NLP,
+    FellowPresent_NLP,
+    FellowInformation_NLP,
+    ScopeType_LLM,
+    Colonoscopy_LLM,
+    ColonoscopyInformation_LLM,
+    Endoscopy_LLM,
+    EndoscopyInformation_LLM,
+    NumberOfDuodenalBiopsies_LLM,
+    DuodenalBiopsiesTaken_LLM,
+    DuodenalBiopsiesInformation_LLM,
+    FellowPresent_LLM,
+    FellowInformation_LLM,
+    RawResponse_LLM,
+    AllDataInAgreement
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+"""
+
+
+def check_result_exists(conn: sqlite3.Connection, id: int) -> bool:
+    """Checks if a working_result already exists for the given id. Returns bool."""
+    cursor = conn.execute(CHECK_RESULT_EXISTS_SQL, (id,))
+    count = cursor.fetchone()[0]
+    return count > 0
+
+
+def insert_working_result(
+    conn: sqlite3.Connection,
+    id: int,
+    nlp_result: dict,
+    llm_result: dict = None,
+    raw_llm_response: str = None
+):
+    """Inserts or updates working_result with NLP and optional LLM data. Returns None."""
+    # Calculate AllDataInAgreement if both results exist
+    all_in_agreement = None
+    if llm_result is not None:
+        # Compare all fields except id and information fields
+        comparison_fields = [
+            "ScopeType", "Colonoscopy", "Endoscopy",
+            "NumberOfDuodenalBiopsies", "DuodenalBiopsiesTaken", "FellowPresent"
+        ]
+        all_in_agreement = 1
+        for field in comparison_fields:
+            nlp_val = nlp_result.get(field)
+            llm_val = llm_result.get(field)
+            if nlp_val != llm_val:
+                all_in_agreement = 0
+                break
+    
+    values = (
+        id,
+        nlp_result.get("ScopeType"),
+        nlp_result.get("Colonoscopy"),
+        nlp_result.get("ColonoscopyInformation"),
+        nlp_result.get("Endoscopy"),
+        nlp_result.get("EndoscopyInformation"),
+        nlp_result.get("NumberOfDuodenalBiopsies"),
+        nlp_result.get("DuodenalBiopsiesTaken"),
+        nlp_result.get("DuodenalBiopsiesInformation"),
+        nlp_result.get("FellowPresent"),
+        nlp_result.get("FellowInformation"),
+        llm_result.get("ScopeType") if llm_result else None,
+        llm_result.get("Colonoscopy") if llm_result else None,
+        llm_result.get("ColonoscopyInformation") if llm_result else None,
+        llm_result.get("Endoscopy") if llm_result else None,
+        llm_result.get("EndoscopyInformation") if llm_result else None,
+        llm_result.get("NumberOfDuodenalBiopsies") if llm_result else None,
+        llm_result.get("DuodenalBiopsiesTaken") if llm_result else None,
+        llm_result.get("DuodenalBiopsiesInformation") if llm_result else None,
+        llm_result.get("FellowPresent") if llm_result else None,
+        llm_result.get("FellowInformation") if llm_result else None,
+        raw_llm_response,
+        all_in_agreement
+    )
+    
+    with conn:
+        conn.execute(INSERT_WORKING_RESULT_SQL, values)
