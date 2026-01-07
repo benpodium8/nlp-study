@@ -26,4 +26,4 @@ Start program:
 > python app.py
 > python app.py --csv ../../../Downloads/endoscopy_notes.csv
 > python app.py --print
-> python app.py --go
+> python app.py --analyze
