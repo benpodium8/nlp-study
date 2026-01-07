@@ -9,10 +9,38 @@ from data_worker import data_worker
 
 def setup_parser():
     """Creates and configures command-line argument parser. Returns ArgumentParser instance."""
-    parser = argparse.ArgumentParser(description="Ingest CSV into SQLite and print contents")
-    parser.add_argument("--csv", type=Path, help="Path to input CSV file")
-    parser.add_argument("--print", action="store_true", help="Print database contents without ingesting CSV")
-    parser.add_argument("--go", action="store_true", help="Run the NLP worker function")
+    parser = argparse.ArgumentParser(
+        description="Clinical note analysis tool: ingest CSV data, analyze with NLP/LLM, and view results",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+            Examples:
+            %(prog)s --csv data.csv                    # Ingest CSV and display summary
+            %(prog)s --print                           # Display all database contents
+            %(prog)s --analyze                         # Run NLP and LLM analysis on all notes
+            %(prog)s --csv data.csv --analyze          # Ingest CSV then analyze
+        """
+    )
+    
+    parser.add_argument(
+        "--csv",
+        type=Path,
+        metavar="FILE",
+        help="Path to CSV file to ingest into database (required columns: MRN, Encounter, NoteCsnID, NoteDate, NoteType, Note)"
+    )
+    
+    parser.add_argument(
+        "--print",
+        action="store_true",
+        help="Display database contents (includes full notes when used alone)"
+    )
+    
+    parser.add_argument(
+        "--analyze",
+        action="store_true",
+        dest="analyze",
+        help="Run NLP and LLM analysis on all notes in the database"
+    )
+    
     return parser
 
 
@@ -39,14 +67,19 @@ def main():
     parser = setup_parser()
     args = parser.parse_args()
 
-    if not args.go and not args.print and not args.csv:
+    if not args.analyze and not args.print and not args.csv:
         parser.print_help()
         sys.exit(0)
+
+    # Validate CSV file exists if provided
+    if args.csv and not args.csv.exists():
+        print(f"Error: CSV file not found: {args.csv}", file=sys.stderr)
+        sys.exit(1)
 
     conn = create_db(Path("data.db"))
     
     try:
-        if args.go:
+        if args.analyze:
             handle_data_worker_mode(conn, args.csv)
         elif args.print:
             handle_print_mode(conn)
