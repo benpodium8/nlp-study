@@ -1,7 +1,7 @@
 import argparse
 import sys
 from pathlib import Path
-from database import create_db, ingest_csv
+from database import create_db, ingest_csv, safe_export_combined_results_to_csv
 from display import print_db_contents, print_working_results
 from data_worker import data_worker
 from reconcile_working_results import reconcile_working_results
@@ -117,6 +117,7 @@ def main():
         if args.analyze:
             handle_data_worker_mode(conn, args.csv)
             reconcile_working_results(conn)
+            safe_export_combined_results_to_csv()
         elif args.print:
             handle_print_mode(conn)
         elif args.working_results:

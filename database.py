@@ -151,7 +151,7 @@ def ingest_csv(csv_path: Path, conn: sqlite3.Connection):
             "Note",
         }
 
-        if not required_columns.issubset(reader.fieldnames):
+        if not required_columns.issubset(reader.fieldnames or []):
             raise ValueError(f"CSV must contain columns: {required_columns}")
 
         rows = [
@@ -253,8 +253,8 @@ def insert_working_result(
     conn: sqlite3.Connection,
     id: int,
     nlp_result: dict,
-    llm_result: dict = None,
-    raw_llm_response: str = None,
+    llm_result: dict | None = None,
+    raw_llm_response: str | None = None,
     nlp_failed: int = 0,
     llm_failed: int = 0
 ):
@@ -333,3 +333,54 @@ def check_final_result_exists(conn: sqlite3.Connection, id: int) -> bool:
     cursor = conn.execute(CHECK_FINAL_RESULT_EXISTS_SQL, (id,))
     count = cursor.fetchone()[0]
     return count > 0
+
+
+def export_combined_results_to_csv(output_folder="output"):
+    """
+    Combine the final_results table with the notes table and export as a CSV.
+    Creates the output folder if it doesn't exist.
+    """
+    output_path = Path(output_folder)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect("data.db") as conn:
+        cursor = conn.cursor()
+
+        # Combine final_results with notes
+        query = """
+        SELECT notes.*, final_results.ScopeType, final_results.NumberOfDuodenalBiopsies,
+               final_results.DuodenalBiopsiesTaken, final_results.FellowPresent
+        FROM notes
+        LEFT JOIN final_results ON notes.id = final_results.id;
+        """
+        cursor.execute(query)
+        combined_results = cursor.fetchall()
+
+        # Get column names
+        column_names = [desc[0] for desc in cursor.description]
+
+        # Write to CSV
+        output_file = output_path / "combined_results.csv"
+        with open(output_file, mode="w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(column_names)  # Write header
+            writer.writerows(combined_results)  # Write data
+
+    print(f"Combined results exported to {output_file}")
+
+
+def safe_export_combined_results_to_csv(output_folder="output"):
+    """
+    Safely export the combined results to a CSV file only if the output folder is empty.
+    If the folder contains data, it skips the export and prints a message.
+    """
+    output_path = Path(output_folder)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Check if the output folder already contains files
+    if any(output_path.iterdir()):
+        print(f"Output folder '{output_folder}' already contains data. Export skipped.")
+        return
+
+    export_combined_results_to_csv(output_folder)
+
