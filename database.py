@@ -74,7 +74,7 @@ SELECT
     FellowPresent_LLM,
     AllHardDataInAgreement,
     NLP_Failed,
-    LLM_Failed,
+    LLM_Failed
 FROM working_results
 ORDER BY id;
 """
