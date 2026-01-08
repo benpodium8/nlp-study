@@ -4,7 +4,13 @@ from llm_analysis import llm_analysis, LLMAnalysisError
 from display import print_nlp_llm_result
 
 def data_worker(conn):
-    """Processes all notes from database: runs NLP and LLM analysis on each. Returns None."""
+    """
+    Processes all notes in the database: runs NLP and LLM analysis on each note,
+    skipping notes that already have results, and stores the results in the database.
+    
+    Parameters:
+        conn: Database connection object.
+    """
     print("Data worker started")
 
     if conn is not None:
@@ -15,7 +21,6 @@ def data_worker(conn):
             note = row[6]
             id = row[0]
             
-            # Skip if result already exists
             if check_result_exists(conn, id):
                 print(f"Skipping id={id} (result already exists)")
                 continue
@@ -29,8 +34,6 @@ def data_worker(conn):
             retry_count = 0
             success = False
             
-            # Retry loop: attempt LLM analysis up to max_retries times for JSON errors
-            # No database operations occur during this loop
             while retry_count < max_retries and not success:
                 try:
                     llm_result, raw_llm_response = llm_analysis(id, note)
@@ -38,7 +41,6 @@ def data_worker(conn):
                     success = True
                 except LLMAnalysisError as e:
                     error_msg = str(e)
-                    # Check if this is a JSON error (as opposed to validation error)
                     is_json_error = "Invalid JSON" in error_msg or "JSONDecodeError" in error_msg
                     
                     if is_json_error and retry_count < max_retries - 1:
@@ -48,10 +50,8 @@ def data_worker(conn):
                         print(f"[LLM ERROR] id={id} → {e}")
                         if is_json_error:
                             print(f"[LLM ERROR] Failed after {max_retries} retry attempts")
-                        # Continue to insert NLP results even if LLM fails
                         break
             
-            # Database insertion only happens after retry loop completes (success or failure)
             insert_working_result(conn, id, nlp_result, llm_result, raw_llm_response)
             print(f"Inserted results for id={id}")
             

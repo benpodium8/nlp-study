@@ -10,7 +10,15 @@ NUMBER_WORDS = {
 }
 
 def normalize_number(text: str):
-    """Converts text number (digit or word) to integer. Returns int or None if invalid."""
+    """
+    Converts a text representation of a number (digit string or number word) to an integer.
+    
+    Parameters:
+        text: Text that may be a digit string or number word (e.g., "5" or "five").
+    
+    Returns:
+        int or None: Integer value if conversion succeeds, None otherwise.
+    """
     t = text.lower()
     if t.isdigit():
         return int(t)
@@ -50,15 +58,44 @@ COLON_EXCLUDE_TERMS = {
 }
 
 def contains_any(text: str, terms: set) -> bool:
-    """Checks if text contains any term from set. Returns bool."""
+    """
+    Checks if any of the given terms appear in the text.
+    
+    Parameters:
+        text: Text to search within.
+        terms: Set of terms to search for.
+    
+    Returns:
+        bool: True if any term is found in the text, False otherwise.
+    """
     return any(t in text for t in terms)
 
 def has_negation(text: str) -> bool:
-    """Checks if text contains negation terms. Returns bool."""
+    """
+    Checks if the text contains any negation terms (no, not, none, without).
+    
+    Parameters:
+        text: Text to check for negation.
+    
+    Returns:
+        bool: True if negation terms are found, False otherwise.
+    """
     return any(n in text for n in NEGATION_TERMS)
 
 def nlp_analysis(id: int, note: str):
-    """Analyzes clinical note using NLP to extract structured data. Returns dict with extracted fields."""
+    """
+    Analyzes a clinical note using NLP techniques to extract structured data.
+    Extracts information about scope type, colonoscopy, endoscopy, duodenal biopsies, and fellow presence.
+    
+    Parameters:
+        id: Note ID to include in the result.
+        note: Clinical note text to analyze.
+    
+    Returns:
+        dict: Dictionary containing extracted fields: id, ScopeType, Colonoscopy, ColonoscopyInformation,
+              Endoscopy, EndoscopyInformation, NumberOfDuodenalBiopsies, DuodenalBiopsiesTaken,
+              DuodenalBiopsiesInformation, FellowPresent, FellowInformation.
+    """
     doc = nlp(note)
     sents = list(doc.sents)
 

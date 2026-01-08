@@ -5,7 +5,13 @@ from rich.table import Table
 from database import fetch_all_notes
 
 def print_nlp_llm_result(result):
-    """Prints formatted NLP/LLM analysis result to console. Returns None."""
+    """
+    Prints NLP or LLM analysis result fields to the console in a formatted manner.
+    
+    Parameters:
+        result: Dictionary containing analysis result with fields: id, ScopeType, Colonoscopy,
+                Endoscopy, NumberOfDuodenalBiopsies, DuodenalBiopsiesTaken, FellowPresent.
+    """
     print(f"ID: {result['id']}")
     print(f"ScopeType: {result['ScopeType']}")
     print(f"Colonoscopy: {result['Colonoscopy']}")
@@ -16,7 +22,14 @@ def print_nlp_llm_result(result):
     print("-" * 50)
 
 def print_db_contents(conn: sqlite3.Connection, include_note: bool = False):
-    """Displays database contents as formatted table, optionally including notes. Returns None."""
+    """
+    Displays database contents in a formatted table using Rich library.
+    Optionally includes or excludes the full note text (truncated if included).
+    
+    Parameters:
+        conn: Database connection object.
+        include_note: If True, includes note column (truncated to 30 chars); if False, excludes it.
+    """
     cursor = fetch_all_notes(conn)
     columns = [description[0] for description in cursor.description]
     
@@ -56,7 +69,13 @@ SELECT_WORKING_RESULTS_SQL = "SELECT * FROM working_results ORDER BY id;"
 
 
 def print_working_results(conn: sqlite3.Connection):
-    """Displays working_results table as formatted table. Returns None."""
+    """
+    Displays the working_results table in a formatted table using Rich library.
+    Truncates long text fields (RawResponse_LLM and Information fields) for display.
+    
+    Parameters:
+        conn: Database connection object.
+    """
     cursor = conn.execute(SELECT_WORKING_RESULTS_SQL)
     columns = [description[0] for description in cursor.description]
     rows = cursor.fetchall()
@@ -73,21 +92,18 @@ def print_working_results(conn: sqlite3.Connection):
     for col in columns:
         table.add_column(col)
     
-    # Add rows with appropriate truncation for long fields
     for row in rows:
         row_values = []
         for i, value in enumerate(row):
             if value is None:
                 row_values.append("")
             elif columns[i] == "RawResponse_LLM":
-                # Truncate raw response (can be very long)
                 str_value = str(value)
                 if len(str_value) > 50:
                     row_values.append(str_value[:47] + "...")
                 else:
                     row_values.append(str_value)
             elif "Information" in columns[i]:
-                # Truncate information fields
                 str_value = str(value)
                 if len(str_value) > 40:
                     row_values.append(str_value[:37] + "...")

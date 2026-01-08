@@ -8,18 +8,16 @@ from data_worker import data_worker
 
 
 def setup_parser():
-    """Creates and configures command-line argument parser. Returns ArgumentParser instance."""
+    """
+    Creates and configures an argument parser for the CLI.
+    
+    Returns:
+        argparse.ArgumentParser: Configured argument parser with CSV, print, analyze, and results options.
+    """
     parser = argparse.ArgumentParser(
         description="Clinical note analysis tool: ingest CSV data, analyze with NLP/LLM, and view results",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-            Examples:
-            %(prog)s --csv data.csv                    # Ingest CSV and display summary
-            %(prog)s --print                           # Display all database contents
-            %(prog)s --results                          # Display working results table
-            %(prog)s --analyze                         # Run NLP and LLM analysis on all notes
-            %(prog)s --csv data.csv --analyze          # Ingest CSV then analyze
-        """
+        epilog=""
     )
     
     parser.add_argument(
@@ -52,30 +50,55 @@ def setup_parser():
 
 
 def handle_data_worker_mode(conn, csv_file):
-    """Ingests CSV if provided, then runs NLP/LLM analysis on all notes. Returns None."""
+    """
+    Handles data worker mode: ingests CSV if provided and runs analysis on all notes.
+    
+    Parameters:
+        conn: Database connection object.
+        csv_file: Optional path to CSV file to ingest before analysis.
+    """
     if csv_file:
         ingest_csv(csv_file, conn)
     data_worker(conn)
 
 
 def handle_print_mode(conn):
-    """Prints all database contents including notes. Returns None."""
+    """
+    Handles print mode: displays all database contents including full notes.
+    
+    Parameters:
+        conn: Database connection object.
+    """
     print_db_contents(conn, include_note=True)
 
 
 def handle_csv_ingest_mode(conn, csv_file):
-    """Ingests CSV file into database and prints contents without notes. Returns None."""
+    """
+    Handles CSV ingest mode: imports CSV data and displays database contents without full notes.
+    
+    Parameters:
+        conn: Database connection object.
+        csv_file: Path to CSV file to ingest.
+    """
     ingest_csv(csv_file, conn)
     print_db_contents(conn, include_note=False)
 
 
 def handle_results_mode(conn):
-    """Prints working results table. Returns None."""
+    """
+    Handles results mode: displays the working results table with NLP and LLM analysis.
+    
+    Parameters:
+        conn: Database connection object.
+    """
     print_working_results(conn)
 
 
 def main():
-    """Main entry point: parses arguments and executes appropriate mode. Returns None."""
+    """
+    Main entry point: parses command-line arguments and executes the appropriate mode.
+    Handles CSV ingestion, analysis, printing, and results display based on user input.
+    """
     parser = setup_parser()
     args = parser.parse_args()
 
@@ -83,7 +106,6 @@ def main():
         parser.print_help()
         sys.exit(0)
 
-    # Validate CSV file exists if provided
     if args.csv and not args.csv.exists():
         print(f"Error: CSV file not found: {args.csv}", file=sys.stderr)
         sys.exit(1)

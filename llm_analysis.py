@@ -26,7 +26,15 @@ JSON_FENCE_RE = re.compile(
 )
 
 def _strip_markdown_fences(text: str) -> str:
-    """Removes markdown code fences (```json ... ```) from text. Returns cleaned string."""
+    """
+    Removes markdown code fences (```json or ```) from text if present.
+    
+    Parameters:
+        text: Text that may contain markdown code fences.
+    
+    Returns:
+        str: Text with markdown fences removed, or original text if no fences found.
+    """
     m = JSON_FENCE_RE.match(text)
     if m:
         return m.group(1).strip()
@@ -38,7 +46,13 @@ class LLMAnalysisError(Exception):
 
 
 def _validate_llm_result(result: dict):
-    """Validates LLM result structure and field types. Raises LLMAnalysisError if invalid. Returns None."""
+    """
+    Validates that the LLM result dictionary contains all required fields with correct types.
+    Raises LLMAnalysisError if validation fails.
+    
+    Parameters:
+        result: Dictionary containing LLM analysis result to validate.
+    """
     for field, expected_type in EXPECTED_FIELDS.items():
         if field not in result:
             raise LLMAnalysisError(f"Missing field: {field}")
@@ -51,7 +65,17 @@ def _validate_llm_result(result: dict):
 
 
 def llm_analysis(id: int, note: str) -> Tuple[dict, str]:
-    """Analyzes clinical note using LLM to extract structured data. Returns tuple of (dict with extracted fields, raw response string)."""
+    """
+    Analyzes a clinical note using an LLM to extract structured data.
+    Sends the note to a local Ollama model and validates the JSON response.
+    
+    Parameters:
+        id: Note ID to include in the result.
+        note: Clinical note text to analyze.
+    
+    Returns:
+        Tuple[dict, str]: A tuple containing (parsed result dictionary, raw LLM response string).
+    """
     messages = [
     {
             "role": "system",

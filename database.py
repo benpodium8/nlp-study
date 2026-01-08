@@ -68,7 +68,15 @@ WHERE mrn = ? AND encounter = ? AND note_csn_id = ?
 
 
 def create_db(db_path: Path):
-    """Creates SQLite database and tables (notes, working_results). Returns database connection."""
+    """
+    Creates or connects to a SQLite database and initializes the notes and working_results tables.
+    
+    Parameters:
+        db_path: Path to the database file.
+    
+    Returns:
+        sqlite3.Connection: Database connection object.
+    """
     conn = sqlite3.connect(db_path)
     with conn:
         conn.execute(TABLE_SCHEMA)
@@ -77,7 +85,14 @@ def create_db(db_path: Path):
 
 
 def ingest_csv(csv_path: Path, conn: sqlite3.Connection):
-    """Reads CSV file and inserts rows into database, skipping duplicates. Returns None."""
+    """
+    Ingests CSV data into the database, skipping duplicate rows.
+    Validates that required columns (MRN, Encounter, NoteCsnID, NoteDate, NoteType, Note) are present.
+    
+    Parameters:
+        csv_path: Path to the CSV file to ingest.
+        conn: Database connection object.
+    """
     with csv_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
 
@@ -126,7 +141,15 @@ def ingest_csv(csv_path: Path, conn: sqlite3.Connection):
 
 
 def fetch_all_notes(conn: sqlite3.Connection):
-    """Executes query to fetch all notes from database. Returns cursor."""
+    """
+    Fetches all notes from the database.
+    
+    Parameters:
+        conn: Database connection object.
+    
+    Returns:
+        sqlite3.Cursor: Cursor object containing all note records.
+    """
     return conn.execute(SELECT_ALL_SQL)
 
 
@@ -163,7 +186,16 @@ INSERT INTO working_results (
 
 
 def check_result_exists(conn: sqlite3.Connection, id: int) -> bool:
-    """Checks if a working_result already exists for the given id. Returns bool."""
+    """
+    Checks if a working result already exists for the given note ID.
+    
+    Parameters:
+        conn: Database connection object.
+        id: Note ID to check.
+    
+    Returns:
+        bool: True if a result exists, False otherwise.
+    """
     cursor = conn.execute(CHECK_RESULT_EXISTS_SQL, (id,))
     count = cursor.fetchone()[0]
     return count > 0
@@ -176,11 +208,19 @@ def insert_working_result(
     llm_result: dict = None,
     raw_llm_response: str = None
 ):
-    """Inserts or updates working_result with NLP and optional LLM data. Returns None."""
-    # Calculate hard data agreement if both results exist
+    """
+    Inserts NLP and LLM analysis results into the working_results table.
+    Compares hard data fields between NLP and LLM results to set AllHardDataInAgreement flag.
+    
+    Parameters:
+        conn: Database connection object.
+        id: Note ID to associate with the results.
+        nlp_result: Dictionary containing NLP analysis results.
+        llm_result: Optional dictionary containing LLM analysis results.
+        raw_llm_response: Optional raw LLM response string.
+    """
     all_hard_data_in_agreement = None
     if llm_result is not None:
-        # Compare only numerical fields
         comparison_fields = [
             "Colonoscopy", "Endoscopy",
             "NumberOfDuodenalBiopsies", "DuodenalBiopsiesTaken", "FellowPresent"
