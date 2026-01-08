@@ -46,6 +46,30 @@ CREATE TABLE IF NOT EXISTS working_results (
 );
 """
 
+FINAL_RESULTS_TABLE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS final_results (
+    id INTEGER PRIMARY KEY,
+    ScopeType TEXT,
+    NumberOfDuodenalBiopsies INTEGER,
+    DuodenalBiopsiesTaken INTEGER,
+    FellowPresent INTEGER,
+    FOREIGN KEY (id) REFERENCES notes(id)
+);
+"""
+
+INSERT_FINAL_RESULT_SQL = """
+INSERT INTO final_results (
+    id,
+    ScopeType,
+    NumberOfDuodenalBiopsies,
+    DuodenalBiopsiesTaken,
+    FellowPresent
+) VALUES (
+    ?, ?, ?, ?, ?
+);
+"""
+
+SELECT_ALL_FINAL_RESULTS = "SELECT * FROM final_results;"
 
 INSERT_NOTE_SQL = """
 INSERT INTO notes (

@@ -2,7 +2,10 @@ import re
 import unicodedata
 from typing import Optional
 
-from database import SELECT_ALL_WORKING_RESULTS_SQL
+from database import (
+    SELECT_ALL_WORKING_RESULTS_SQL,
+    INSERT_FINAL_RESULTS_SQL,
+)
 
 
 def normalize_string(value: Optional[str]) -> Optional[str]:
@@ -30,19 +33,15 @@ def reconcile_scope_type(scope_nlp: Optional[str], scope_llm: Optional[str]) -> 
     norm_llm = normalize_string(scope_llm)
     norm_nlp = normalize_string(scope_nlp)
 
-    # 1. Exact normalized match
     if norm_llm and norm_llm == norm_nlp:
         return scope_llm
 
-    # 2. Model token agreement
     llm_models = extract_model_tokens(scope_llm)
     nlp_models = extract_model_tokens(scope_nlp)
 
     if llm_models and llm_models == nlp_models:
-        # Prefer more descriptive source
         return scope_llm if scope_llm and len(scope_llm) >= len(scope_nlp or "") else scope_nlp
 
-    # 3. One side present
     if norm_llm and not norm_nlp:
         return scope_llm
 
@@ -52,15 +51,11 @@ def reconcile_scope_type(scope_nlp: Optional[str], scope_llm: Optional[str]) -> 
     return None
 
 
-
 def reconcile_working_results(conn):
-    print("Reconciling working results...")
-
     cursor = conn.execute(SELECT_ALL_WORKING_RESULTS_SQL)
     rows = cursor.fetchall()
 
     if not rows:
-        print("No working results found to reconcile.")
         return
 
     for row in rows:
@@ -79,24 +74,42 @@ def reconcile_working_results(conn):
             LLM_Failed,
         ) = row
 
-        final_scope_type = reconcile_scope_type(ScopeType_NLP, ScopeType_LLM)
+        final_scope_type = reconcile_scope_type(
+            ScopeType_NLP,
+            ScopeType_LLM,
+        )
 
-        reconciled = {
-            "id": id,
-            "ScopeType": final_scope_type,
-            "ScopeType_NLP": ScopeType_NLP,
-            "ScopeType_LLM": ScopeType_LLM,
-            "NumberOfDuodenalBiopsies_NLP": NumberOfDuodenalBiopsies_NLP,
-            "NumberOfDuodenalBiopsies_LLM": NumberOfDuodenalBiopsies_LLM,
-            "DuodenalBiopsiesTaken_NLP": DuodenalBiopsiesTaken_NLP,
-            "DuodenalBiopsiesTaken_LLM": DuodenalBiopsiesTaken_LLM,
-            "FellowPresent_NLP": FellowPresent_NLP,
-            "FellowPresent_LLM": FellowPresent_LLM,
-            "NLP_Failed": NLP_Failed,
-            "LLM_Failed": LLM_Failed,
-            "AllHardDataInAgreement": AllHardDataInAgreement,
-        }
+        numeric_mismatch = any([
+            NumberOfDuodenalBiopsies_NLP != NumberOfDuodenalBiopsies_LLM,
+            DuodenalBiopsiesTaken_NLP != DuodenalBiopsiesTaken_LLM,
+            FellowPresent_NLP != FellowPresent_LLM,
+        ])
 
-        print(f"[RECONCILED] id={id} → {reconciled}")
+        insert_null_row = (
+            not AllHardDataInAgreement
+            or NLP_Failed
+            or LLM_Failed
+            or numeric_mismatch
+            or not final_scope_type
+        )
 
-    print("Reconciliation complete.")
+        if insert_null_row:
+            values = (
+                id,
+                None,
+                None,
+                None,
+                None,
+            )
+        else:
+            values = (
+                id,
+                final_scope_type,
+                NumberOfDuodenalBiopsies_LLM,
+                DuodenalBiopsiesTaken_LLM,
+                FellowPresent_LLM,
+            )
+
+        conn.execute(INSERT_FINAL_RESULTS_SQL, values)
+
+    conn.commit()
