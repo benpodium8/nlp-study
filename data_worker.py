@@ -1,7 +1,7 @@
 from database import SELECT_ALL_SQL, check_result_exists, insert_working_result
 from nlp_analysis import nlp_analysis
 from llm_analysis import llm_analysis, LLMAnalysisError
-from display import print_nlp_llm_result
+from reconcile_working_results import reconcile_working_results
 
 def data_worker(conn):
     """
@@ -26,8 +26,6 @@ def data_worker(conn):
                 continue
             
             nlp_result = nlp_analysis(id, note)
-            print_nlp_llm_result(nlp_result)
-
             llm_result = None
             raw_llm_response = None
             max_retries = 5
@@ -37,7 +35,6 @@ def data_worker(conn):
             while retry_count < max_retries and not success:
                 try:
                     llm_result, raw_llm_response = llm_analysis(id, note)
-                    print_nlp_llm_result(llm_result)
                     success = True
                 except LLMAnalysisError as e:
                     error_msg = str(e)
@@ -53,7 +50,10 @@ def data_worker(conn):
                         break
             
             insert_working_result(conn, id, nlp_result, llm_result, raw_llm_response)
-            print(f"Inserted results for id={id}")
+            print(f"Inserted working result for id={id}")
+
+        print("Finished processing working results.")
+        reconcile_working_results()
             
 
 
