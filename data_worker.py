@@ -25,7 +25,29 @@ def data_worker(conn):
                 print(f"Skipping id={id} (result already exists)")
                 continue
             
-            nlp_result = nlp_analysis(id, note)
+            # Default NLP result structure in case of failure
+            default_nlp_result = {
+                "id": id,
+                "ScopeType": None,
+                "Colonoscopy": 0,
+                "ColonoscopyInformation": None,
+                "Endoscopy": 0,
+                "EndoscopyInformation": None,
+                "NumberOfDuodenalBiopsies": 0,
+                "DuodenalBiopsiesTaken": 0,
+                "DuodenalBiopsiesInformation": None,
+                "FellowPresent": 0,
+                "FellowInformation": None,
+            }
+            
+            # Try NLP analysis, use default if it fails
+            try:
+                nlp_result = nlp_analysis(id, note)
+            except Exception as e:
+                print(f"[NLP ERROR] id={id} → {e}")
+                nlp_result = default_nlp_result
+            
+            # Try LLM analysis with retries
             llm_result = None
             raw_llm_response = None
             max_retries = 5
@@ -48,7 +70,12 @@ def data_worker(conn):
                         if is_json_error:
                             print(f"[LLM ERROR] Failed after {max_retries} retry attempts")
                         break
+                except Exception as e:
+                    # Catch any other unexpected exceptions from LLM analysis
+                    print(f"[LLM ERROR] id={id} → Unexpected error: {e}")
+                    break
             
+            # Always insert a row, even if both analyses failed
             insert_working_result(conn, id, nlp_result, llm_result, raw_llm_response)
             print(f"Inserted working result for id={id}")
 
