@@ -314,3 +314,22 @@ def insert_working_result(
     
     with conn:
         conn.execute(INSERT_WORKING_RESULT_SQL, values)
+
+
+CHECK_FINAL_RESULT_EXISTS_SQL = "SELECT COUNT(*) FROM final_results WHERE id = ?;"
+
+
+def check_final_result_exists(conn: sqlite3.Connection, id: int) -> bool:
+    """
+    Checks if a final result already exists for the given note ID.
+
+    Parameters:
+        conn: Database connection object.
+        id: Note ID to check.
+
+    Returns:
+        bool: True if a final result exists, False otherwise.
+    """
+    cursor = conn.execute(CHECK_FINAL_RESULT_EXISTS_SQL, (id,))
+    count = cursor.fetchone()[0]
+    return count > 0

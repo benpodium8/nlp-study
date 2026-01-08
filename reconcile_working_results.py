@@ -5,6 +5,7 @@ from typing import Optional
 from database import (
     SELECT_ALL_WORKING_RESULTS_SQL,
     INSERT_FINAL_RESULT_SQL,
+    check_final_result_exists
 )
 
 
@@ -73,6 +74,9 @@ def reconcile_working_results(conn):
             NLP_Failed,
             LLM_Failed,
         ) = row
+
+        if check_final_result_exists(conn, id):
+            continue
 
         final_scope_type = reconcile_scope_type(
             ScopeType_NLP,
