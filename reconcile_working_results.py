@@ -4,7 +4,7 @@ from typing import Optional
 
 from database import (
     SELECT_ALL_WORKING_RESULTS_SQL,
-    INSERT_FINAL_RESULTS_SQL,
+    INSERT_FINAL_RESULT_SQL,
 )
 
 
@@ -110,6 +110,6 @@ def reconcile_working_results(conn):
                 FellowPresent_LLM,
             )
 
-        conn.execute(INSERT_FINAL_RESULTS_SQL, values)
+        conn.execute(INSERT_FINAL_RESULT_SQL, values)
 
     conn.commit()
