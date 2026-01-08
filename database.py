@@ -3,7 +3,7 @@ import sqlite3
 from pathlib import Path
 
 
-TABLE_SCHEMA = """
+NOTES_TABLE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS notes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     mrn TEXT,
@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS working_results (
 """
 
 
-INSERT_SQL = """
+INSERT_NOTE_SQL = """
 INSERT INTO notes (
     mrn,
     encounter,
@@ -57,10 +57,10 @@ INSERT INTO notes (
 """
 
 
-SELECT_ALL_SQL = "SELECT * FROM notes;"
+SELECT_ALL_NOTES_SQL = "SELECT * FROM notes;"
 
 
-CHECK_DUPLICATE_SQL = """
+CHECK_DUPLICATE_NOTE_SQL = """
 SELECT COUNT(*) FROM notes
 WHERE mrn = ? AND encounter = ? AND note_csn_id = ? 
   AND note_date = ? AND note_type = ? AND note = ?;
@@ -79,7 +79,7 @@ def create_db(db_path: Path):
     """
     conn = sqlite3.connect(db_path)
     with conn:
-        conn.execute(TABLE_SCHEMA)
+        conn.execute(NOTES_TABLE_SCHEMA)
         conn.execute(WORKING_RESULTS_TABLE_SCHEMA)
     return conn
 
@@ -125,7 +125,7 @@ def ingest_csv(csv_path: Path, conn: sqlite3.Connection):
         duplicates_count = 0
         
         for row in rows:
-            cursor = conn.execute(CHECK_DUPLICATE_SQL, row)
+            cursor = conn.execute(CHECK_DUPLICATE_NOTE_SQL, row)
             count = cursor.fetchone()[0]
             
             if count == 0:
@@ -134,7 +134,7 @@ def ingest_csv(csv_path: Path, conn: sqlite3.Connection):
                 duplicates_count += 1
         
         if new_rows:
-            conn.executemany(INSERT_SQL, new_rows)
+            conn.executemany(INSERT_NOTE_SQL, new_rows)
         
         if duplicates_count > 0:
             print(f"Skipped {duplicates_count} duplicate row(s) during import.")
@@ -150,10 +150,10 @@ def fetch_all_notes(conn: sqlite3.Connection):
     Returns:
         sqlite3.Cursor: Cursor object containing all note records.
     """
-    return conn.execute(SELECT_ALL_SQL)
+    return conn.execute(SELECT_ALL_NOTES_SQL)
 
 
-CHECK_RESULT_EXISTS_SQL = "SELECT COUNT(*) FROM working_results WHERE id = ?;"
+CHECK_WORKING_RESULT_EXISTS_SQL = "SELECT COUNT(*) FROM working_results WHERE id = ?;"
 
 
 INSERT_WORKING_RESULT_SQL = """
@@ -185,7 +185,7 @@ INSERT INTO working_results (
 """
 
 
-def check_result_exists(conn: sqlite3.Connection, id: int) -> bool:
+def check_working_result_exists(conn: sqlite3.Connection, id: int) -> bool:
     """
     Checks if a working result already exists for the given note ID.
     
@@ -196,7 +196,7 @@ def check_result_exists(conn: sqlite3.Connection, id: int) -> bool:
     Returns:
         bool: True if a result exists, False otherwise.
     """
-    cursor = conn.execute(CHECK_RESULT_EXISTS_SQL, (id,))
+    cursor = conn.execute(CHECK_WORKING_RESULT_EXISTS_SQL, (id,))
     count = cursor.fetchone()[0]
     return count > 0
 

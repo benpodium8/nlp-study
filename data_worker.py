@@ -1,4 +1,4 @@
-from database import SELECT_ALL_SQL, check_result_exists, insert_working_result
+from database import SELECT_ALL_NOTES_SQL, check_working_result_exists, insert_working_result
 from nlp_analysis import nlp_analysis
 from llm_analysis import llm_analysis, LLMAnalysisError
 from reconcile_working_results import reconcile_working_results
@@ -14,14 +14,14 @@ def data_worker(conn):
     print("Data worker started")
 
     if conn is not None:
-        cursor = conn.execute(SELECT_ALL_SQL)
+        cursor = conn.execute(SELECT_ALL_NOTES_SQL)
         rows = cursor.fetchall()
         
         for row in rows:
             note = row[6]
             id = row[0]
             
-            if check_result_exists(conn, id):
+            if check_working_result_exists(conn, id):
                 print(f"Skipping id={id} (result already exists)")
                 continue
             
