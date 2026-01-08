@@ -126,6 +126,7 @@ def create_db(db_path: Path):
     with conn:
         conn.execute(NOTES_TABLE_SCHEMA)
         conn.execute(WORKING_RESULTS_TABLE_SCHEMA)
+        conn.execute(FINAL_RESULTS_TABLE_SCHEMA)
     return conn
 
 
