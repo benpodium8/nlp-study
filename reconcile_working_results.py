@@ -24,6 +24,9 @@ def extract_model_tokens(value: Optional[str]) -> set[str]:
         return set()
 
     norm = normalize_string(value)
+    if not norm:
+        return set()
+
     return {
         token
         for token in norm.split()
