@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS working_results (
     FellowInformation_LLM TEXT,
     RawResponse_LLM TEXT,
     AllHardDataInAgreement INTEGER,
+    NLP_Failed INTEGER,
+    LLM_Failed INTEGER,
     FOREIGN KEY (id) REFERENCES notes(id)
 );
 """
@@ -180,8 +182,10 @@ INSERT INTO working_results (
     FellowPresent_LLM,
     FellowInformation_LLM,
     RawResponse_LLM,
-    AllHardDataInAgreement
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    AllHardDataInAgreement,
+    NLP_Failed,
+    LLM_Failed
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 """
 
 
@@ -206,7 +210,9 @@ def insert_working_result(
     id: int,
     nlp_result: dict,
     llm_result: dict = None,
-    raw_llm_response: str = None
+    raw_llm_response: str = None,
+    nlp_failed: int = 0,
+    llm_failed: int = 0
 ):
     """
     Inserts NLP and LLM analysis results into the working_results table.
@@ -218,6 +224,8 @@ def insert_working_result(
         nlp_result: Dictionary containing NLP analysis results.
         llm_result: Optional dictionary containing LLM analysis results.
         raw_llm_response: Optional raw LLM response string.
+        nlp_failed: Integer flag indicating if NLP analysis failed (1 = failed, 0 = success).
+        llm_failed: Integer flag indicating if LLM analysis failed (1 = failed, 0 = success).
     """
     all_hard_data_in_agreement = None
     if llm_result is not None:
@@ -256,7 +264,9 @@ def insert_working_result(
         llm_result.get("FellowPresent") if llm_result else None,
         llm_result.get("FellowInformation") if llm_result else None,
         raw_llm_response,
-        all_hard_data_in_agreement
+        all_hard_data_in_agreement,
+        nlp_failed,
+        llm_failed
     )
     
     with conn:

@@ -41,15 +41,18 @@ def data_worker(conn):
             }
             
             # Try NLP analysis, use default if it fails
+            nlp_failed = 0
             try:
                 nlp_result = nlp_analysis(id, note)
             except Exception as e:
                 print(f"[NLP ERROR] id={id} → {e}")
                 nlp_result = default_nlp_result
+                nlp_failed = 1
             
             # Try LLM analysis with retries
             llm_result = None
             raw_llm_response = None
+            llm_failed = 0
             max_retries = 5
             retry_count = 0
             success = False
@@ -69,14 +72,16 @@ def data_worker(conn):
                         print(f"[LLM ERROR] id={id} → {e}")
                         if is_json_error:
                             print(f"[LLM ERROR] Failed after {max_retries} retry attempts")
+                        llm_failed = 1
                         break
                 except Exception as e:
                     # Catch any other unexpected exceptions from LLM analysis
                     print(f"[LLM ERROR] id={id} → Unexpected error: {e}")
+                    llm_failed = 1
                     break
             
             # Always insert a row, even if both analyses failed
-            insert_working_result(conn, id, nlp_result, llm_result, raw_llm_response)
+            insert_working_result(conn, id, nlp_result, llm_result, raw_llm_response, nlp_failed, llm_failed)
             print(f"Inserted working result for id={id}")
 
         print("Finished processing working results.")
