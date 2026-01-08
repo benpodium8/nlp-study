@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Tuple
 import ollama
 
@@ -18,22 +19,21 @@ EXPECTED_FIELDS = {
     "FellowInformation": (str, type(None)),
 }
 
-import re
-
 JSON_FENCE_RE = re.compile(
     r"^\s*```(?:json)?\s*(.*?)\s*```\s*$",
     re.DOTALL | re.IGNORECASE
 )
 
+TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
+
+
+class LLMAnalysisError(Exception):
+    pass
+
+
 def _strip_markdown_fences(text: str) -> str:
     """
     Removes markdown code fences (```json or ```) from text if present.
-    
-    Parameters:
-        text: Text that may contain markdown code fences.
-    
-    Returns:
-        str: Text with markdown fences removed, or original text if no fences found.
     """
     m = JSON_FENCE_RE.match(text)
     if m:
@@ -41,17 +41,56 @@ def _strip_markdown_fences(text: str) -> str:
     return text.strip()
 
 
-class LLMAnalysisError(Exception):
-    pass
+def parse_json_with_repair(text: str) -> dict:
+    """
+    Attempts to parse JSON. If parsing fails, applies common repairs
+    and retries once before failing.
+    """
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    repaired = text.strip()
+
+    # Remove trailing commas
+    repaired = TRAILING_COMMA_RE.sub(r"\1", repaired)
+
+    # Trim to outermost JSON object
+    start = repaired.find("{")
+    end = repaired.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        repaired = repaired[start:end + 1]
+
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError as e:
+        raise e
+
+
+def normalize_llm_result(parsed: dict) -> dict:
+    """
+    Ensures required integer fields are never None.
+    """
+    int_fields = [
+        "Colonoscopy",
+        "Endoscopy",
+        "NumberOfDuodenalBiopsies",
+        "DuodenalBiopsiesTaken",
+        "FellowPresent",
+    ]
+
+    for field in int_fields:
+        if parsed.get(field) is None:
+            parsed[field] = 0
+
+    return parsed
 
 
 def _validate_llm_result(result: dict):
     """
-    Validates that the LLM result dictionary contains all required fields with correct types.
-    Raises LLMAnalysisError if validation fails.
-    
-    Parameters:
-        result: Dictionary containing LLM analysis result to validate.
+    Validates that the LLM result dictionary contains all required fields
+    with correct types.
     """
     for field, expected_type in EXPECTED_FIELDS.items():
         if field not in result:
@@ -67,17 +106,9 @@ def _validate_llm_result(result: dict):
 def llm_analysis(id: int, note: str) -> Tuple[dict, str]:
     """
     Analyzes a clinical note using an LLM to extract structured data.
-    Sends the note to a local Ollama model and validates the JSON response.
-    
-    Parameters:
-        id: Note ID to include in the result.
-        note: Clinical note text to analyze.
-    
-    Returns:
-        Tuple[dict, str]: A tuple containing (parsed result dictionary, raw LLM response string).
     """
     messages = [
-    {
+        {
             "role": "system",
             "content": """
                 You are a strict clinical information extraction API.
@@ -89,6 +120,11 @@ def llm_analysis(id: int, note: str) -> Tuple[dict, str]:
                 - Do NOT guess or infer missing information.
                 - If information is not explicitly stated, use null or 0 as appropriate.
                 - Use integers 1 or 0 for all boolean fields.
+
+                FINAL REMINDER:
+                - ALL integer fields must be integers (never null)
+                - No trailing commas
+                - JSON must parse successfully
 
                 MATCH THIS SCHEMA EXACTLY:
                 {
@@ -103,7 +139,6 @@ def llm_analysis(id: int, note: str) -> Tuple[dict, str]:
                     "FellowPresent": 0 | 1,
                     "FellowInformation": string | null
                 }
-
                 FIELD-SPECIFIC EXTRACTION RULES:
 
                 1) ScopeType
@@ -180,19 +215,19 @@ def llm_analysis(id: int, note: str) -> Tuple[dict, str]:
         }
     ]
 
-
     response = ollama.chat(model=LOCAL_MODEL, messages=messages)
-    
 
     raw = response["message"]["content"]
     clean = _strip_markdown_fences(raw)
 
     try:
-        parsed = json.loads(clean)
+        parsed = parse_json_with_repair(clean)
     except json.JSONDecodeError as e:
         raise LLMAnalysisError(f"Invalid JSON returned by LLM: {e}")
 
     parsed["id"] = id
+
+    parsed = normalize_llm_result(parsed)
 
     _validate_llm_result(parsed)
 
