@@ -1,10 +1,11 @@
 import argparse
 import sys
 from pathlib import Path
-
 from database import create_db, ingest_csv
 from display import print_db_contents, print_working_results
 from data_worker import data_worker
+from reconcile_working_results import reconcile_working_results
+
 
 
 def setup_parser():
@@ -84,7 +85,7 @@ def handle_csv_ingest_mode(conn, csv_file):
     print_db_contents(conn, include_note=False)
 
 
-def handle_results_mode(conn):
+def handle_working_results_mode(conn):
     """
     Handles results mode: displays the working results table with NLP and LLM analysis.
     
@@ -102,7 +103,7 @@ def main():
     parser = setup_parser()
     args = parser.parse_args()
 
-    if not args.analyze and not args.print and not args.csv and not args.results:
+    if not args.analyze and not args.print and not args.csv and not args.working_results:
         parser.print_help()
         sys.exit(0)
 
@@ -115,10 +116,11 @@ def main():
     try:
         if args.analyze:
             handle_data_worker_mode(conn, args.csv)
+            reconcile_working_results(conn)
         elif args.print:
             handle_print_mode(conn)
-        elif args.results:
-            handle_results_mode(conn)
+        elif args.working_results:
+            handle_working_results_mode(conn)
         elif args.csv:
             handle_csv_ingest_mode(conn, args.csv)
     finally:

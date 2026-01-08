@@ -61,6 +61,20 @@ INSERT INTO notes (
 
 SELECT_ALL_NOTES_SQL = "SELECT * FROM notes;"
 
+SELECT_ALL_WORKING_RESULTS_SQL = """
+SELECT
+    id,
+    ScopeType_NLP,
+    ScopeType_LLM,
+    DuodenalBiopsiesTaken_NLP,
+    DuodenalBiopsiesTaken_LLM,
+    FellowPresent_NLP,
+    FellowPresent_LLM
+FROM working_results
+ORDER BY id;
+"""
+
+
 
 CHECK_DUPLICATE_NOTE_SQL = """
 SELECT COUNT(*) FROM notes

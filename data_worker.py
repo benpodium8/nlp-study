@@ -1,7 +1,6 @@
 from database import SELECT_ALL_NOTES_SQL, check_working_result_exists, insert_working_result
 from nlp_analysis import nlp_analysis
 from llm_analysis import llm_analysis, LLMAnalysisError
-from reconcile_working_results import reconcile_working_results
 
 def data_worker(conn):
     """
@@ -85,7 +84,6 @@ def data_worker(conn):
             print(f"Inserted working result for id={id}")
 
         print("Finished processing working results.")
-        reconcile_working_results()
             
 
 
