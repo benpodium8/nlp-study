@@ -73,7 +73,10 @@ def reconcile_working_results(conn):
             DuodenalBiopsiesTaken_NLP,
             DuodenalBiopsiesTaken_LLM,
             FellowPresent_NLP,
-            FellowPresent_LLM
+            FellowPresent_LLM,
+            AllHardDataInAgreement,
+            NLP_Failed,
+            LLM_Failed,
         ) = row
 
         final_scope_type = reconcile_scope_type(ScopeType_NLP, ScopeType_LLM)
@@ -89,6 +92,9 @@ def reconcile_working_results(conn):
             "DuodenalBiopsiesTaken_LLM": DuodenalBiopsiesTaken_LLM,
             "FellowPresent_NLP": FellowPresent_NLP,
             "FellowPresent_LLM": FellowPresent_LLM,
+            "NLP_Failed": NLP_Failed,
+            "LLM_Failed": LLM_Failed,
+            "AllHardDataInAgreement": AllHardDataInAgreement,
         }
 
         print(f"[RECONCILED] id={id} → {reconciled}")

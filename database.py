@@ -71,7 +71,10 @@ SELECT
     DuodenalBiopsiesTaken_NLP,
     DuodenalBiopsiesTaken_LLM,
     FellowPresent_NLP,
-    FellowPresent_LLM
+    FellowPresent_LLM,
+    AllHardDataInAgreement,
+    NLP_Failed,
+    LLM_Failed,
 FROM working_results
 ORDER BY id;
 """
