@@ -66,6 +66,8 @@ SELECT
     id,
     ScopeType_NLP,
     ScopeType_LLM,
+    NumberOfDuodenalBiopsies_NLP,
+    NumberOfDuodenalBiopsies_LLM,
     DuodenalBiopsiesTaken_NLP,
     DuodenalBiopsiesTaken_LLM,
     FellowPresent_NLP,
@@ -244,7 +246,6 @@ def insert_working_result(
     all_hard_data_in_agreement = None
     if llm_result is not None:
         comparison_fields = [
-            "Colonoscopy", "Endoscopy",
             "NumberOfDuodenalBiopsies", "DuodenalBiopsiesTaken", "FellowPresent"
         ]
         all_hard_data_in_agreement = 1

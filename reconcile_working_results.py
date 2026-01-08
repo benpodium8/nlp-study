@@ -41,24 +41,29 @@ def reconcile_working_results(conn):
     for row in rows:
         (
             id,
-            scope_nlp,
-            scope_llm,
-            biopsies_taken_nlp,
-            biopsies_taken_llm,
-            fellow_present_nlp,
-            fellow_present_llm,
+            ScopeType_NLP,
+            ScopeType_LLM,
+            NumberOfDuodenalBiopsies_NLP,
+            NumberOfDuodenalBiopsies_LLM,
+            DuodenalBiopsiesTaken_NLP,
+            DuodenalBiopsiesTaken_LLM,
+            FellowPresent_NLP,
+            FellowPresent_LLM
         ) = row
 
-        final_scope_type = reconcile_scope_type(scope_nlp, scope_llm)
+        final_scope_type = reconcile_scope_type(ScopeType_NLP, ScopeType_LLM)
 
         reconciled = {
             "id": id,
             "ScopeType": final_scope_type,
-            # numeric fields intentionally untouched
-            "DuodenalBiopsiesTaken_NLP": biopsies_taken_nlp,
-            "DuodenalBiopsiesTaken_LLM": biopsies_taken_llm,
-            "FellowPresent_NLP": fellow_present_nlp,
-            "FellowPresent_LLM": fellow_present_llm,
+            "ScopeType_NLP": ScopeType_NLP,
+            "ScopeType_LLM": ScopeType_LLM,
+            "NumberOfDuodenalBiopsies_NLP": NumberOfDuodenalBiopsies_NLP,
+            "NumberOfDuodenalBiopsies_LLM": NumberOfDuodenalBiopsies_LLM,
+            "DuodenalBiopsiesTaken_NLP": DuodenalBiopsiesTaken_NLP,
+            "DuodenalBiopsiesTaken_LLM": DuodenalBiopsiesTaken_LLM,
+            "FellowPresent_NLP": FellowPresent_NLP,
+            "FellowPresent_LLM": FellowPresent_LLM,
         }
 
         print(f"[RECONCILED] id={id} → {reconciled}")
