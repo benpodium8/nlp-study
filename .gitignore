@@ -2,3 +2,4 @@ data.db
 __pycache__
 .venv
 .github/
+output/
