@@ -41,9 +41,9 @@ def setup_parser():
     )
     
     parser.add_argument(
-        "--results",
+        "--working_results",
         action="store_true",
-        help="Display working results table (NLP and LLM analysis results)"
+        help="Display working results table (NLP and LLM analysis output)"
     )
     
     return parser
