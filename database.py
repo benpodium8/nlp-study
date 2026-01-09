@@ -371,16 +371,122 @@ def export_combined_results_to_csv(output_folder="output"):
 
 def safe_export_combined_results_to_csv(output_folder="output"):
     """
-    Safely export the combined results to a CSV file only if the output folder is empty.
-    If the folder contains data, it skips the export and prints a message.
+    Safely export the combined results to a CSV file only if the file does not already exist.
+    If the file exists, it skips the export and prints a message.
     """
     output_path = Path(output_folder)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Check if the output folder already contains files
-    if any(output_path.iterdir()):
-        print(f"Output folder '{output_folder}' already contains data. Export skipped.")
+    output_file = output_path / "combined_results.csv"
+
+    # Check if the output file already exists
+    if output_file.exists():
+        print(f"File '{output_file}' already exists. Export skipped.")
         return
 
     export_combined_results_to_csv(output_folder)
+
+
+def export_full_combined_results_to_csv(output_folder="output"):
+    """
+    Export all tables and their contents into a single CSV file.
+    Creates the output folder if it doesn't exist.
+    """
+    output_path = Path(output_folder)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect("data.db") as conn:
+        cursor = conn.cursor()
+
+        # Get all table names
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = cursor.fetchall()
+
+        # Prepare output file
+        output_file = output_path / "full_combined_results.csv"
+        with open(output_file, mode="w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+
+            for table_name, in tables:
+                writer.writerow([f"Table: {table_name}"])  # Table name header
+
+                # Fetch all rows from the table
+                cursor.execute(f"SELECT * FROM {table_name};")
+                rows = cursor.fetchall()
+
+                # Write column names and rows
+                column_names = [desc[0] for desc in cursor.description]
+                writer.writerow(column_names)
+                writer.writerows(rows)
+
+                writer.writerow([])  # Blank line between tables
+
+    print(f"Full combined results exported to {output_file}")
+
+
+def export_all_tables_combined_to_csv(output_folder="output"):
+    """
+    Combine all tables together using SQL joins and export the result as a CSV.
+    Creates the output folder if it doesn't exist.
+    """
+    output_path = Path(output_folder)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect("data.db") as conn:
+        cursor = conn.cursor()
+
+        # Combine all tables using SQL joins
+        query = """
+        SELECT notes.*, 
+               working_results.ScopeType_NLP, working_results.Colonoscopy_NLP, 
+               working_results.Endoscopy_NLP, working_results.NumberOfDuodenalBiopsies_NLP, 
+               working_results.DuodenalBiopsiesTaken_NLP, working_results.FellowPresent_NLP,
+               working_results.ScopeType_LLM, working_results.Colonoscopy_LLM, 
+               working_results.Endoscopy_LLM, working_results.NumberOfDuodenalBiopsies_LLM, 
+               working_results.DuodenalBiopsiesTaken_LLM, working_results.FellowPresent_LLM,
+               final_results.ScopeType AS Final_ScopeType, 
+               final_results.NumberOfDuodenalBiopsies AS Final_NumberOfDuodenalBiopsies, 
+               final_results.DuodenalBiopsiesTaken AS Final_DuodenalBiopsiesTaken, 
+               final_results.FellowPresent AS Final_FellowPresent
+        FROM notes
+        LEFT JOIN working_results ON notes.id = working_results.id
+        LEFT JOIN final_results ON notes.id = final_results.id;
+        """
+        cursor.execute(query)
+        combined_results = cursor.fetchall()
+
+        # Get column names
+        column_names = [desc[0] for desc in cursor.description]
+
+        # Write to CSV
+        output_file = output_path / "all_tables_combined_results.csv"
+        with open(output_file, mode="w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(column_names)  # Write header
+            writer.writerows(combined_results)  # Write data
+
+    print(f"All tables combined results exported to {output_file}")
+
+
+def safe_export_all_tables_combined_to_csv(output_folder="output"):
+    """
+    Safely combine all tables together using SQL joins and export the result as a CSV file.
+    If the file exists, it skips the export and prints a message.
+    """
+    output_path = Path(output_folder)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    output_file_1 = output_path / "all_tables_combined_results.csv"
+    output_file_2 = output_path / "full_combined_results.csv"
+
+    # Check if the output file already exists
+    if output_file_1.exists():
+        print(f"File '{output_file_1}' already exists. Export skipped.")
+        return
+    if output_file_2.exists():
+            print(f"File '{output_file_2}' already exists. Export skipped.")
+            return
+
+    export_all_tables_combined_to_csv(output_folder)
+    export_full_combined_results_to_csv(output_folder)
 
