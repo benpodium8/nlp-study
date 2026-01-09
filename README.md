@@ -1,29 +1,364 @@
-# nlp-study
+# Clinical NLP + LLM Study Pipeline (HIPAA‑Aware)
 
-## Setup
+## Overview
+This project is a **local, offline-first clinical note analysis pipeline** designed to extract structured data from endoscopy procedure notes using **two independent methods**:
 
-Python version: Python 3.12.10
+1. **Rule-based NLP (spaCy)** for deterministic extraction
+2. **Local Large Language Model (LLM via Ollama)** for semantic extraction and cross‑validation
 
-If at any point you get an error similar to
-".venv\scripts\activate.ps1 cannot be loaded because running scripts is disabled on this system. for more information, see about_execution_policies at https:/go.microsoft.com/fwlink/?linkid=135170"
+The system compares results from both methods, stores intermediate and final results in a local SQLite database, and exports reconciled outputs to CSV for downstream analysis.
 
-then you need to run
+> **Key design goals**
+> - Run entirely on a hospital workstation
+> - Never transmit PHI outside the machine
+> - Provide auditability, determinism, and error isolation
+> - Prevent duplicate processing and data overwrites
 
-> Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+---
 
-Create virtual environment
+## High-Level Architecture
 
-> python -m venv .venv
+```
+CSV (Clinical Notes)
+        │
+        ▼
+SQLite Database (notes)
+        │
+        ▼
+┌───────────────────────────────┐
+│ data_worker                   │
+│  ├─ NLP analysis (spaCy)      │
+│  ├─ LLM analysis (Ollama)     │
+│  └─ Store working_results     │
+└───────────────────────────────┘
+        │
+        ▼
+┌───────────────────────────────┐
+│ Reconciliation Layer          │
+│  ├─ Cross-check NLP vs LLM    │
+│  └─ Write final_results       │
+└───────────────────────────────┘
+        │
+        ▼
+CSV Exports (final + audit)
+```
 
-Activate virtual environment
+---
 
-> .venv\Scripts\activate
+## Windows Setup Instructions
 
-Install Dependencies:
-> pip install -r requirements.txt
+### 1. Prerequisites
 
-Start program: 
-> python app.py
-> python app.py --csv ../../../Downloads/endoscopy_notes.csv
-> python app.py --print
-> python app.py --analyze
+| Software | Purpose |
+|--------|---------|
+| **Windows 10/11** | Supported OS |
+| **Python 3.12+** | Core runtime |
+| **PowerShell** | Environment management |
+| **Ollama** | Local LLM runtime |
+
+---
+
+### 2. Install Python
+
+Download Python from:
+https://www.python.org/downloads/windows/
+
+During installation:
+- ✅ Check **"Add Python to PATH"**
+- ✅ Install `pip`
+
+Verify:
+```powershell
+python --version
+```
+
+---
+
+### 3. Clone or Copy Project
+
+Place the project in a local directory such as:
+```
+C:\Users\<you>\Documents\nlp-study
+```
+
+---
+
+### 4. PowerShell Execution Policy (One-Time)
+
+If you see:
+```
+.venv\Scripts\Activate.ps1 cannot be loaded
+```
+
+Run:
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+---
+
+### 5. Create & Activate Virtual Environment
+
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+```
+
+---
+
+### 6. Install Dependencies
+
+```powershell
+pip install -r requirements.txt
+```
+
+#### Dependency Breakdown
+
+| Package | Purpose |
+|-------|--------|
+| `spacy` | Deterministic NLP parsing |
+| `ollama` | Interface to local LLM |
+| `rich` | Progress bars & terminal UI |
+
+---
+
+### 7. Install and Start Ollama
+
+Download Ollama:
+https://ollama.com
+
+Pull the required model:
+```powershell
+ollama pull gemma2:2b
+```
+
+Ollama runs locally and does **not** require internet access after model download.
+
+---
+
+## Running the Program
+
+### Basic Entry Point
+
+```powershell
+python app.py
+```
+
+This displays CLI help.
+
+---
+
+### Ingest CSV
+
+```powershell
+python app.py --csv path\\to\\endoscopy_notes.csv
+```
+
+**Required CSV columns:**
+- MRN
+- Encounter
+- NoteCsnID
+- NoteDate
+- NoteType
+- Note
+
+Duplicates are automatically skipped.
+
+---
+
+### Run Full Analysis Pipeline
+
+```powershell
+python app.py --analyze --csv path\\to\\endoscopy_notes.csv
+```
+
+This will:
+1. Ingest notes
+2. Run NLP + LLM extraction
+3. Store working results
+4. Reconcile results
+5. Export CSV outputs
+
+---
+
+### View Database Contents
+
+```powershell
+python app.py --print
+python app.py --working_results
+```
+
+---
+
+## Detailed Component Walkthrough
+
+### `app.py`
+**Purpose:** Application entry point
+- Delegates execution to the CLI
+- No business logic
+
+HIPAA:
+- No data access
+- Safe bootstrap layer
+
+---
+
+### `cli.py`
+**Purpose:** Command-line interface & orchestration
+
+Responsibilities:
+- Argument parsing
+- Mode selection
+- Safe ordering of pipeline steps
+
+HIPAA:
+- No network access
+- Controls execution boundaries
+- Prevents accidental exports
+
+---
+
+### `database.py`
+**Purpose:** Local persistence and data integrity
+
+Tables:
+- `notes` – raw clinical notes
+- `working_results` – NLP & LLM outputs
+- `final_results` – reconciled outputs
+
+Safeguards:
+- Duplicate detection on ingest
+- Idempotent inserts
+- No overwrites of final results
+
+HIPAA Compliance:
+- SQLite stored locally
+- No encryption bypasses OS security
+- No outbound connections
+- Full audit trail retained
+
+---
+
+### `data_worker.py`
+**Purpose:** Core processing engine
+
+Workflow per note:
+1. Skip if already processed
+2. Run NLP analysis
+3. Run LLM analysis (with retries)
+4. Store results atomically
+
+Features:
+- Progress bar with ETA
+- Retry logic for malformed LLM output
+- Graceful failure isolation
+
+HIPAA:
+- Processes one note at a time in memory
+- No caching outside DB
+- Raw LLM output retained for audit
+
+---
+
+### `nlp_analysis.py`
+**Purpose:** Deterministic rule-based extraction
+
+Techniques:
+- Sentence segmentation
+- Regex-based entity detection
+- Negation handling
+
+Why it matters:
+- Fully explainable
+- Deterministic baseline
+
+HIPAA:
+- No ML training
+- No model downloads
+- No data persistence outside DB
+
+---
+
+### `llm_analysis.py`
+**Purpose:** Semantic extraction using local LLM
+
+Key Safeguards:
+- Strict JSON schema enforcement
+- Type validation
+- Boolean normalization
+- JSON repair layer
+
+Model:
+- `gemma2:2b` (local only)
+
+HIPAA:
+- Ollama runs locally
+- No API calls
+- No telemetry
+- No prompt logging outside SQLite
+
+---
+
+### `reconcile_working_results.py`
+**Purpose:** Final result decision logic
+
+Logic:
+- Compare NLP vs LLM hard fields
+- Require agreement
+- Null-out ambiguous cases
+
+Design philosophy:
+> **When in doubt, discard**
+
+HIPAA:
+- Prevents silent corruption
+- Ensures conservative outputs
+
+---
+
+### `display.py`
+**Purpose:** Human-readable inspection
+
+Features:
+- Truncated PHI display
+- Rich tables
+
+HIPAA:
+- Avoids full-note exposure by default
+- Operator-controlled visibility
+
+---
+
+## HIPAA Compliance Summary
+
+| Requirement | Implementation |
+|-----------|----------------|
+| Local processing | ✅ All compute on workstation |
+| No PHI exfiltration | ✅ No network calls |
+| Auditability | ✅ Raw + structured storage |
+| Deterministic fallback | ✅ NLP baseline |
+| Minimal exposure | ✅ Truncated display |
+| Data integrity | ✅ Idempotent inserts |
+
+⚠️ **Operational Notes**
+- Ensure workstation disk encryption is enabled
+- Restrict OS-level user access
+- Treat CSV exports as PHI
+
+---
+
+## Output Files
+
+Generated in `/output`:
+- `combined_results.csv`
+- `all_tables_combined_results.csv`
+- `full_combined_results.csv`
+
+Exports are **write-once** by default to prevent overwrites.
+
+---
+
+## Disclaimer
+
+This software assists with data extraction and research workflows.
+It **does not replace clinical judgment** and must be validated per institutional policy.
