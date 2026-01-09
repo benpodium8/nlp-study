@@ -39,18 +39,18 @@ def reconcile_scope_type(scope_nlp: Optional[str], scope_llm: Optional[str]) -> 
 
     if norm_llm and norm_llm == norm_nlp:
         return scope_llm
+    
+    if scope_llm and not scope_nlp:
+        return scope_llm
+
+    if scope_nlp and not scope_llm:
+        return scope_nlp
 
     llm_models = extract_model_tokens(scope_llm)
     nlp_models = extract_model_tokens(scope_nlp)
 
     if llm_models and llm_models == nlp_models:
         return scope_llm if scope_llm and len(scope_llm) >= len(scope_nlp or "") else scope_nlp
-
-    if norm_llm and not norm_nlp:
-        return scope_llm
-
-    if norm_nlp and not norm_llm:
-        return scope_nlp
 
     return None
 
