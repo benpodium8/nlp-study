@@ -1,4 +1,4 @@
-# Clinical NLP + LLM Study Pipeline (HIPAA‑Aware)
+# Clinical NLP + LLM dual evaluation study for clinical notes
 
 ## Overview
 This project is a **local, offline-first clinical note analysis pipeline** designed to extract structured data from endoscopy procedure notes using **two independent methods**:
