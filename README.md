@@ -99,9 +99,15 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 
 ### 5. Create & Activate Virtual Environment
 
+On Windows: 
 ```powershell
 python -m venv .venv
 .venv\Scripts\activate
+```
+
+On Mac:
+```
+source .venv/bin/activate
 ```
 
 ---
