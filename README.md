@@ -1,6 +1,7 @@
 # Clinical NLP + LLM dual evaluation study for clinical notes
 
 ## Overview
+
 This project is a **local, offline-first clinical note analysis pipeline** designed to extract structured data from endoscopy procedure notes using **two independent methods**:
 
 1. **Rule-based NLP (spaCy)** for deterministic extraction
@@ -9,6 +10,7 @@ This project is a **local, offline-first clinical note analysis pipeline** desig
 The system compares results from both methods, stores intermediate and final results in a local SQLite database, and exports reconciled outputs to CSV for downstream analysis.
 
 > **Key design goals**
+>
 > - Run entirely on a hospital workstation
 > - Never transmit PHI outside the machine
 > - Provide auditability, determinism, and error isolation
@@ -49,12 +51,12 @@ CSV Exports (final + audit)
 
 ### 1. Prerequisites
 
-| Software | Purpose |
-|--------|---------|
-| **Windows 10/11** | Supported OS |
-| **Python 3.12+** | Core runtime |
-| **PowerShell** | Environment management |
-| **Ollama** | Local LLM runtime |
+| Software          | Purpose                |
+| ----------------- | ---------------------- |
+| **Windows 10/11** | Supported OS           |
+| **Python 3.12+**  | Core runtime           |
+| **PowerShell**    | Environment management |
+| **Ollama**        | Local LLM runtime      |
 
 ---
 
@@ -64,10 +66,12 @@ Download Python from:
 https://www.python.org/downloads/windows/
 
 During installation:
+
 - ✅ Check **"Add Python to PATH"**
 - ✅ Install `pip`
 
 Verify:
+
 ```powershell
 python --version
 ```
@@ -77,6 +81,7 @@ python --version
 ### 3. Clone or Copy Project
 
 Place the project in a local directory such as:
+
 ```
 C:\Users\<you>\Documents\nlp-study
 ```
@@ -86,11 +91,13 @@ C:\Users\<you>\Documents\nlp-study
 ### 4. PowerShell Execution Policy (One-Time)
 
 If you see:
+
 ```
 .venv\Scripts\Activate.ps1 cannot be loaded
 ```
 
 Run:
+
 ```powershell
 Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 ```
@@ -99,13 +106,15 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 
 ### 5. Create & Activate Virtual Environment
 
-On Windows: 
+On Windows:
+
 ```powershell
 python -m venv .venv
 .venv\Scripts\activate
 ```
 
-On Mac:
+On Mac or Linux:
+
 ```
 source .venv/bin/activate
 ```
@@ -120,11 +129,11 @@ pip install -r requirements.txt
 
 #### Dependency Breakdown
 
-| Package | Purpose |
-|-------|--------|
-| `spacy` | Deterministic NLP parsing |
-| `ollama` | Interface to local LLM |
-| `rich` | Progress bars & terminal UI |
+| Package  | Purpose                     |
+| -------- | --------------------------- |
+| `spacy`  | Deterministic NLP parsing   |
+| `ollama` | Interface to local LLM      |
+| `rich`   | Progress bars & terminal UI |
 
 ---
 
@@ -133,9 +142,16 @@ pip install -r requirements.txt
 Download Ollama:
 https://ollama.com
 
+Install Ollama on Linux or Mac:
+
+```
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
 Pull the required model:
+
 ```powershell
-ollama pull gemma2:2b
+ollama pull gemma4:e4b
 ```
 
 Ollama runs locally and does **not** require internet access after model download.
@@ -161,6 +177,7 @@ python app.py --csv path\\to\\endoscopy_notes.csv
 ```
 
 **Required CSV columns:**
+
 - MRN
 - Encounter
 - NoteCsnID
@@ -179,6 +196,7 @@ python app.py --analyze --csv path\\to\\endoscopy_notes.csv
 ```
 
 This will:
+
 1. Ingest notes
 2. Run NLP + LLM extraction
 3. Store working results
@@ -199,25 +217,31 @@ python app.py --working_results
 ## Detailed Component Walkthrough
 
 ### `app.py`
+
 **Purpose:** Application entry point
+
 - Delegates execution to the CLI
 - No business logic
 
 HIPAA:
+
 - No data access
 - Safe bootstrap layer
 
 ---
 
 ### `cli.py`
+
 **Purpose:** Command-line interface & orchestration
 
 Responsibilities:
+
 - Argument parsing
 - Mode selection
 - Safe ordering of pipeline steps
 
 HIPAA:
+
 - No network access
 - Controls execution boundaries
 - Prevents accidental exports
@@ -225,19 +249,23 @@ HIPAA:
 ---
 
 ### `database.py`
+
 **Purpose:** Local persistence and data integrity
 
 Tables:
+
 - `notes` – raw clinical notes
 - `working_results` – NLP & LLM outputs
 - `final_results` – reconciled outputs
 
 Safeguards:
+
 - Duplicate detection on ingest
 - Idempotent inserts
 - No overwrites of final results
 
 HIPAA Compliance:
+
 - SQLite stored locally
 - No encryption bypasses OS security
 - No outbound connections
@@ -246,20 +274,24 @@ HIPAA Compliance:
 ---
 
 ### `data_worker.py`
+
 **Purpose:** Core processing engine
 
 Workflow per note:
+
 1. Skip if already processed
 2. Run NLP analysis
 3. Run LLM analysis (with retries)
 4. Store results atomically
 
 Features:
+
 - Progress bar with ETA
 - Retry logic for malformed LLM output
 - Graceful failure isolation
 
 HIPAA:
+
 - Processes one note at a time in memory
 - No caching outside DB
 - Raw LLM output retained for audit
@@ -267,18 +299,22 @@ HIPAA:
 ---
 
 ### `nlp_analysis.py`
+
 **Purpose:** Deterministic rule-based extraction
 
 Techniques:
+
 - Sentence segmentation
 - Regex-based entity detection
 - Negation handling
 
 Why it matters:
+
 - Fully explainable
 - Deterministic baseline
 
 HIPAA:
+
 - No ML training
 - No model downloads
 - No data persistence outside DB
@@ -286,18 +322,22 @@ HIPAA:
 ---
 
 ### `llm_analysis.py`
+
 **Purpose:** Semantic extraction using local LLM
 
 Key Safeguards:
+
 - Strict JSON schema enforcement
 - Type validation
 - Boolean normalization
 - JSON repair layer
 
 Model:
-- `gemma2:2b` (local only)
+
+- `gemma4:e4b` (local only)
 
 HIPAA:
+
 - Ollama runs locally
 - No API calls
 - No telemetry
@@ -306,30 +346,37 @@ HIPAA:
 ---
 
 ### `reconcile_working_results.py`
+
 **Purpose:** Final result decision logic
 
 Logic:
+
 - Compare NLP vs LLM hard fields
 - Require agreement
 - Null-out ambiguous cases
 
 Design philosophy:
+
 > **When in doubt, discard**
 
 HIPAA:
+
 - Prevents silent corruption
 - Ensures conservative outputs
 
 ---
 
 ### `display.py`
+
 **Purpose:** Human-readable inspection
 
 Features:
+
 - Truncated PHI display
 - Rich tables
 
 HIPAA:
+
 - Avoids full-note exposure by default
 - Operator-controlled visibility
 
@@ -337,16 +384,17 @@ HIPAA:
 
 ## HIPAA Compliance Summary
 
-| Requirement | Implementation |
-|-----------|----------------|
-| Local processing | ✅ All compute on workstation |
-| No PHI exfiltration | ✅ No network calls |
-| Auditability | ✅ Raw + structured storage |
-| Deterministic fallback | ✅ NLP baseline |
-| Minimal exposure | ✅ Truncated display |
-| Data integrity | ✅ Idempotent inserts |
+| Requirement            | Implementation                |
+| ---------------------- | ----------------------------- |
+| Local processing       | ✅ All compute on workstation |
+| No PHI exfiltration    | ✅ No network calls           |
+| Auditability           | ✅ Raw + structured storage   |
+| Deterministic fallback | ✅ NLP baseline               |
+| Minimal exposure       | ✅ Truncated display          |
+| Data integrity         | ✅ Idempotent inserts         |
 
 ⚠️ **Operational Notes**
+
 - Ensure workstation disk encryption is enabled
 - Restrict OS-level user access
 - Treat CSV exports as PHI
@@ -356,6 +404,7 @@ HIPAA:
 ## Output Files
 
 Generated in `/output`:
+
 - `combined_results.csv`
 - `all_tables_combined_results.csv`
 - `full_combined_results.csv`
