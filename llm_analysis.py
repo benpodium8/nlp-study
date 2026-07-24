@@ -3,7 +3,7 @@ import re
 from typing import Tuple
 import ollama
 
-LOCAL_MODEL = "gemma4:e4b"
+LOCAL_MODEL = "gemma4:e2b"
 
 EXPECTED_FIELDS = {
     "id": int,

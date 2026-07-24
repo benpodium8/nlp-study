@@ -152,7 +152,7 @@ curl -fsSL https://ollama.com/install.sh | sh
 Pull the required model:
 
 ```powershell
-ollama pull gemma4:e4b
+ollama pull gemma4:e2b
 ```
 
 Ollama runs locally and does **not** require internet access after model download.
@@ -384,7 +384,7 @@ Key Safeguards:
 
 Model:
 
-- `gemma4:e4b` (local only)
+- `gemma4:e2b` (local only)
 
 HIPAA:
 
