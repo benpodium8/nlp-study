@@ -196,6 +196,16 @@ Duplicates are automatically skipped.
 python app.py --analyze --csv path\\to\\endoscopy_notes.csv
 ```
 
+```bash
+python app.py --analyze --csv path/to/endoscopy_notes.csv
+```
+
+For example, if the notes.csv is placed inside the same folder as the source code, the full analysis pipeline is:
+
+```bash
+python app.py --analyze --csv ./notes.csv
+```
+
 This will:
 
 1. Ingest notes
@@ -211,6 +221,45 @@ This will:
 ```powershell
 python app.py --print
 python app.py --working_results
+```
+
+---
+
+### Troubleshooting:
+
+The `notes.csv` file may replace column names with underscores or dashes depending on client export/import differences in platforms.
+For example, if you see a message like this:
+
+```((.venv) ) ben@deb-developer-vm:~/Documents/GitHub/nlp-study$ python app.py --analyze --csv ./notes.csv
+Traceback (most recent call last):
+File "/home/ben/Documents/GitHub/nlp-study/app.py", line 4, in <module>
+main()
+File "/home/ben/Documents/GitHub/nlp-study/cli.py", line 118, in main
+handle_data_worker_mode(conn, args.csv)
+File "/home/ben/Documents/GitHub/nlp-study/cli.py", line 62, in handle_data_worker_mode
+ingest_csv(csv_file, conn)
+File "/home/ben/Documents/GitHub/nlp-study/database.py", line 155, in ingest_csv
+raise ValueError(f"CSV must contain columns: {required_columns}")
+ValueError: CSV must contain columns: {'NoteType', 'MRN', 'Note', 'Encounter', 'NoteCsnID', 'NoteDate'}
+
+```
+
+Then the column names have been incorrectly coerced to something like:
+
+```
+
+id,mrn,encounter,note_csn_id,note_date,note_type,note
+
+```
+
+or similar.
+
+To parse data, the column names must exactly match:
+
+```
+
+id,MRN,Encounter,NoteCsnID,NoteDate,NoteType,Note
+
 ```
 
 ---
@@ -418,3 +467,7 @@ Exports are **write-once** by default to prevent overwrites.
 
 This software assists with data extraction and research workflows.
 It **does not replace clinical judgment** and must be validated per institutional policy.
+
+```
+
+```
