@@ -54,7 +54,7 @@ CSV Exports (final + audit)
 | Software          | Purpose                |
 | ----------------- | ---------------------- |
 | **Windows 10/11** | Supported OS           |
-| **Python 3.12+**  | Core runtime           |
+| **Python 3.12**   | Core runtime           |
 | **PowerShell**    | Environment management |
 | **Ollama**        | Local LLM runtime      |
 
@@ -116,6 +116,7 @@ python -m venv .venv
 On Mac or Linux:
 
 ```
+python -m venv .venv
 source .venv/bin/activate
 ```
 
