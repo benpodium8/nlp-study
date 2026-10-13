@@ -38,6 +38,8 @@ Typical use
   python app.py --analyze --csv notes.csv   ingest, analyse every note, write {EXPORT_PATH}
   python app.py --analyze                   resume: analyse only the notes without a result
   python app.py --analyze --model gemma3:4b local testing only: analyse with another model
+  python app.py --clean                     delete {DB_PATH} and {EXPORT_PATH} from earlier runs
+  python app.py --clean --analyze --csv notes.csv   start over from scratch
 
 Output
   {EXPORT_PATH}   one row per note: the identifiers, the ten extracted fields, the
@@ -53,7 +55,7 @@ def setup_parser():
     Creates and configures the argument parser for the CLI.
 
     Returns:
-        argparse.ArgumentParser: Parser with the --csv, --analyze and --model options.
+        argparse.ArgumentParser: Parser with the --csv, --analyze, --model and --clean options.
     """
     parser = argparse.ArgumentParser(
         description=DESCRIPTION,
@@ -87,7 +89,39 @@ def setup_parser():
         ),
     )
 
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help=(
+            f"Delete the files earlier runs generated ({DB_PATH} and its journal files, "
+            f"{EXPORT_PATH}) before doing anything else. This discards every stored result"
+        ),
+    )
+
     return parser
+
+
+def clean():
+    """
+    Deletes the files earlier runs generated: the database (with any SQLite journal files)
+    and the export. Removes the export folder too if that leaves it empty.
+    """
+    generated = [DB_PATH] + [DB_PATH.with_name(DB_PATH.name + s) for s in ("-journal", "-wal", "-shm")]
+    generated.append(EXPORT_PATH)
+
+    removed = False
+    for path in generated:
+        if path.exists():
+            path.unlink()
+            print(f"Deleted {path}")
+            removed = True
+
+    if EXPORT_PATH.parent.is_dir() and not any(EXPORT_PATH.parent.iterdir()):
+        EXPORT_PATH.parent.rmdir()
+        print(f"Deleted {EXPORT_PATH.parent}/")
+
+    if not removed:
+        print("Nothing to clean.")
 
 
 def print_status(model: str):
@@ -124,21 +158,27 @@ def print_status(model: str):
 
 def main():
     """
-    Main entry point: ingests the CSV if one is given, then runs the analysis if requested.
+    Main entry point: cleans up earlier runs if asked, ingests the CSV if one is given,
+    then runs the analysis if requested.
     With no options, prints the help text and the current status.
     """
     parser = setup_parser()
     args = parser.parse_args()
+
+    if args.csv and not args.csv.exists():
+        print(f"Error: CSV file not found: {args.csv}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.clean:
+        clean()
+        if not args.csv and not args.analyze:
+            sys.exit(0)
 
     if not args.csv and not args.analyze:
         parser.print_help()
         print()
         print_status(args.model)
         sys.exit(0)
-
-    if args.csv and not args.csv.exists():
-        print(f"Error: CSV file not found: {args.csv}", file=sys.stderr)
-        sys.exit(1)
 
     print(f"Using database {DB_PATH.resolve()}")
     conn = create_db(DB_PATH)

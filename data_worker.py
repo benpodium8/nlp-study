@@ -33,7 +33,7 @@ def analyze_note(note_id: int, note: str, model: str, console: Console) -> Analy
     """
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            result, raw_response = llm_analysis(note_id, note, model)
+            result, raw_response = llm_analysis(note_id, note, model, attempt)
             return Analysis(result, raw_response, 0, attempt, None)
         except LLMAnalysisError as e:
             error = str(e)

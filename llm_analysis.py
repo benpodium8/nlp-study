@@ -14,7 +14,24 @@ DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 
 # Generation settings. Temperature 0 makes decoding greedy, so the same note gives the
 # same answer on every run, which a study needs; Ollama's server default is 0.8.
-GENERATION_OPTIONS = {"temperature": 0}
+# A valid answer is ~120 tokens; num_predict stops a model stuck repeating a phrase
+# instead of letting it run to the context limit.
+GENERATION_OPTIONS = {"temperature": 0, "num_predict": 1024}
+
+# Greedy decoding gives the same output on every call, so a retry after a repetition
+# loop would loop again. Retries therefore sample, with the attempt number as the
+# seed so a rerun of the study still reproduces them.
+RETRY_TEMPERATURE = 0.8
+
+
+def generation_options(attempt: int) -> dict:
+    """
+    Returns the Ollama options for the given attempt (1-based): greedy on the first
+    attempt, seeded sampling on retries.
+    """
+    if attempt == 1:
+        return GENERATION_OPTIONS
+    return {**GENERATION_OPTIONS, "temperature": RETRY_TEMPERATURE, "seed": attempt}
 
 EXPECTED_FIELDS = {
     "id": int,
@@ -259,9 +276,10 @@ def _validate_llm_result(result: dict):
             )
 
 
-def llm_analysis(id: int, note: str, model: str = LOCAL_MODEL) -> Tuple[dict, str]:
+def llm_analysis(id: int, note: str, model: str = LOCAL_MODEL, attempt: int = 1) -> Tuple[dict, str]:
     """
     Analyzes a clinical note using an LLM (the Ollama model named by model) to extract the study fields.
+    attempt (1-based) selects the generation options; see generation_options.
 
     Returns:
         (result, raw): the validated field dictionary (with the note id) and the verbatim model text.
@@ -272,7 +290,7 @@ def llm_analysis(id: int, note: str, model: str = LOCAL_MODEL) -> Tuple[dict, st
     ]
 
     try:
-        response = ollama.chat(model=model, messages=messages, think=False, options=GENERATION_OPTIONS)
+        response = ollama.chat(model=model, messages=messages, think=False, options=generation_options(attempt))
     except Exception as e:
         raise LLMAnalysisError(f"LLM call failed: {e}")
 

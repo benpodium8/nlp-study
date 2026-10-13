@@ -163,12 +163,13 @@ Ollama runs locally and does **not** require internet access after model downloa
 python app.py
 ```
 
-With no options it prints what the program needs (the packages, Ollama and the model, the CSV header, where files go), the typical commands, and a status check of the current directory: whether Ollama is reachable and the model is pulled, how many notes `data.db` holds and how many are still pending, and whether `output/results.csv` already exists. There are two options, which can be combined:
+With no options it prints what the program needs (the packages, Ollama and the model, the CSV header, where files go), the typical commands, and a status check of the current directory: whether Ollama is reachable and the model is pulled, how many notes `data.db` holds and how many are still pending, and whether `output/results.csv` already exists. There are three options, which can be combined (`--model` is a local-testing override, see below):
 
 | Option         | Effect                                                                                   |
 | -------------- | ---------------------------------------------------------------------------------------- |
 | `--csv FILE`   | Ingest the notes in `FILE` into `data.db` (duplicates skipped); reports how many were added |
 | `--analyze`    | Run the LLM on every note that has no result yet, then write `output/results.csv`          |
+| `--clean`      | Delete `data.db` (and any SQLite journal files) and `output/results.csv` from earlier runs, before anything else. Discards every stored result |
 
 ---
 
@@ -359,7 +360,10 @@ Key Safeguards:
 - Strict JSON schema enforcement
 - Type validation, with true/false and numeric strings coerced to integers
 - JSON repair layer
-- Greedy decoding (temperature 0) so a note gives the same answer on every run
+- Greedy decoding (temperature 0) so a note gives the same answer on every run; retries after
+  invalid JSON sample at temperature 0.8 with the attempt number as the seed, since a greedy
+  retry would repeat the same output
+- Output capped at 1024 tokens (`num_predict`) so a model stuck repeating a phrase fails fast
 
 Model:
 
