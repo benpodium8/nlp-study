@@ -4,3 +4,5 @@ __pycache__
 .github/
 output/
 notes.csv
+samples
+environment-notes
