@@ -9,8 +9,8 @@ from rich.progress import Progress, BarColumn, TimeElapsedColumn, TimeRemainingC
 from database import COUNT_NOTES_SQL, SELECT_PENDING_NOTES_SQL, insert_result
 from llm_analysis import LOCAL_MODEL, llm_analysis, LLMAnalysisError, RetryableLLMError
 
-# Total attempts per note when the model's output is unusable (invalid JSON, runaway text).
-# Every other failure is recorded on the first attempt.
+# Total attempts per note when the model's output is unusable (invalid JSON, runaway text,
+# a value that fails validation). A failed call (server down) is recorded on the first attempt.
 MAX_ATTEMPTS = 5
 
 # A running summary (done, failed, speed, time remaining) is logged after this many notes.
@@ -29,13 +29,16 @@ def analyze_note(note_id: int, note: str, model: str, console: Console) -> Analy
     """
     Runs the LLM analysis on one note with the given model.
     Retries when the model's output is unusable (RetryableLLMError), up to MAX_ATTEMPTS
-    attempts in total; any other failure is recorded immediately.
+    attempts in total, telling the model why its previous answer was rejected; any other
+    failure is recorded immediately.
     """
+    rejected = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            result, raw_response = llm_analysis(note_id, note, model, attempt)
+            result, raw_response = llm_analysis(note_id, note, model, attempt, rejected)
             return Analysis(result, raw_response, 0, attempt, None)
         except RetryableLLMError as e:
+            rejected = str(e)
             if attempt < MAX_ATTEMPTS:
                 _log(console, 
                     f"[yellow]retry [/yellow] note {note_id}: "

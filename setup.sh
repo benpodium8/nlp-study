@@ -725,7 +725,7 @@ def tier1(mods, model, reps, budget, notes):
 
     head("Throughput")
     if not raw.strip().startswith("{"):
-        warn("output is not bare JSON, so the repair layer is doing work; data_worker retries up to 5x per note on JSON errors")
+        warn("output is not bare JSON, so the repair layer is doing work; data_worker retries up to 5x per note on invalid or unusable output")
     avg = sum(times) / len(times)
     print(f"        {avg:.1f}s per note (range {min(times):.1f}-{max(times):.1f}s)")
     for n in (100, 1000, notes):

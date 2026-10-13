@@ -226,7 +226,7 @@ While it runs, the program reports what it is doing:
 [15:50:40] retry  note 2: attempt 1/5 did not return valid JSON
 [15:51:55] ok     note 2 (2/330) 149.1s, attempt 2: scope=None egd=0 colonoscopy=0 duodenal_biopsies=0 taken=0 fellow=0
 ...
-[16:02:10] FAILED note 7 (7/330) after 5 attempt(s), 301.4s: Invalid JSON returned by LLM: Expecting value: line 1 column 1 (char 0)
+[16:02:10] FAILED note 7 (7/330) after 5 attempt(s), 301.4s: the output was not valid JSON (Expecting value: line 1 column 1 (char 0)).
 [16:08:33] progress 10/330 done, 1 failed, 68.1s per note, 0:11:21 elapsed, about 6:03:12 remaining
 ...
 [21:51:02] Finished 330 note(s) in 6:02:32: 326 ok, 4 failed, 65.9s per note.
@@ -363,10 +363,12 @@ Key Safeguards:
 - Output constrained to a JSON schema (`format=`): always a bare object with exactly the study
   fields, 0/1 flags, and text fields capped at 1000 characters
 - Greedy decoding (temperature 0) so a note gives the same answer on every run
-- Retries (up to 5 attempts) when the output is invalid JSON or a text field reaches the
-  1000-character cap (a repetition loop); retries sample at temperature 0.8 with a repeat
+- Retries (up to 5 attempts) when the output is invalid JSON, fails validation, or a text field
+  reaches the 1000-character cap (a repetition loop); the retry prompt says why the previous
+  answer was rejected, and retries sample at temperature 0.8 with a repeat
   penalty of 1.1 and the attempt number as the seed, since a greedy retry would repeat the loop
-- Output capped at 2048 tokens (`num_predict`)
+- Output capped at 2048 tokens (`num_predict`); context window `NLP_CONTEXT_LENGTH` tokens
+  (default 8192, `num_ctx`) on every call, the same as an Argon job
 
 Model:
 

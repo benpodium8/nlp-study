@@ -12,11 +12,16 @@ LOCAL_MODEL = "medgemma:27b"
 # Where the ollama client connects when OLLAMA_HOST is not set.
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 
+# Context window in tokens, passed on every call so a workstation run uses the same window
+# as an Argon job (setup.sh starts Ollama with OLLAMA_CONTEXT_LENGTH from the same variable).
+# Without it Ollama picks its own default, 4096 on a CPU-only machine.
+CONTEXT_LENGTH = int(os.environ.get("NLP_CONTEXT_LENGTH", "8192"))
+
 # Generation settings. Temperature 0 makes decoding greedy, so the same note gives the
 # same answer on every run, which a study needs; Ollama's server default is 0.8.
 # A valid answer is ~120 tokens; num_predict stops a model stuck repeating a phrase
 # instead of letting it run to the context limit.
-GENERATION_OPTIONS = {"temperature": 0, "num_predict": 2048}
+GENERATION_OPTIONS = {"temperature": 0, "seed": 0, "num_ctx": CONTEXT_LENGTH, "num_predict": 2048}
 
 # Greedy decoding gives the same output on every call, so a retry after a repetition
 # loop would loop again. Retries therefore sample, with the attempt number as the
@@ -170,6 +175,13 @@ NOTE:
 \"\"\"{note}\"\"\"
 """
 
+# Appended to the user prompt on a retry. The rejected answer itself is not sent back:
+# when it is a repetition loop, showing it to the model invites the same loop.
+RETRY_PROMPT = """
+Your previous answer for this note was rejected: {reason}
+Answer again, following the OUTPUT and FIELD RULES exactly.
+"""
+
 JSON_FENCE_RE = re.compile(
     r"```(?:json)?\s*(\{.*?\})\s*```",
     re.DOTALL | re.IGNORECASE
@@ -185,7 +197,10 @@ class LLMAnalysisError(Exception):
 
 
 class RetryableLLMError(LLMAnalysisError):
-    """The model's output was unusable in a way another attempt may fix (invalid JSON, a runaway string)."""
+    """
+    The model's output was unusable in a way another attempt may fix: invalid JSON, a runaway
+    string, or a value that fails validation. The message is shown to the model on the retry.
+    """
 
 
 class OllamaStatus(NamedTuple):
@@ -295,31 +310,46 @@ def _validate_llm_result(result: dict):
     # Required fields and types
     for field, expected_type in EXPECTED_FIELDS.items():
         if field not in result:
-            raise LLMAnalysisError(f"Missing field: {field}")
+            raise RetryableLLMError(f"the field {field} is missing.")
 
         if not isinstance(result[field], expected_type):
-            raise LLMAnalysisError(
-                f"Invalid type for '{field}': "
-                f"expected {expected_type}, got {type(result[field])}"
+            raise RetryableLLMError(
+                f"{field} must be {_type_name(expected_type)}, got {json.dumps(result[field])}."
             )
 
     # No extra fields
     extra_fields = set(result.keys()) - set(EXPECTED_FIELDS.keys())
     if extra_fields:
-        raise LLMAnalysisError(f"Unexpected fields returned: {extra_fields}")
+        raise RetryableLLMError(f"unexpected fields {', '.join(sorted(extra_fields))}.")
 
     # Boolean-as-int enforcement
     for field in BOOL_FIELDS:
         if result[field] not in (0, 1):
-            raise LLMAnalysisError(
-                f"{field} must be 0 or 1, got {result[field]}"
-            )
+            raise RetryableLLMError(f"{field} must be 0 or 1, got {json.dumps(result[field])}.")
+
+    count = result["NumberOfDuodenalBiopsies"]
+    if count is not None and count < 0:
+        raise RetryableLLMError(f"NumberOfDuodenalBiopsies must not be negative, got {count}.")
 
 
-def llm_analysis(id: int, note: str, model: str = LOCAL_MODEL, attempt: int = 1) -> Tuple[dict, str]:
+def _type_name(expected_type) -> str:
+    """Names an EXPECTED_FIELDS type the way the prompt does ("a string or null")."""
+    names = {str: "a string", int: "an integer", type(None): "null"}
+    types = expected_type if isinstance(expected_type, tuple) else (expected_type,)
+    return " or ".join(names.get(t, t.__name__) for t in types)
+
+
+def llm_analysis(
+    id: int, note: str, model: str = LOCAL_MODEL, attempt: int = 1, rejected: str | None = None
+) -> Tuple[dict, str]:
     """
     Analyzes a clinical note using an LLM (the Ollama model named by model) to extract the study fields.
-    attempt (1-based) selects the generation options; see generation_options.
+    attempt (1-based) selects the generation options; see generation_options. rejected is the
+    reason the previous attempt failed (a RetryableLLMError message); it is added to the prompt.
+
+    Raises:
+        RetryableLLMError: the output was unusable; another attempt may succeed.
+        LLMAnalysisError: the call itself failed.
 
     Returns:
         (result, raw): the validated field dictionary (with the note id) and the verbatim model text.
@@ -328,6 +358,8 @@ def llm_analysis(id: int, note: str, model: str = LOCAL_MODEL, attempt: int = 1)
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": USER_PROMPT.format(note=note)},
     ]
+    if rejected:
+        messages[1]["content"] += RETRY_PROMPT.format(reason=rejected)
 
     # Each call (every note and every retry) gets its own client, so its HTTP connection
     # is closed when the call returns instead of being held open between notes.
@@ -344,11 +376,16 @@ def llm_analysis(id: int, note: str, model: str = LOCAL_MODEL, attempt: int = 1)
     try:
         parsed = parse_json_with_repair(clean)
     except json.JSONDecodeError as e:
-        raise RetryableLLMError(f"Invalid JSON returned by LLM: {e}")
+        raise RetryableLLMError(f"the output was not valid JSON ({e}).")
+    if not isinstance(parsed, dict):
+        raise RetryableLLMError("the output was not a JSON object.")
 
     runaway = [k for k, v in parsed.items() if isinstance(v, str) and len(v) >= MAX_TEXT_CHARS]
     if runaway:
-        raise RetryableLLMError(f"Runaway text in {', '.join(runaway)} (reached {MAX_TEXT_CHARS} characters)")
+        raise RetryableLLMError(
+            f"{', '.join(runaway)} repeated text until it reached the {MAX_TEXT_CHARS}-character limit; "
+            "quote one sentence or line from the note."
+        )
 
     parsed["id"] = id
 
