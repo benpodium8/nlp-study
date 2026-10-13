@@ -131,7 +131,7 @@ notes.csv ──> SQLite notes table
 
 | Invocation | Effect |
 | --- | --- |
-| `python app.py` | Prints help and exits 0 |
+| `python app.py` | Prints what the program needs, typical use, and a status check of the current directory (Ollama reachable, model pulled, notes in `data.db` and how many are pending, export present), then exits 0. On a login node the Ollama line says NOT reachable, which is expected there; the probe is a 3 s client request and starts nothing |
 | `python app.py --csv FILE` | Ingests the CSV (duplicates skipped) and reports rows read, notes added and duplicates skipped |
 | `python app.py --analyze --csv FILE` | Ingests, runs the LLM on every note without a result, writes `output/results.csv` |
 | `python app.py --analyze` | Same, without ingesting. Resumes an interrupted run |
@@ -855,10 +855,10 @@ Symptoms are grouped by where they appear. Each entry gives the cause and the fi
 #### CSV must contain columns
 
 ```
-ValueError: CSV must contain columns: {'NoteType', 'MRN', 'Note', 'Encounter', 'NoteCsnID', 'NoteDate'}
+Error: CSV is missing the column(s) MRN, Encounter. Required (case-sensitive): MRN, Encounter, NoteCsnID, NoteDate, NoteType, Note. Header found: \ufeffMRN, EncounterID, NoteCsnID, NoteDate, NoteType, Note
 ```
 
-Cause: the header does not contain the six names exactly. Three variants seen:
+Cause: the header does not contain the six names exactly. The message lists the names it could not find and the header it did find (`REQUIRED_CSV_COLUMNS` in `database.py`). Three variants seen:
 
 1. Lower-case snake_case header from a database export: `id,mrn,encounter,note_csn_id,note_date,note_type,note`.
 
@@ -1194,7 +1194,7 @@ Things to hold in mind while changing the code, grouped by the layer they affect
 
 12. **`LOCAL_MODEL` in `llm_analysis.py` is parsed by `sed`.** Keep it a single line of the form `LOCAL_MODEL = "name:tag"` at column 0. Any model change requires `./setup.sh` on a login node to fetch the weights (and it prunes the old ones), and the README should be updated in the same commit (BACKLOG B24).
 13. **Model size budget.** `gemma4:e2b` is 5.12 B parameters at Q4_K_M, about 7.2 GB, and is a reasoning model that emits a thinking trace by default. Gemma 3 12B (`hf.co/ggml-org/gemma-3-12b-it-GGUF:Q4_K_M`) is about 7.8 GB. Budget 8 to 10 GB of VRAM once the KV cache is allocated. The September job script pinned `gpu_p100` (16 GB) for that reason; the rewrite requests only `ngpus=1`, so pin a card type with `#$ -l <complex>` if a small card would silently fall back to CPU. CPU inference needs that much RAM plus headroom.
-14. **The module-level `ollama` client is wired by `OLLAMA_HOST` at import time.** Do not create `ollama.Client()` with a hard-coded host or port, and do not import `ollama` before the host is exported. The port is random per job to avoid collisions with other users on the node. If you add a client with a timeout (BACKLOG B15), keep it reading `OLLAMA_HOST`.
+14. **The module-level `ollama` client is wired by `OLLAMA_HOST` at import time.** Do not create `ollama.Client()` with a hard-coded host or port, and do not import `ollama` before the host is exported. The port is random per job to avoid collisions with other users on the node. If you add a client with a timeout (BACKLOG B15), keep it reading `OLLAMA_HOST`. `ollama_status()` in `llm_analysis.py` follows that rule: the no-argument `python app.py` builds a short-lived `ollama.Client(timeout=3)` that reads `OLLAMA_HOST` at call time and only lists models.
 15. **Ollama is not deterministic by default.** `ollama.chat()` is called without `options`, so the server default temperature (0.8) applies despite the prompt calling itself deterministic. For reproducibility add `options={"temperature": 0, "seed": <int>}` and use `format=` with the JSON schema, which also removes the markdown fences every saved response currently has (BACKLOG B9). Re-run the preflight after any change here.
 16. **Context window.** The rewrite sets `OLLAMA_CONTEXT_LENGTH=8192` on the container (`NLP_CONTEXT_LENGTH`). The September script and a workstation install get Ollama's default, 4096 on CPU. The system prompt is roughly 700 tokens; the 5000-note corpus has notes up to about 10 000 tokens. Ollama truncates server-side and the client sees a normal response. Pass `num_ctx` explicitly and detect over-long notes (BACKLOG B10, F4).
 17. **`OLLAMA_KEEP_ALIVE=-1` keeps the model loaded for the whole job.** Keep it; reloading an 8 GB model per note would dominate runtime. `OLLAMA_NUM_PARALLEL=1` matches the single-threaded `data_worker`. Nothing limits llama.cpp's threads to the requested slots (BACKLOG B26).
@@ -1213,7 +1213,7 @@ Things to hold in mind while changing the code, grouped by the layer they affect
 27. **Relative paths everywhere.** `data.db` and `output/` are resolved from the current directory. Run from the repo directory, or refactor to pass a path (BACKLOG B18).
 28. **The export is write-once.** `output/results.csv` is skipped if it already exists. After a resume the file on disk is stale (BACKLOG B17).
 29. **Ingest dedup is whole-row equality and quadratic.** A trailing space in one field creates a second note; identical notes under different CSN ids are analysed twice (BACKLOG B16).
-30. **CSV contract is strict and case-sensitive**, opened with `encoding="utf-8"`. Switching to `encoding="utf-8-sig"` would make BOM-prefixed exports work. `EncounterID` would still need renaming unless the required set is widened (BACKLOG B7).
+30. **CSV contract is strict and case-sensitive** (`REQUIRED_CSV_COLUMNS` in `database.py`; the error names the missing columns and the header found), opened with `encoding="utf-8"`. Switching to `encoding="utf-8-sig"` would make BOM-prefixed exports work. `EncounterID` would still need renaming unless the required set is widened (BACKLOG B7).
 
 ### 15.4 Operations and HIPAA
 

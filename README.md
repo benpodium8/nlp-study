@@ -163,7 +163,7 @@ Ollama runs locally and does **not** require internet access after model downloa
 python app.py
 ```
 
-This displays CLI help. There are two options, which can be combined:
+With no options it prints what the program needs (the packages, Ollama and the model, the CSV header, where files go), the typical commands, and a status check of the current directory: whether Ollama is reachable and the model is pulled, how many notes `data.db` holds and how many are still pending, and whether `output/results.csv` already exists. There are two options, which can be combined:
 
 | Option         | Effect                                                                                   |
 | -------------- | ---------------------------------------------------------------------------------------- |
@@ -248,30 +248,19 @@ sqlite3 data.db "select count(*) notes, (select count(*) from results) done, (se
 
 ### Troubleshooting:
 
-The `notes.csv` file may replace column names with underscores or dashes depending on client export/import differences in platforms.
-For example, if you see a message like this:
+The `notes.csv` file may replace column names with underscores or dashes depending on client export/import differences in platforms. The program then stops with a message that names the columns it could not find and the header it did find, for example:
 
 ```
-ValueError: CSV must contain columns: {'NoteType', 'MRN', 'Note', 'Encounter', 'NoteCsnID', 'NoteDate'}
+Error: CSV is missing the column(s) MRN, Encounter, NoteCsnID, NoteDate, NoteType, Note. Required (case-sensitive): MRN, Encounter, NoteCsnID, NoteDate, NoteType, Note. Header found: id, mrn, encounter, note_csn_id, note_date, note_type, note
 ```
 
-Then the column names have been incorrectly coerced to something like:
+Rename the header so the six required names match exactly (extra columns such as `id` are ignored):
 
 ```
-
-id,mrn,encounter,note_csn_id,note_date,note_type,note
-
-```
-
-or similar.
-
-To parse data, the column names must exactly match:
-
-```
-
 id,MRN,Encounter,NoteCsnID,NoteDate,NoteType,Note
-
 ```
+
+A header found as `\ufeffMRN` means the file starts with a UTF-8 byte-order mark; save it as plain UTF-8.
 
 ---
 

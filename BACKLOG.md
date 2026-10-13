@@ -16,7 +16,9 @@ Evidence comes from running `nlp_analysis.py` over `samples/notes.csv` (10 notes
 > connection and there is one export, `output/results.csv`, instead of three (the rest of B17 and B18 is still
 > open); `results` records `LLM_Attempts`, `LLM_Seconds` and `LLM_Error` per note (B21); missing `results`
 > columns are added on startup (the column-add half of B19); the run logs one line per note, a running
-> summary with the projected time remaining, and the failed ids (the heartbeat half of F9). F3 needs a gate
+> summary with the projected time remaining, and the failed ids (the heartbeat half of F9); a bad CSV header
+> now names the missing columns and the header found (the message half of B7; BOM and alias handling are
+> still open); `python app.py` alone prints the requirements and a status check. F3 needs a gate
 > that is not the NLP (note type and a procedure regex). Everything else still applies to the LLM path, and
 > the line numbers cited below refer to the files as they were.
 

@@ -1,12 +1,16 @@
 import json
+import os
 import re
-from typing import Tuple
+from typing import NamedTuple, Tuple
 import ollama
 
 # MedGemma 27B (Gemma 3 base), Q4_K_M, 17.4 GB. The registry build declares no "requires" and ships
 # no separate projector layer, so it loads on Argon's pinned Ollama 0.24.0 (driver 535).
 # Model blob digest as of 2026-10-13: sha256:4b97da6b21a8fb1405a0d1efee462bfd6c4d3c46307bac8b34373835f07ca758
 LOCAL_MODEL = "medgemma:27b"
+
+# Where the ollama client connects when OLLAMA_HOST is not set.
+DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 
 EXPECTED_FIELDS = {
     "id": int,
@@ -41,6 +45,28 @@ SINGLE_QUOTE_VALUE_RE = re.compile(r":\s*'([^']*)'")
 
 class LLMAnalysisError(Exception):
     pass
+
+
+class OllamaStatus(NamedTuple):
+    host: str              # the server address the client uses
+    reachable: bool        # the server answered /api/tags
+    model_available: bool  # LOCAL_MODEL is among the models it serves
+    detail: str            # the error when unreachable, else the served model names
+
+
+def ollama_status(timeout: float = 3.0) -> OllamaStatus:
+    """
+    Probes the Ollama server (OLLAMA_HOST, else the default) without loading a model,
+    bounded by timeout seconds, and reports whether LOCAL_MODEL is available there.
+    """
+    host = os.environ.get("OLLAMA_HOST") or DEFAULT_OLLAMA_HOST
+    try:
+        models = ollama.Client(timeout=timeout).list().models
+    except Exception as e:
+        return OllamaStatus(host, False, False, f"{type(e).__name__}: {e}")
+    names = [m.model for m in models if m.model]
+    available = LOCAL_MODEL in names or f"{LOCAL_MODEL}:latest" in names
+    return OllamaStatus(host, True, available, ", ".join(names) or "no models pulled")
 
 
 def _strip_markdown_fences(text: str) -> str:

@@ -66,6 +66,9 @@ WHERE mrn = ? AND encounter = ? AND note_csn_id = ?
   AND note_date = ? AND note_type = ? AND note = ?;
 """
 
+# The header names a notes CSV must carry (case-sensitive; extra columns are ignored).
+REQUIRED_CSV_COLUMNS = ("MRN", "Encounter", "NoteCsnID", "NoteDate", "NoteType", "Note")
+
 COUNT_NOTES_SQL = "SELECT COUNT(*) FROM notes;"
 
 # Notes that have no results row yet, in id order.
@@ -130,7 +133,7 @@ def _add_missing_result_columns(conn: sqlite3.Connection):
 def ingest_csv(csv_path: Path, conn: sqlite3.Connection):
     """
     Ingests CSV data into the database, skipping duplicate rows.
-    Validates that required columns (MRN, Encounter, NoteCsnID, NoteDate, NoteType, Note) are present.
+    Raises ValueError, naming the headers found, when a REQUIRED_CSV_COLUMNS entry is missing.
 
     Parameters:
         csv_path: Path to the CSV file to ingest.
@@ -139,17 +142,14 @@ def ingest_csv(csv_path: Path, conn: sqlite3.Connection):
     with csv_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
 
-        required_columns = {
-            "MRN",
-            "Encounter",
-            "NoteCsnID",
-            "NoteDate",
-            "NoteType",
-            "Note",
-        }
-
-        if not required_columns.issubset(reader.fieldnames or []):
-            raise ValueError(f"CSV must contain columns: {required_columns}")
+        found = reader.fieldnames or []
+        missing = [name for name in REQUIRED_CSV_COLUMNS if name not in found]
+        if missing:
+            raise ValueError(
+                f"CSV is missing the column(s) {', '.join(missing)}. "
+                f"Required (case-sensitive): {', '.join(REQUIRED_CSV_COLUMNS)}. "
+                f"Header found: {', '.join(found) or '(empty)'}"
+            )
 
         rows = [
             (
@@ -183,6 +183,32 @@ def ingest_csv(csv_path: Path, conn: sqlite3.Connection):
         f"Read {len(rows)} row(s) from {csv_path}: "
         f"{len(new_rows)} new note(s) added, {duplicates_count} duplicate(s) skipped."
     )
+
+
+def database_status(db_path: Path) -> str:
+    """
+    One line about db_path for the no-argument help: how many notes it holds, how many
+    are analysed and failed, and how many are pending; or why it cannot be read.
+    Opens the file read-only and never creates it.
+    """
+    if not db_path.exists():
+        return "not found here; it is created on the first run"
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            notes = conn.execute(COUNT_NOTES_SQL).fetchone()[0]
+            tables = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table';")}
+            if "results" in tables:
+                done, failed = conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(LLM_Failed), 0) FROM results;"
+                ).fetchone()
+            else:
+                done = failed = 0
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        return f"exists but could not be read ({e})"
+    return f"{notes} note(s), {done} analysed ({failed} failed), {notes - done} pending"
 
 
 def insert_result(
