@@ -25,15 +25,15 @@ class Analysis(NamedTuple):
     error: str | None         # the final error message when llm_failed is 1
 
 
-def analyze_note(note_id: int, note: str, console: Console) -> Analysis:
+def analyze_note(note_id: int, note: str, model: str, console: Console) -> Analysis:
     """
-    Runs the LLM analysis on one note.
+    Runs the LLM analysis on one note with the given model.
     Retries when the model's output cannot be parsed as JSON, up to MAX_ATTEMPTS
     attempts in total; any other failure is recorded immediately.
     """
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            result, raw_response = llm_analysis(note_id, note)
+            result, raw_response = llm_analysis(note_id, note, model)
             return Analysis(result, raw_response, 0, attempt, None)
         except LLMAnalysisError as e:
             error = str(e)
@@ -70,9 +70,9 @@ def _log_progress(console: Console, done: int, pending: int, failed: int, elapse
     )
 
 
-def data_worker(conn):
+def data_worker(conn, model: str = LOCAL_MODEL):
     """
-    Runs the LLM analysis on every note that has no result yet and stores each
+    Runs the LLM analysis (with model) on every note that has no result yet and stores each
     result, with its debugging columns, in the database. Logs one line per note,
     a running summary every SUMMARY_EVERY notes, and a final summary.
     Only the structured fields are logged, never note text or model output.
@@ -83,7 +83,7 @@ def data_worker(conn):
     rows = conn.execute(SELECT_PENDING_NOTES_SQL).fetchall()
     pending = len(rows)
 
-    _log(console, f"Model: {LOCAL_MODEL}")
+    _log(console, f"Model: {model}")
     _log(console, 
         f"{total_notes} note(s) in the database, {total_notes - pending} already analysed, "
         f"{pending} to process."
@@ -108,7 +108,7 @@ def data_worker(conn):
 
         for done, (note_id, note) in enumerate(rows, start=1):
             note_started = time.perf_counter()
-            analysis = analyze_note(note_id, note, console)
+            analysis = analyze_note(note_id, note, model, console)
             seconds = round(time.perf_counter() - note_started, 2)
 
             insert_result(

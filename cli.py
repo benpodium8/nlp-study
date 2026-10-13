@@ -13,8 +13,8 @@ DESCRIPTION = f"""\
 Extract structured data from endoscopy procedure notes with a local LLM.
 
 Reads notes from a CSV into a local SQLite database ({DB_PATH}), sends each note once to
-the model {LOCAL_MODEL} through Ollama, stores the answer next to the note, and writes
-{EXPORT_PATH}. Nothing leaves this machine.
+the model {LOCAL_MODEL} (or the one given with --model) through Ollama, stores the answer
+next to the note, and writes {EXPORT_PATH}. Nothing leaves this machine.
 
 Run with no options to see this text plus a check of what is in place right now."""
 
@@ -37,6 +37,7 @@ Typical use
   python app.py --csv notes.csv             ingest only (no model needed)
   python app.py --analyze --csv notes.csv   ingest, analyse every note, write {EXPORT_PATH}
   python app.py --analyze                   resume: analyse only the notes without a result
+  python app.py --analyze --model gemma3:4b local testing only: analyse with another model
 
 Output
   {EXPORT_PATH}   one row per note: the identifiers, the ten extracted fields, the
@@ -52,7 +53,7 @@ def setup_parser():
     Creates and configures the argument parser for the CLI.
 
     Returns:
-        argparse.ArgumentParser: Parser with the --csv and --analyze options.
+        argparse.ArgumentParser: Parser with the --csv, --analyze and --model options.
     """
     parser = argparse.ArgumentParser(
         description=DESCRIPTION,
@@ -76,32 +77,42 @@ def setup_parser():
         help=f"Run the LLM on every note that has no result yet, then write {EXPORT_PATH}",
     )
 
+    parser.add_argument(
+        "--model",
+        default=LOCAL_MODEL,
+        metavar="NAME",
+        help=(
+            f"Local testing override: use this Ollama model instead of {LOCAL_MODEL}, "
+            "e.g. gemma3:4b; it must be pulled. Study runs should omit it"
+        ),
+    )
+
     return parser
 
 
-def print_status():
+def print_status(model: str):
     """
     Reports whether each thing the program needs is in place right now:
     the Ollama server, the model, the database and the export file.
     """
     print("Current status")
 
-    status = ollama_status()
+    status = ollama_status(model)
     if status.reachable:
         print(f"  Ollama     reachable at {status.host}")
         if status.model_available:
-            print(f"  Model      {LOCAL_MODEL} is available")
+            print(f"  Model      {model} is available")
         else:
             print(
-                f"  Model      {LOCAL_MODEL} is NOT pulled (server has: {status.detail}). "
-                f"Run: ollama pull {LOCAL_MODEL}"
+                f"  Model      {model} is NOT pulled (server has: {status.detail}). "
+                f"Run: ollama pull {model}"
             )
     else:
         print(
             f"  Ollama     NOT reachable at {status.host} ({status.detail}). "
             "Start it (ollama serve) or set OLLAMA_HOST. Needed for --analyze only."
         )
-        print(f"  Model      {LOCAL_MODEL} (cannot check until Ollama is reachable)")
+        print(f"  Model      {model} (cannot check until Ollama is reachable)")
 
     print(f"  Database   {DB_PATH}: {database_status(DB_PATH)}")
 
@@ -122,7 +133,7 @@ def main():
     if not args.csv and not args.analyze:
         parser.print_help()
         print()
-        print_status()
+        print_status(args.model)
         sys.exit(0)
 
     if args.csv and not args.csv.exists():
@@ -140,7 +151,7 @@ def main():
                 print(f"Error: {e}", file=sys.stderr)
                 sys.exit(1)
         if args.analyze:
-            data_worker(conn)
+            data_worker(conn, args.model)
             export_results(conn)
     finally:
         conn.close()

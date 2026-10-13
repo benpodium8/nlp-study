@@ -363,7 +363,7 @@ Key Safeguards:
 
 Model:
 
-- `medgemma:27b` (MedGemma 27B, thinking off; set by `LOCAL_MODEL` in `llm_analysis.py`)
+- `medgemma:27b` (MedGemma 27B, thinking off; set by `LOCAL_MODEL` in `llm_analysis.py`). For local testing only, `--model` overrides it for one run, e.g. `python app.py --analyze --model gemma3:4b`; study runs omit it
 
 HIPAA:
 

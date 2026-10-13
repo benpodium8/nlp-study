@@ -134,14 +134,14 @@ class LLMAnalysisError(Exception):
 class OllamaStatus(NamedTuple):
     host: str              # the server address the client uses
     reachable: bool        # the server answered /api/tags
-    model_available: bool  # LOCAL_MODEL is among the models it serves
+    model_available: bool  # the requested model is among the models it serves
     detail: str            # the error when unreachable, else the served model names
 
 
-def ollama_status(timeout: float = 3.0) -> OllamaStatus:
+def ollama_status(model: str = LOCAL_MODEL, timeout: float = 3.0) -> OllamaStatus:
     """
     Probes the Ollama server (OLLAMA_HOST, else the default) without loading a model,
-    bounded by timeout seconds, and reports whether LOCAL_MODEL is available there.
+    bounded by timeout seconds, and reports whether model is available there.
     """
     host = os.environ.get("OLLAMA_HOST") or DEFAULT_OLLAMA_HOST
     try:
@@ -149,7 +149,7 @@ def ollama_status(timeout: float = 3.0) -> OllamaStatus:
     except Exception as e:
         return OllamaStatus(host, False, False, f"{type(e).__name__}: {e}")
     names = [m.model for m in models if m.model]
-    available = LOCAL_MODEL in names or f"{LOCAL_MODEL}:latest" in names
+    available = model in names or f"{model}:latest" in names
     return OllamaStatus(host, True, available, ", ".join(names) or "no models pulled")
 
 
@@ -259,9 +259,9 @@ def _validate_llm_result(result: dict):
             )
 
 
-def llm_analysis(id: int, note: str) -> Tuple[dict, str]:
+def llm_analysis(id: int, note: str, model: str = LOCAL_MODEL) -> Tuple[dict, str]:
     """
-    Analyzes a clinical note using an LLM to extract the study fields.
+    Analyzes a clinical note using an LLM (the Ollama model named by model) to extract the study fields.
 
     Returns:
         (result, raw): the validated field dictionary (with the note id) and the verbatim model text.
@@ -272,7 +272,7 @@ def llm_analysis(id: int, note: str) -> Tuple[dict, str]:
     ]
 
     try:
-        response = ollama.chat(model=LOCAL_MODEL, messages=messages, think=False, options=GENERATION_OPTIONS)
+        response = ollama.chat(model=model, messages=messages, think=False, options=GENERATION_OPTIONS)
     except Exception as e:
         raise LLMAnalysisError(f"LLM call failed: {e}")
 
