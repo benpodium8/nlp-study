@@ -33,11 +33,11 @@
 #  Sequence:  [login] ./setup.sh  ->  [qlogin] ./setup.sh  ->  [login] qsub ~/nlp-study.job --analyze --csv ./notes.csv
 #
 #  Optional environment overrides:
-#     MODEL=name:tag                 model to fetch (default: LOCAL_MODEL in llm_analysis.py)
+#     MODEL=[host/][ns/]name:tag     model to fetch (default: LOCAL_MODEL in llm_analysis.py; hf.co/... works)
 #     NLP_REPO_URL=...               clone a fork or branch mirror instead of the GitHub repo
 #     NLP_PYTHON=/path/to/python     skip interpreter detection
 #     NLP_FAST_ROOT, NLP_BULK_ROOT   scratch dirs for repo+venv and image+model
-#     NLP_OLLAMA_IMAGE=docker://ollama/ollama:0.12.5   pin the container image
+#     NLP_OLLAMA_IMAGE=docker://ollama/ollama:<tag>    container image (default 0.24.0: last to use driver 535 GPUs)
 #     PIP_INSTALL_ARGS="..."         default: --only-binary=:all:
 #     NLP_JOB_QUEUE=UI NLP_JOB_SLOTS=8 NLP_JOB_HRT=24:00:00 NLP_JOB_GPU=1
 #     NLP_CONTEXT_LENGTH=8192        Ollama context window used by the job
@@ -51,8 +51,10 @@ set -Eeuo pipefail
 # ----------------------------------------------------------------------------- config
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"; readonly SELF
 readonly REPO_URL="${NLP_REPO_URL:-https://github.com/benpodium8/nlp-study.git}"
-readonly OLLAMA_IMAGE="${NLP_OLLAMA_IMAGE:-docker://ollama/ollama:latest}"
-readonly REGISTRY="https://registry.ollama.ai"
+# 0.24.0 is the last Ollama whose CUDA build runs on Argon's driver 535 (A10 nodes): 0.30.0+
+# need driver 550+ and crash or fall back to CPU. Move up only after the driver is upgraded.
+readonly OLLAMA_DRIVER535_MAX="0.24.0"
+readonly OLLAMA_IMAGE="${NLP_OLLAMA_IMAGE:-docker://ollama/ollama:${OLLAMA_DRIVER535_MAX}}"
 readonly JOB_SCRIPT="${HOME}/nlp-study.job"
 readonly ENV_SCRIPT="${HOME}/nlp-study-env.sh"
 readonly LOG_DIR="${HOME}/nlp-study-logs"
@@ -66,8 +68,8 @@ export GIT_TERMINAL_PROMPT=0                       # never block on a credential
 # curl: fail instead of hanging when a transfer stalls (under 1 KB/s for 60 s)
 readonly CURL_NET=(--connect-timeout 30 --speed-limit 1024 --speed-time 60)
 
-MODEL="" MODEL_SOURCE=""
-PROJECT_ROOT="" ASSET_ROOT="" REPO_DIR="" VENV_DIR="" SIF_PATH="" SIF_PARTIAL="" MODELS_DIR=""
+MODEL="" MODEL_SOURCE="" SIF_OLLAMA="" M_REQUIRES=""
+PROJECT_ROOT="" ASSET_ROOT="" REPO_DIR="" VENV_DIR="" SIF_PATH="" SIF_PARTIAL="" SIF_IMAGE_STAMP="" MODELS_DIR=""
 APPT_CACHE="" APPT_TMP="" PREFLIGHT_PY="" PYTHON_BIN="" PYTHON_VER=""
 MODE="setup" FORCE_LIST="" ASSUME_YES=""
 V_STATE="absent" V_REASON=""
@@ -263,15 +265,25 @@ create_venv()  { run "$PYTHON_BIN" -m venv "$VENV_DIR"; }
 # --- container image ---------------------------------------------------------
 # Pulled to a .partial name and renamed on success, so an existing file is a
 # complete one. `apptainer sif list` parses the header without mounting or
-# executing anything, which keeps this check safe on a login node.
+# executing anything, which keeps this check safe on a login node. The image
+# reference it was pulled from is recorded next to it; a different OLLAMA_IMAGE
+# means a re-pull, except offline, where the existing image is kept with a warning.
 verify_sif() {
+    local pulled
     [[ -e "$SIF_PATH" ]] || { V_STATE="absent"; return 0; }
     if [[ "$(stat -c %s "$SIF_PATH")" -lt 104857600 ]] || ! apptainer sif list "$SIF_PATH" >/dev/null 2>&1; then
         V_STATE="broken"; V_REASON="not a valid SIF image"; return 0
     fi
+    pulled="$(cat "$SIF_IMAGE_STAMP" 2>/dev/null || true)"
+    if [[ "$pulled" != "$OLLAMA_IMAGE" ]]; then
+        if [[ "$HAVE_NET" -eq 1 ]]; then
+            V_STATE="broken"; V_REASON="pulled from ${pulled:-an unrecorded image}, but ${OLLAMA_IMAGE} is selected"; return 0
+        fi
+        warn "[sif] pulled from ${pulled:-an unrecorded image}, not ${OLLAMA_IMAGE}; offline, so using it as it is"
+    fi
     V_STATE="healthy"
 }
-destroy_sif() { run rm -f "$SIF_PATH" "$SIF_PARTIAL"; apptainer cache clean --force >/dev/null 2>&1 || true; }
+destroy_sif() { run rm -f "$SIF_PATH" "$SIF_PARTIAL" "$SIF_IMAGE_STAMP"; apptainer cache clean --force >/dev/null 2>&1 || true; }
 # Apptainer 1.3 offers no way to pass mksquashfs options on pull, and the defaults
 # (every CPU, 25% of RAM) break the login-node cap. Apptainer resolves mksquashfs
 # through $PATH first unless apptainer.conf pins "mksquashfs path", so a wrapper
@@ -301,19 +313,46 @@ create_sif() {
     log "[sif] pulling ${OLLAMA_IMAGE} (a few GB; mksquashfs capped to ${NSLOTS:-1} thread(s), allow several minutes)"
     PATH="${MKSQUASHFS_WRAP:+${MKSQUASHFS_WRAP}:}${PATH}" run apptainer pull "$SIF_PARTIAL" "$OLLAMA_IMAGE"
     mv "$SIF_PARTIAL" "$SIF_PATH"
+    printf '%s\n' "$OLLAMA_IMAGE" > "$SIF_IMAGE_STAMP"
+}
+version_gt() { [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" == "$1" ]]; }
+# The Ollama version of the image on disk, from the tag it was pulled under
+# (ollama/ollama:0.24.0 -> 0.24.0). Empty for "latest", a digest, or no record.
+refresh_sif_ollama() {
+    local ref re=':v?([0-9]+\.[0-9]+\.[0-9]+)(-[A-Za-z0-9.]+)?$'
+    ref="$(cat "$SIF_IMAGE_STAMP" 2>/dev/null || true)"
+    SIF_OLLAMA=""
+    if [[ "$ref" =~ $re ]]; then SIF_OLLAMA="${BASH_REMATCH[1]}"; fi
 }
 
 # --- model -------------------------------------------------------------------
 # Fetched with curl straight from the registry into Ollama's own on-disk layout
-# (manifests/registry.ollama.ai/<ns>/<name>/<tag> plus blobs/sha256-<hex>), so
-# no Ollama process ever runs on the login node. The manifest is written last:
-# its presence means every blob is complete. Downloads resume after interruption.
+# (manifests/<host>/<ns>/<name>/<tag> plus blobs/sha256-<hex>), so no Ollama
+# process ever runs on the login node. The manifest is written last: its
+# presence means every blob is complete. Downloads resume after interruption.
+# Names parse as Ollama does: gemma3:12b is registry.ollama.ai/library/gemma3:12b,
+# and hf.co/<user>/<repo>:<quant> is served by Hugging Face over the same protocol.
 model_parts() {
     local ref="${MODEL%%:*}"
     M_TAG="${MODEL#*:}"; [[ "$M_TAG" != "$MODEL" ]] || M_TAG="latest"
-    M_NS="library"; M_NAME="$ref"
-    [[ "$ref" != */* ]] || { M_NS="${ref%/*}"; M_NAME="${ref##*/}"; }
-    MANIFEST="${MODELS_DIR}/manifests/registry.ollama.ai/${M_NS}/${M_NAME}/${M_TAG}"
+    M_HOST="registry.ollama.ai"; M_NS="library"; M_NAME="$ref"
+    case "$ref" in
+        */*/*) M_HOST="${ref%%/*}"; ref="${ref#*/}"; M_NS="${ref%/*}"; M_NAME="${ref##*/}" ;;
+        */*)   M_NS="${ref%/*}"; M_NAME="${ref##*/}" ;;
+    esac
+    MANIFEST="${MODELS_DIR}/manifests/${M_HOST}/${M_NS}/${M_NAME}/${M_TAG}"
+}
+# A model's config blob may name the oldest Ollama that runs it ("requires"). The
+# registry enforces that on `ollama pull`, but curl bypasses the check and Ollama
+# 0.24.0 does not repeat it on load, so it is checked here against the image.
+config_requires() {   # config_requires CONFIG_BLOB: prints the "requires" version, or nothing
+    local py
+    py="$(command -v "${VENV_DIR}/bin/python" || command -v python3)" || return 0
+    "$py" -I -c 'import json, sys; print(json.load(open(sys.argv[1])).get("requires", ""))' "$1" 2>/dev/null || true
+}
+model_fits_ollama() {   # false only when the config requires a newer Ollama than the image; sets M_REQUIRES
+    M_REQUIRES="$(config_requires "$1")"
+    [[ -z "$SIF_OLLAMA" || -z "$M_REQUIRES" ]] || ! version_gt "$M_REQUIRES" "$SIF_OLLAMA"
 }
 manifest_blobs() {   # prints "<digest> <size>" per blob (config first); prints nothing for a bad manifest
     local py
@@ -337,7 +376,12 @@ verify_model() {
         fi
         n=$((n + 1))
     done < <(manifest_blobs "$MANIFEST")
-    if [[ "$n" -eq 0 ]]; then V_STATE="broken"; V_REASON="manifest unreadable (or no python to parse it)"; else V_STATE="healthy"; fi
+    if [[ "$n" -eq 0 ]]; then V_STATE="broken"; V_REASON="manifest unreadable (or no python to parse it)"; return 0; fi
+    read -r d s < <(manifest_blobs "$MANIFEST")
+    if ! model_fits_ollama "${MODELS_DIR}/blobs/${d/:/-}"; then
+        V_STATE="broken"; V_REASON="requires Ollama ${M_REQUIRES}, the image has ${SIF_OLLAMA}"; return 0
+    fi
+    V_STATE="healthy"
 }
 destroy_model() {
     model_parts
@@ -348,13 +392,20 @@ destroy_model() {
 create_model() {
     [[ -n "$MODEL" ]] || die "Cannot tell which model to fetch: LOCAL_MODEL not found in llm_analysis.py. Set MODEL=name:tag."
     model_parts
-    local base="${REGISTRY}/v2/${M_NS}/${M_NAME}" tmp="${MANIFEST}.partial" d s total=0 count=0
+    local base="https://${M_HOST}/v2/${M_NS}/${M_NAME}" tmp="${MANIFEST}.partial" d s total=0 count=0
     mkdir -p "${MANIFEST%/*}" "${MODELS_DIR}/blobs"
     curl -fsSL --retry 3 --max-time 120 -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
          -o "$tmp" "${base}/manifests/${M_TAG}" \
-        || die "registry.ollama.ai has no '${MODEL}'. Check LOCAL_MODEL in llm_analysis.py (or MODEL=...)."
+        || die "${M_HOST} has no '${MODEL}' (or it is gated). Check LOCAL_MODEL in llm_analysis.py (or MODEL=...)."
     while read -r d s; do total=$((total + s)); count=$((count + 1)); done < <(manifest_blobs "$tmp")
     [[ "$count" -gt 0 ]] || die "Unreadable manifest for ${MODEL} (left at ${tmp})."
+    # The config blob is a few hundred bytes: check it before committing to gigabytes.
+    read -r d s < <(manifest_blobs "$tmp")
+    fetch_blob "${base}/blobs/${d}" "${MODELS_DIR}/blobs/${d/:/-}" "$s" "${d#sha256:}"
+    if ! model_fits_ollama "${MODELS_DIR}/blobs/${d/:/-}"; then
+        rm -f "$tmp"
+        die "${MODEL} requires Ollama ${M_REQUIRES}, but the image has ${SIF_OLLAMA} (the last release that uses Argon's driver-535 GPUs is ${OLLAMA_DRIVER535_MAX}). Set LOCAL_MODEL in llm_analysis.py to a build without that requirement, e.g. a GGUF from hf.co."
+    fi
     log "[model] ${MODEL}: ${count} blobs, $((total / 1048576)) MB, into ${MODELS_DIR}"
     while read -r d s; do
         fetch_blob "${base}/blobs/${d}" "${MODELS_DIR}/blobs/${d/:/-}" "$s" "${d#sha256:}"
@@ -389,6 +440,23 @@ fetch_blob() {   # fetch_blob URL DEST SIZE SHA256: single-threaded curl, resuma
         rm -f "$part"
     done
     die "[model] blob ${sha:0:12} could not be downloaded intact after 5 attempts. Re-run to try again."
+}
+# Any stored model, not only the repo's, that needs a newer Ollama than the image
+# loses its manifest here; prune_model_store then drops the blobs nothing else uses.
+remove_incompatible_models() {
+    local mf d s
+    if [[ -z "$SIF_OLLAMA" ]]; then
+        log "[model] the image's Ollama version is unknown (no version tag); stored models not checked against it"; return 0
+    fi
+    while IFS= read -r mf; do
+        d=""; read -r d s < <(manifest_blobs "$mf") || true
+        [[ -n "$d" && -f "${MODELS_DIR}/blobs/${d/:/-}" ]] || continue   # unreadable or incomplete: verify_model handles the one in use
+        if ! model_fits_ollama "${MODELS_DIR}/blobs/${d/:/-}"; then
+            warn "[model] removing ${mf#"${MODELS_DIR}/manifests/"}: requires Ollama ${M_REQUIRES}, the image has ${SIF_OLLAMA}"
+            run rm -f "$mf"
+        fi
+    done < <(find "${MODELS_DIR}/manifests" -type f 2>/dev/null)   # .partial too: it pins blobs
+    find "${MODELS_DIR}/manifests" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 }
 prune_model_store() {   # blobs no manifest references any more, left behind by a model change
     local referenced f n=0
@@ -482,8 +550,10 @@ class Timeout(BaseException):
 
 def split_model(model):
     ref, _, tag = model.partition(":")
-    ns, _, name = ref.rpartition("/")
-    return ns or "library", name, tag or "latest"
+    parts = ref.split("/")
+    host = parts.pop(0) if len(parts) > 2 else "registry.ollama.ai"
+    name = parts.pop()
+    return host, "/".join(parts) or "library", name, tag or "latest"
 
 
 def http_json(url, timeout=10):
@@ -525,8 +595,8 @@ def tier0(repo, model, models_dir):
     else:
         fail(f"llm_analysis.LOCAL_MODEL is {local!r} but setup fetched {model!r}",
              "Re-run setup.sh: it reads LOCAL_MODEL and fetches whatever the repo asks for.")
-    ns, name, tag = split_model(model)
-    manifest = models_dir / "manifests" / "registry.ollama.ai" / ns / name / tag
+    host, ns, name, tag = split_model(model)
+    manifest = models_dir / "manifests" / host / ns / name / tag
     try:
         data = json.loads(manifest.read_text())
         blobs = [data["config"]] + data["layers"]
@@ -909,7 +979,8 @@ resolve_scratch_roots() {
 }
 resolve_scratch_roots
 REPO_DIR="${PROJECT_ROOT}/repo"; VENV_DIR="${PROJECT_ROOT}/venv"; PREFLIGHT_PY="${PROJECT_ROOT}/nlp-preflight.py"
-SIF_PATH="${ASSET_ROOT}/ollama.sif"; SIF_PARTIAL="${ASSET_ROOT}/ollama.partial.sif"; MODELS_DIR="${ASSET_ROOT}/ollama-models"
+SIF_PATH="${ASSET_ROOT}/ollama.sif"; SIF_PARTIAL="${ASSET_ROOT}/ollama.partial.sif"; SIF_IMAGE_STAMP="${ASSET_ROOT}/ollama.sif.image"
+MODELS_DIR="${ASSET_ROOT}/ollama-models"
 APPT_CACHE="${ASSET_ROOT}/apptainer-cache"; APPT_TMP="${ASSET_ROOT}/apptainer-tmp"
 mkdir -p "$PROJECT_ROOT" "$ASSET_ROOT" "$MODELS_DIR" "$APPT_CACHE" "$APPT_TMP"   # not REPO_DIR/VENV_DIR: clone and venv own those
 if [[ "$MODE" == "setup" || "$MODE" == "clean" ]]; then acquire_lock; fi
@@ -933,6 +1004,7 @@ log "Model: ${MODEL:-<unknown until the repo is cloned>} (${MODEL_SOURCE})"
 # ----------------------------------------------------------------------------- --status
 if [[ "$MODE" == "status" ]]; then
     section "Status"
+    refresh_sif_ollama
     for r in repo venv sif model; do
         V_STATE="absent"; V_REASON=""; "verify_$r"
         case "$r" in repo) p="$REPO_DIR" ;; venv) p="$VENV_DIR" ;; sif) p="$SIF_PATH" ;; model) p="$MODELS_DIR" ;; esac
@@ -958,7 +1030,7 @@ if [[ "$MODE" == "clean" ]]; then
         [[ "$reply" == "yes" ]] || die "Aborted."
     fi
     preserve_user_data "$REPO_DIR"
-    run rm -rf "$REPO_DIR" "$VENV_DIR" "$PREFLIGHT_PY" "$SIF_PATH" "$SIF_PARTIAL" "$MODELS_DIR" "$APPT_CACHE" "$APPT_TMP"
+    run rm -rf "$REPO_DIR" "$VENV_DIR" "$PREFLIGHT_PY" "$SIF_PATH" "$SIF_PARTIAL" "$SIF_IMAGE_STAMP" "$MODELS_DIR" "$APPT_CACHE" "$APPT_TMP"
     apptainer cache clean --force >/dev/null 2>&1 || true
     ok "Removed. Left alone: ${JOB_SCRIPT}, ${ENV_SCRIPT}, ${LOG_DIR}, ${PROJECT_ROOT}/preserved"
     exit 0
@@ -1084,10 +1156,18 @@ done
 # ============================================================================= 4. container image
 section "Ollama container image"
 ensure_resource sif
-log "[sif] $(du -h "$SIF_PATH" | cut -f1) at ${SIF_PATH}"
+refresh_sif_ollama
+log "[sif] $(du -h "$SIF_PATH" | cut -f1) at ${SIF_PATH}, Ollama ${SIF_OLLAMA:-version unknown}"
+if [[ -z "$SIF_OLLAMA" ]]; then
+    warn "[sif] cannot tell the image's Ollama version; GPUs on NVIDIA driver 535 need ${OLLAMA_DRIVER535_MAX} or older"
+elif version_gt "$SIF_OLLAMA" "$OLLAMA_DRIVER535_MAX"; then
+    warn "[sif] Ollama ${SIF_OLLAMA} needs NVIDIA driver 550+; on Argon's driver-535 GPUs it falls back to CPU"
+fi
 
 # ============================================================================= 5. model
 section "Model: ${MODEL}"
+remove_incompatible_models
+prune_model_store
 ensure_resource model
 prune_model_store
 log "[model] store size: $(du -sh "$MODELS_DIR" | cut -f1)"

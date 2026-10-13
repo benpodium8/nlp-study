@@ -3,7 +3,9 @@ import re
 from typing import Tuple
 import ollama
 
-LOCAL_MODEL = "gemma3:12b"
+# Gemma 3 12B instruct, Q4_K_M GGUF from the llama.cpp maintainers. Not the registry.ollama.ai
+# gemma3:12b: every build there now requires Ollama 0.30+, and Argon pins 0.24.0 (driver 535).
+LOCAL_MODEL = "hf.co/ggml-org/gemma-3-12b-it-GGUF:Q4_K_M"
 
 EXPECTED_FIELDS = {
     "id": int,
