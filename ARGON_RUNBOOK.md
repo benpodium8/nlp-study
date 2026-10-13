@@ -144,15 +144,15 @@ notes.csv ──> SQLite notes table
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `ScopeType` | string or null | Brand and model of the upper endoscope, for example `Olympus H190` |
-| `Colonoscopy` | 0 or 1 | A colonoscopy was performed |
+| `ScopeType` | string or null | The upper endoscope as the note names it (brand and/or model, for example `Olympus H190`, `GIF-H 190`, `Olympus gastroscope`); colonoscopes are ignored |
+| `Colonoscopy` | 0 or 1 | A colonoscopy was performed as this note's procedure (history, plans and instructions do not count) |
 | `ColonoscopyInformation` | string or null | Supporting sentence |
-| `Endoscopy` | 0 or 1 | An upper endoscopy / EGD was performed |
+| `Endoscopy` | 0 or 1 | An upper endoscopy / EGD was performed as this note's procedure (PEG placement with a gastroscope counts) |
 | `EndoscopyInformation` | string or null | Supporting sentence |
-| `NumberOfDuodenalBiopsies` | integer | Explicitly stated count, else 0. This makes "count unknown" and "none" the same value, which the study needs to keep apart (15.5; BACKLOG B1) |
-| `DuodenalBiopsiesTaken` | 0 or 1 | At least one duodenal biopsy |
+| `NumberOfDuodenalBiopsies` | integer or null | Stated count of duodenal biopsies, the bulb included and counted once; null when biopsies were taken but no number is given; 0 when none were taken (15.5; BACKLOG B1) |
+| `DuodenalBiopsiesTaken` | 0 or 1 | At least one duodenal biopsy (duodenum, bulb, D1 to D3), with or without a count |
 | `DuodenalBiopsiesInformation` | string or null | Supporting sentence |
-| `FellowPresent` | 0 or 1 | A fellow is explicitly mentioned |
+| `FellowPresent` | 0 or 1 | A fellow or other trainee took part in the procedure, read from the attestation: Teaching Statement is 1, Staff Only is 0 |
 | `FellowInformation` | string or null | Supporting sentence |
 
 What the researcher actually needs from these fields is in [15.5](#155-study-requirements-the-researchers-review-comments).
@@ -395,7 +395,7 @@ spacy 3.8.14, thinc 8.3.13, blis 1.3.3, numpy 2.2.6, ollama 0.6.2, httpx 0.28.1,
 
 Tier 1 expectations on the synthetic note:
 
-- Hard (failure): `Endoscopy == 1`, `Colonoscopy == 0`. Note that the synthetic note says "No colonoscopy was performed", while the production prompt tells the model to set `Colonoscopy = 1` on the trigger word "colonoscopy"; a model that follows the prompt literally fails this gate (BACKLOG B11).
+- Hard (failure): `Endoscopy == 1`, `Colonoscopy == 0`. The synthetic note says "No colonoscopy was performed", and since 2026-10-13 the prompt defines `Colonoscopy` as a colonoscopy performed in the note, so the gate and the prompt agree (BACKLOG B11).
 - Soft (warning): `DuodenalBiopsiesTaken == 1`, `NumberOfDuodenalBiopsies == 4`, `FellowPresent == 1`, `ScopeType` containing `H190`.
 - Warns if the raw output is not bare JSON (the repair layer is doing work; `data_worker` retries up to 5x on JSON errors).
 - Placement: PASS at 100% on GPU, PASS on a node with no `nvidia-smi`, WARN otherwise ("partly or fully on CPU, expect it to be slow").
@@ -711,7 +711,7 @@ Bug-level items are tracked in `BACKLOG.md` (B1 to B26) with proposed fixes; thi
 
 9. **Job preflight budget dropped from 900 s to 600 s** in the rewrite (it inherits the preflight script's default). On a CPU node a 12 B model can exceed 600 s for one call. Export `NLP_PREFLIGHT_BUDGET` at `qsub` time if the gate times out (BACKLOG B26).
 
-10. **The code does not yet implement the study's definitions.** The researcher's comments (15.5) require "biopsies taken, count unknown" to be representable and colonoscopes to be ignored; the prompt coerces unknown counts to 0 and decides fellow presence by the word "fellow" rather than by the attestation. BACKLOG B1 and B11 cover this.
+10. **The code does not yet implement the study's definitions.** The researcher's comments (15.5) require "biopsies taken, count unknown" to be representable and colonoscopes to be ignored; as of 2026-10-13 the prompt implements them (null count when taken but not stated, scope from the upper endoscope only, fellow from the attestation; BACKLOG B1 and B11), measured against the ten annotated notes on a workstation. Not yet confirmed on Argon: run the tier 1 preflight after pulling.
 
 ---
 
@@ -1195,7 +1195,7 @@ Things to hold in mind while changing the code, grouped by the layer they affect
 12. **`LOCAL_MODEL` in `llm_analysis.py` is parsed by `sed`.** Keep it a single line of the form `LOCAL_MODEL = "name:tag"` at column 0. Any model change requires `./setup.sh` on a login node to fetch the weights (and it prunes the old ones), and the README should be updated in the same commit (BACKLOG B24).
 13. **Model size budget.** `gemma4:e2b` is 5.12 B parameters at Q4_K_M, about 7.2 GB, and is a reasoning model that emits a thinking trace by default. Gemma 3 12B (`hf.co/ggml-org/gemma-3-12b-it-GGUF:Q4_K_M`) is about 7.8 GB. Budget 8 to 10 GB of VRAM once the KV cache is allocated. The September job script pinned `gpu_p100` (16 GB) for that reason; the rewrite requests only `ngpus=1`, so pin a card type with `#$ -l <complex>` if a small card would silently fall back to CPU. CPU inference needs that much RAM plus headroom.
 14. **The module-level `ollama` client is wired by `OLLAMA_HOST` at import time.** Do not create `ollama.Client()` with a hard-coded host or port, and do not import `ollama` before the host is exported. The port is random per job to avoid collisions with other users on the node. If you add a client with a timeout (BACKLOG B15), keep it reading `OLLAMA_HOST`. `ollama_status()` in `llm_analysis.py` follows that rule: the no-argument `python app.py` builds a short-lived `ollama.Client(timeout=3)` that reads `OLLAMA_HOST` at call time and only lists models.
-15. **Ollama is not deterministic by default.** `ollama.chat()` is called without `options`, so the server default temperature (0.8) applies despite the prompt calling itself deterministic. For reproducibility add `options={"temperature": 0, "seed": <int>}` and use `format=` with the JSON schema, which also removes the markdown fences every saved response currently has (BACKLOG B9). Re-run the preflight after any change here.
+15. **Decoding is greedy.** `ollama.chat()` passes `GENERATION_OPTIONS` (`temperature` 0), so the same note gives the same answer on the same model build; Ollama's server default would be 0.8. Still open from BACKLOG B9: a `seed`, and `format=` with the JSON schema, which would also remove markdown fences (the repair layer handles them today). Re-run the preflight after any change here.
 16. **Context window.** The rewrite sets `OLLAMA_CONTEXT_LENGTH=8192` on the container (`NLP_CONTEXT_LENGTH`). The September script and a workstation install get Ollama's default, 4096 on CPU. The system prompt is roughly 700 tokens; the 5000-note corpus has notes up to about 10 000 tokens. Ollama truncates server-side and the client sees a normal response. Pass `num_ctx` explicitly and detect over-long notes (BACKLOG B10, F4).
 17. **`OLLAMA_KEEP_ALIVE=-1` keeps the model loaded for the whole job.** Keep it; reloading an 8 GB model per note would dominate runtime. `OLLAMA_NUM_PARALLEL=1` matches the single-threaded `data_worker`. Nothing limits llama.cpp's threads to the requested slots (BACKLOG B26).
 18. **The container tag is pinned.** Now pinned to `0.24.0`, the last release that uses a driver-535 GPU; a newer tag needs driver 550+ (BACKLOG B25). The Python packages, including `ollama` 0.6.2, are pinned in `requirements.txt` to the Argon versions.
@@ -1206,7 +1206,7 @@ Things to hold in mind while changing the code, grouped by the layer they affect
 
 21. **LLM failures are swallowed by design.** Any change to the schema, prompt or model must be followed by a tier 1 preflight; nothing else will tell you it broke. If you add a field, update all of: the prompt schema text, `EXPECTED_FIELDS`, `BOOL_FIELDS` if boolean, `normalize_llm_result` if integer, `RESULT_FIELDS` in `database.py` (the table schema, the insert and the export query are all built from it, and `create_db` adds the new column to an existing database), and `HARD`/`SOFT` plus the synthetic note in `setup.sh`.
 22. **Keep `except Exception` in `llm_analysis()`, not `except BaseException`.** The preflight's timeout is a `BaseException` subclass precisely so that wrapper cannot swallow it.
-23. **Validation rejects extra fields and non-0/1 booleans.** A model that adds commentary keys or returns `true`/`false` fails validation and is not retried (only JSON parse errors are). The prompt is the only defence; `format=` with a schema would be stronger (BACKLOG B9).
+23. **Validation rejects extra fields and non-0/1 booleans.** `normalize_llm_result` first coerces `true`/`false` and numeric strings to integers, fills null booleans with 0, treats a non-numeric count as "not stated" (null) and keeps the count and the taken flag consistent; after that, a model that adds commentary keys or returns a value other than 0/1 fails validation and is not retried (only JSON parse errors are). `format=` with a schema would be stronger (BACKLOG B9).
 24. **Retries are only for JSON decode errors**, up to 5 attempts, each a full generation. Budget runtime accordingly and prefer fixing the prompt or decoding over raising the retry count.
 25. **`CREATE TABLE IF NOT EXISTS` does not migrate.** `create_db` adds any `results` column missing from an existing `data.db` (`ALTER TABLE ... ADD COLUMN`; existing rows get null), which covers adding a field. Anything else (renaming or retyping a column, changing `notes`) still needs a fresh database or a hand-written migration (BACKLOG B19).
 26. **Resume logic keys on row existence, not freshness.** Changing the prompt or model does not reprocess notes that already have a `results` row. Delete those rows to recompute.
@@ -1255,11 +1255,10 @@ The `.docx` also carries 36 yellow highlights marking the expected answer in eac
 
 Where the current code falls short of these, with the BACKLOG item that fixes it:
 
-- The prompt says integers are never null and "if no explicit number is stated, return 0"; `normalize_llm_result` also coerces null to 0; the columns are plain `INTEGER`. Comments 1 and 4 need "unknown" and "zero" to differ (B1).
-- `FellowPresent` is defined by the word "fellow" in prompt rule 9; the gold reads the attestation ("Teaching Statement" versus "Staff Only"), which is why notes 6 and 9 come back 0 (B11).
-- Brand-only ("Olympus gastroscope") and model-only ("GIF-H 190") scopes are valid answers, and nothing canonicalises the strings the model returns, so one scope can appear under several spellings (F5).
-- Bulb biopsies are duodenal biopsies and must be counted once; the prompt lists "bulb" under duodenum but does not say how to combine "6 biopsies ... including 2 from bulb" (comment 3; F6).
-- The real input is mixed note types: per BACKLOG section 1, only about 609 of the 5000 deidentified rows are `Procedures` and about 330 are EGDs, so the prompt's trigger-word rules for endoscopy and colonoscopy must distinguish a performed procedure from history, plans and instructions (B11, F3).
+Done in the prompt on 2026-10-13 (`SYSTEM_PROMPT` in `llm_analysis.py`): `NumberOfDuodenalBiopsies` is null when biopsies were taken without a stated count and 0 when none were taken (B1); `FellowPresent` is read from the attestation, Teaching Statement 1 and Staff Only 0, with named trainees and "Fellow: None" handled (B11); bulb biopsies are duodenal and counted once (comment 3, F6); `ScopeType` is the upper endoscope as written, brand-only and model-only accepted, colonoscopes ignored (comment 2); `Endoscopy` and `Colonoscopy` mean performed in this note, so history, plans and instructions are 0 (B11). Still open:
+
+- Nothing canonicalises the scope strings the model returns, so one scope can appear under several spellings ("Olympus H190", "GIF-H 190", "Olympus GIF-H190") (F5).
+- The real input is mixed note types: per BACKLOG section 1, only about 609 of the 5000 deidentified rows are `Procedures` and about 330 are EGDs. The prompt now tells the model that history and plans do not count, but every note is still sent to the model; a relevance gate would cut the run roughly tenfold (F3).
 
 When changing the prompt or the model, check behaviour on all ten notes of `samples/notes.csv` against the gold table (after fixing its header and the note 9/10 boundary, B7 and B8). A gold-label fixture and `--evaluate` command are BACKLOG F1.
 

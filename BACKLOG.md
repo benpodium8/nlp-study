@@ -15,7 +15,9 @@ Evidence comes from running `nlp_analysis.py` over `samples/notes.csv` (10 notes
 > and F13. Done in the same change: `click` dropped from `requirements.txt` (B24); the exports reuse the open
 > connection and there is one export, `output/results.csv`, instead of three (the rest of B17 and B18 is still
 > open); `results` records `LLM_Attempts`, `LLM_Seconds` and `LLM_Error` per note (B21); missing `results`
-> columns are added on startup (the column-add half of B19); the run logs one line per note, a running
+> columns are added on startup (the column-add half of B19); the system prompt now implements the study definitions
+> (B1 nullable count, B11 attestation-based fellow and performed-only procedures, comment 3 bulb counting; the
+> validation coerces true/false and numeric strings, and `temperature` 0 is passed, the first half of B9); the run logs one line per note, a running
 > summary with the projected time remaining, and the failed ids (the heartbeat half of F9); a bad CSV header
 > now names the missing columns and the header found (the message half of B7; BOM and alias handling are
 > still open); `python app.py` alone prints the requirements and a status check. F3 needs a gate

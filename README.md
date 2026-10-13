@@ -352,11 +352,14 @@ HIPAA:
 
 **Purpose:** Semantic extraction using local LLM
 
+The system prompt encodes the study's definitions (see `SYSTEM_PROMPT`): only the upper endoscope counts as the scope, bulb biopsies are duodenal and counted once, "biopsies taken but no count stated" is recorded as a null count rather than 0, fellow presence is read from the Teaching Statement or Staff Only attestation rather than the word "fellow", and only a procedure performed in the note (not history, plans or instructions) counts.
+
 Key Safeguards:
 
 - Strict JSON schema enforcement
-- Type validation
+- Type validation, with true/false and numeric strings coerced to integers
 - JSON repair layer
+- Greedy decoding (temperature 0) so a note gives the same answer on every run
 
 Model:
 
