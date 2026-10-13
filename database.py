@@ -15,36 +15,36 @@ CREATE TABLE IF NOT EXISTS notes (
 );
 """
 
-# The fields the LLM extracts, in the order they are stored and exported.
+# The fields the LLM extracts, with their SQLite types, in storage and export order.
 # llm_analysis.EXPECTED_FIELDS validates the same set (plus the note id).
 RESULT_FIELDS = (
-    "ScopeType",
-    "Colonoscopy",
-    "ColonoscopyInformation",
-    "Endoscopy",
-    "EndoscopyInformation",
-    "NumberOfDuodenalBiopsies",
-    "DuodenalBiopsiesTaken",
-    "DuodenalBiopsiesInformation",
-    "FellowPresent",
-    "FellowInformation",
+    ("ScopeType", "TEXT"),
+    ("Colonoscopy", "INTEGER"),
+    ("ColonoscopyInformation", "TEXT"),
+    ("Endoscopy", "INTEGER"),
+    ("EndoscopyInformation", "TEXT"),
+    ("NumberOfDuodenalBiopsies", "INTEGER"),
+    ("DuodenalBiopsiesTaken", "INTEGER"),
+    ("DuodenalBiopsiesInformation", "TEXT"),
+    ("FellowPresent", "INTEGER"),
+    ("FellowInformation", "TEXT"),
 )
 
-RESULTS_TABLE_SCHEMA = """
+# Debugging columns data_worker records for every note next to the extracted fields.
+DEBUG_FIELDS = (
+    ("LLM_Failed", "INTEGER"),    # 1 when the model call or its validation failed; the extracted fields are then null
+    ("LLM_Attempts", "INTEGER"),  # model calls made for this note (retries happen only on invalid JSON)
+    ("LLM_Seconds", "REAL"),      # wall-clock seconds spent on this note, all attempts included
+    ("LLM_Error", "TEXT"),        # the final error message when LLM_Failed is 1
+    ("RawResponse", "TEXT"),      # verbatim text of the model response that was accepted, for audit
+)
+
+RESULTS_COLUMNS = RESULT_FIELDS + DEBUG_FIELDS
+
+RESULTS_TABLE_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS results (
     id INTEGER PRIMARY KEY,
-    ScopeType TEXT,
-    Colonoscopy INTEGER,
-    ColonoscopyInformation TEXT,
-    Endoscopy INTEGER,
-    EndoscopyInformation TEXT,
-    NumberOfDuodenalBiopsies INTEGER,
-    DuodenalBiopsiesTaken INTEGER,
-    DuodenalBiopsiesInformation TEXT,
-    FellowPresent INTEGER,
-    FellowInformation TEXT,
-    RawResponse TEXT,
-    LLM_Failed INTEGER,
+    {", ".join(f"{name} {sqltype}" for name, sqltype in RESULTS_COLUMNS)},
     FOREIGN KEY (id) REFERENCES notes(id)
 );
 """
@@ -66,23 +66,29 @@ WHERE mrn = ? AND encounter = ? AND note_csn_id = ?
   AND note_date = ? AND note_type = ? AND note = ?;
 """
 
-SELECT_NOTES_SQL = "SELECT id, note FROM notes ORDER BY id;"
+COUNT_NOTES_SQL = "SELECT COUNT(*) FROM notes;"
 
-CHECK_RESULT_EXISTS_SQL = "SELECT COUNT(*) FROM results WHERE id = ?;"
+# Notes that have no results row yet, in id order.
+SELECT_PENDING_NOTES_SQL = """
+SELECT notes.id, notes.note
+FROM notes
+LEFT JOIN results ON notes.id = results.id
+WHERE results.id IS NULL
+ORDER BY notes.id;
+"""
 
 INSERT_RESULT_SQL = f"""
 INSERT INTO results (
     id,
-    {", ".join(RESULT_FIELDS)},
-    RawResponse,
-    LLM_Failed
-) VALUES ({", ".join("?" * (len(RESULT_FIELDS) + 3))});
+    {", ".join(name for name, _ in RESULTS_COLUMNS)}
+) VALUES ({", ".join("?" * (len(RESULTS_COLUMNS) + 1))});
 """
 
-COMBINED_RESULTS_SQL = f"""
-SELECT notes.*,
-       {", ".join(f"results.{field}" for field in RESULT_FIELDS)},
-       results.LLM_Failed
+# One row per note: identifiers, the extracted fields, the debugging columns, then the note text last.
+EXPORT_RESULTS_SQL = f"""
+SELECT notes.id, notes.mrn, notes.encounter, notes.note_csn_id, notes.note_date, notes.note_type,
+       {", ".join(f"results.{name}" for name, _ in RESULTS_COLUMNS)},
+       notes.note
 FROM notes
 LEFT JOIN results ON notes.id = results.id
 ORDER BY notes.id;
@@ -92,6 +98,7 @@ ORDER BY notes.id;
 def create_db(db_path: Path):
     """
     Creates or connects to a SQLite database and initializes the notes and results tables.
+    Adds any results column that an older database lacks.
 
     Parameters:
         db_path: Path to the database file.
@@ -103,7 +110,21 @@ def create_db(db_path: Path):
     with conn:
         conn.execute(NOTES_TABLE_SCHEMA)
         conn.execute(RESULTS_TABLE_SCHEMA)
+        _add_missing_result_columns(conn)
     return conn
+
+
+def _add_missing_result_columns(conn: sqlite3.Connection):
+    """
+    Brings the results table of an existing database up to the current column set,
+    so a data.db created before a column was introduced keeps working.
+    Existing rows get NULL in any column added here.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(results);")}
+    for name, sqltype in RESULTS_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE results ADD COLUMN {name} {sqltype};")
+            print(f"Added missing column {name} to the results table.")
 
 
 def ingest_csv(csv_path: Path, conn: sqlite3.Connection):
@@ -158,25 +179,10 @@ def ingest_csv(csv_path: Path, conn: sqlite3.Connection):
         if new_rows:
             conn.executemany(INSERT_NOTE_SQL, new_rows)
 
-    print(f"Ingested {len(new_rows)} new note(s).")
-    if duplicates_count > 0:
-        print(f"Skipped {duplicates_count} duplicate row(s) during import.")
-
-
-def check_result_exists(conn: sqlite3.Connection, id: int) -> bool:
-    """
-    Checks if a result already exists for the given note ID.
-
-    Parameters:
-        conn: Database connection object.
-        id: Note ID to check.
-
-    Returns:
-        bool: True if a result exists, False otherwise.
-    """
-    cursor = conn.execute(CHECK_RESULT_EXISTS_SQL, (id,))
-    count = cursor.fetchone()[0]
-    return count > 0
+    print(
+        f"Read {len(rows)} row(s) from {csv_path}: "
+        f"{len(new_rows)} new note(s) added, {duplicates_count} duplicate(s) skipped."
+    )
 
 
 def insert_result(
@@ -185,80 +191,63 @@ def insert_result(
     result: dict | None,
     raw_response: str | None,
     llm_failed: int,
+    attempts: int,
+    seconds: float,
+    error: str | None,
 ):
     """
-    Inserts one note's LLM analysis into the results table.
+    Inserts one note's LLM analysis, with its debugging columns, into the results table.
 
     Parameters:
         conn: Database connection object.
         id: Note ID to associate with the result.
         result: Dictionary of extracted fields, or None when the LLM failed.
-        raw_response: Verbatim LLM response text, or None when the LLM failed.
+        raw_response: Verbatim text of the accepted model response, or None when the LLM failed.
         llm_failed: 1 if the LLM analysis failed, 0 if it succeeded.
+        attempts: Number of model calls made for this note.
+        seconds: Wall-clock seconds spent on this note.
+        error: The final error message when the analysis failed, else None.
     """
-    extracted = tuple(result.get(field) if result else None for field in RESULT_FIELDS)
-    values = (id, *extracted, raw_response, llm_failed)
+    extracted = tuple(result.get(name) if result else None for name, _ in RESULT_FIELDS)
+    debug = {
+        "LLM_Failed": llm_failed,
+        "LLM_Attempts": attempts,
+        "LLM_Seconds": seconds,
+        "LLM_Error": error,
+        "RawResponse": raw_response,
+    }
+    values = (id, *extracted, *(debug[name] for name, _ in DEBUG_FIELDS))
 
     with conn:
         conn.execute(INSERT_RESULT_SQL, values)
 
 
-def _write_combined_results(conn: sqlite3.Connection, output_file: Path):
-    """
-    Writes the notes table joined with each note's extracted fields to a CSV.
-    """
-    cursor = conn.execute(COMBINED_RESULTS_SQL)
-    column_names = [desc[0] for desc in cursor.description]
-
-    with output_file.open(mode="w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(column_names)
-        writer.writerows(cursor)
-
-    print(f"Combined results exported to {output_file}")
-
-
-def _write_full_dump(conn: sqlite3.Connection, output_file: Path):
-    """
-    Writes every table in full, one after another, to a single CSV.
-    Each table is introduced by a "Table: <name>" line and ends with a blank line.
-    """
-    tables = [name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table';")]
-
-    with output_file.open(mode="w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile)
-
-        for table_name in tables:
-            cursor = conn.execute(f"SELECT * FROM {table_name};")
-            column_names = [desc[0] for desc in cursor.description]
-
-            writer.writerow([f"Table: {table_name}"])
-            writer.writerow(column_names)
-            writer.writerows(cursor)
-            writer.writerow([])
-
-    print(f"Full combined results exported to {output_file}")
-
-
 def export_results(conn: sqlite3.Connection, output_folder="output"):
     """
-    Exports the database to CSV files in output_folder, creating the folder if needed.
-    Each file is written only if it does not already exist (write-once); an existing
-    file is left alone and a message is printed.
-
-        combined_results.csv       notes joined with their extracted fields
-        full_combined_results.csv  every table dumped in full, including raw LLM responses
+    Writes every note with its extracted fields and debugging columns to output_folder/results.csv,
+    creating the folder if needed. The file is written only if it does not already exist
+    (write-once); an existing file is left alone and a message is printed.
     """
     output_path = Path(output_folder)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    exports = (
-        (output_path / "combined_results.csv", _write_combined_results),
-        (output_path / "full_combined_results.csv", _write_full_dump),
-    )
+    output_file = output_path / "results.csv"
+    if output_file.exists():
+        print(
+            f"File '{output_file}' already exists. Export skipped; "
+            "move it aside and run --analyze again to regenerate it from the database."
+        )
+        return
 
-    for output_file, write in exports:
-        if output_file.exists():
-            print(f"File '{output_file}' already exists. Export skipped.")
-        else:
-            write(conn, output_file)
+    cursor = conn.execute(EXPORT_RESULTS_SQL)
+    column_names = [desc[0] for desc in cursor.description]
+
+    row_count = 0
+    with output_file.open(mode="w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(column_names)
+        for row in cursor:
+            writer.writerow(row)
+            row_count += 1
+
+    print(f"Wrote {row_count} row(s) to {output_file}.")

@@ -33,7 +33,7 @@ SQLite Database (notes)
 └───────────────────────────────┘
         │
         ▼
-CSV Exports (results + full audit dump)
+CSV Export (output/results.csv)
 ```
 
 ---
@@ -167,8 +167,8 @@ This displays CLI help. There are two options, which can be combined:
 
 | Option         | Effect                                                                                   |
 | -------------- | ---------------------------------------------------------------------------------------- |
-| `--csv FILE`   | Ingest the notes in `FILE` into `data.db` (duplicates skipped); prints how many were added |
-| `--analyze`    | Run the LLM on every note that has no result yet, then write the CSV exports to `output/` |
+| `--csv FILE`   | Ingest the notes in `FILE` into `data.db` (duplicates skipped); reports how many were added |
+| `--analyze`    | Run the LLM on every note that has no result yet, then write `output/results.csv`          |
 
 ---
 
@@ -211,16 +211,34 @@ This will:
 
 1. Ingest notes
 2. Run the LLM extraction on every note without a result
-3. Store each result, with the raw model response, in the database
-4. Export CSV outputs
+3. Store each result, with the raw model response and per-note debugging columns, in the database
+4. Export `output/results.csv`
 
 Running `python app.py --analyze` again resumes: notes that already have a result are skipped.
+
+While it runs, the program reports what it is doing:
+
+```
+[15:48:30] Model: medgemma:27b
+[15:48:30] 330 note(s) in the database, 0 already analysed, 330 to process.
+[15:49:26] ok     note 1 (1/330) 56.2s, attempt 1: scope='Olympus H190' egd=1 colonoscopy=0 duodenal_biopsies=4 taken=1 fellow=1
+[15:50:40] retry  note 2: attempt 1/5 did not return valid JSON
+[15:51:55] ok     note 2 (2/330) 149.1s, attempt 2: scope=None egd=0 colonoscopy=0 duodenal_biopsies=0 taken=0 fellow=0
+...
+[16:02:10] FAILED note 7 (7/330) after 5 attempt(s), 301.4s: Invalid JSON returned by LLM: Expecting value: line 1 column 1 (char 0)
+[16:08:33] progress 10/330 done, 1 failed, 68.1s per note, 0:11:21 elapsed, about 6:03:12 remaining
+...
+[21:51:02] Finished 330 note(s) in 6:02:32: 326 ok, 4 failed, 65.9s per note.
+[21:51:02] Failed note id(s): 7, 118, 240, 301
+```
+
+Only the structured fields are logged, never note text or the model's prose; the evidence sentences and raw responses are in the database and the export.
 
 ---
 
 ### Inspecting the Data
 
-The program does not print notes or results to the terminal. Use the CSV exports in `output/`, or query `data.db` directly, for example:
+The program never prints note text to the terminal. Use `output/results.csv`, or query `data.db` directly, for example:
 
 ```bash
 sqlite3 data.db "select count(*) notes, (select count(*) from results) done, (select count(*) from results where LLM_Failed=1) failed from notes;"
@@ -297,7 +315,9 @@ HIPAA:
 Tables:
 
 - `notes` – raw clinical notes
-- `results` – the LLM's extracted fields and raw response, one row per note
+- `results` – one row per note: the LLM's ten extracted fields plus the debugging columns `LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error` and `RawResponse`
+
+If an older `data.db` lacks one of the `results` columns, it is added on startup (existing rows get an empty value).
 
 Safeguards:
 
@@ -326,9 +346,10 @@ Workflow per note:
 
 Features:
 
-- Progress bar with ETA
-- Retry logic for malformed LLM output
-- Graceful failure isolation: a failed note is recorded with `LLM_Failed = 1` and the run continues
+- One log line per note (time taken, attempts, and the extracted flags), a running summary every ten notes with the projected time remaining, and a final summary that lists the failed note ids
+- Progress bar with ETA when run in a terminal
+- Retry logic for malformed LLM output; every retry is logged
+- Graceful failure isolation: a failed note is recorded with `LLM_Failed = 1`, its attempt count and the error message, and the run continues
 
 HIPAA:
 
@@ -383,10 +404,11 @@ HIPAA:
 
 Generated in `/output`:
 
-- `combined_results.csv` – every note with its extracted fields and `LLM_Failed` flag
-- `full_combined_results.csv` – every table dumped in full, including raw LLM responses, for audit
+- `results.csv` – one row per note
 
-Exports are **write-once** by default to prevent overwrites.
+Columns, in order: the note identifiers (`id`, `mrn`, `encounter`, `note_csn_id`, `note_date`, `note_type`); the ten extracted fields (`ScopeType`, `Colonoscopy`, `ColonoscopyInformation`, `Endoscopy`, `EndoscopyInformation`, `NumberOfDuodenalBiopsies`, `DuodenalBiopsiesTaken`, `DuodenalBiopsiesInformation`, `FellowPresent`, `FellowInformation`); the debugging columns (`LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `RawResponse`); and the note text last. A note the model failed on has empty extracted fields, `LLM_Failed = 1` and the error in `LLM_Error`.
+
+The export is **write-once**: an existing `results.csv` is never overwritten. Move it aside and run `--analyze` again to regenerate it from the database.
 
 ---
 

@@ -120,12 +120,11 @@ notes.csv ──> SQLite notes table
                  │
                  ▼  data_worker.py, one note at a time
        ┌──────────────────────────────┐
-       │ llm_analysis.py (Ollama LLM) │──> results (extracted fields + raw LLM text)
+       │ llm_analysis.py (Ollama LLM) │──> results (extracted fields + debugging columns + raw LLM text)
        └──────────────────────────────┘
                  │
-                 ▼  database.py exports (write-once)
-                     output/combined_results.csv
-                     output/full_combined_results.csv
+                 ▼  database.py export (write-once)
+                     output/results.csv
 ```
 
 ### 2.1 Command-line interface (`cli.py`)
@@ -133,11 +132,11 @@ notes.csv ──> SQLite notes table
 | Invocation | Effect |
 | --- | --- |
 | `python app.py` | Prints help and exits 0 |
-| `python app.py --csv FILE` | Ingests the CSV (duplicates skipped) and prints how many notes were added |
-| `python app.py --analyze --csv FILE` | Ingests, runs the LLM on every note without a result, exports CSVs |
+| `python app.py --csv FILE` | Ingests the CSV (duplicates skipped) and reports rows read, notes added and duplicates skipped |
+| `python app.py --analyze --csv FILE` | Ingests, runs the LLM on every note without a result, writes `output/results.csv` |
 | `python app.py --analyze` | Same, without ingesting. Resumes an interrupted run |
 
-`--csv` always ingests first; `--analyze` then runs if given. The database file is always `data.db` in the current working directory and `output/` is created there too, so run the program from the repository directory. There is no command that prints notes or results; use the exports or `sqlite3` (7.3).
+`--csv` always ingests first; `--analyze` then runs if given. The database file is always `data.db` in the current working directory and `output/` is created there too, so run the program from the repository directory. There is no command that prints notes or results; use `output/results.csv` or `sqlite3` (7.3).
 
 ### 2.2 Extracted fields
 
@@ -162,13 +161,14 @@ What the researcher actually needs from these fields is in [15.5](#155-study-req
 
 - LLM `LLMAnalysisError` whose message contains `Invalid JSON` or `JSONDecodeError`: retried, up to 5 attempts total. Each retry is a complete generation.
 - Any other `LLMAnalysisError` (missing field, wrong type, unexpected field, boolean not 0/1) or any other exception: stored immediately with `LLM_Failed = 1`, no retry.
+- Every note gets a `results` row with `LLM_Attempts`, `LLM_Seconds` and, on failure, `LLM_Error`. The log carries one timestamped line per note (`ok` or `FAILED`, with the time taken, the attempt count and the structured fields, never note text), a `retry` line for every JSON retry, a `progress` line every 10 notes with the projected time remaining, and a final summary that lists the failed ids.
 - The loop never raises. The process exits 0 even when every note failed. This is why the preflight exists (section 6).
 
 ### 2.4 Idempotency
 
 - Ingest skips a row only if all six fields match an existing row exactly.
 - `data_worker` skips any note id that already has a `results` row.
-- Exports are skipped if the target CSV already exists.
+- The export is skipped if `output/results.csv` already exists.
 
 ---
 
@@ -476,7 +476,7 @@ tail -f /Users/apkane/nlp-study-logs/nlp-study.o<JOB_ID>
 qdel <JOB_ID>
 ```
 
-After the job ends, `qacct -j <JOB_ID>` shows exit status, wallclock, and `maxvmem`. Checking progress in the database while a job is running is safe for reads:
+After the job ends, `qacct -j <JOB_ID>` shows exit status, wallclock, and `maxvmem`. The job log (`tail -f` above) carries one line per note with the time taken and the extracted flags, a `progress` line every 10 notes with the projected time remaining, and a final summary with the failed ids. Checking progress in the database while a job is running is also safe for reads:
 
 ```bash
 sqlite3 /nfsscratch/Users/apkane/nlp-study/repo/data.db "select count(*) notes, (select count(*) from results) done, (select count(*) from results where LLM_Failed=1) llm_failed from notes;"
@@ -490,11 +490,11 @@ Submit again without `--csv`. Notes with a `results` row are skipped; the rest a
 qsub ~/nlp-study.job --analyze
 ```
 
-Exports are write-once. If `output/combined_results.csv` or `output/full_combined_results.csv` exists, that export is skipped with a message, so after a resume the files on disk are from the first partial run (BACKLOG B17). Move or delete the old files first to regenerate them from the complete database.
+The export is write-once. If `output/results.csv` exists it is skipped with a message, so after a resume the file on disk is from the first partial run (BACKLOG B17). Move or delete the old file first to regenerate it from the complete database.
 
 ### 7.5 Collecting results
 
-Two files in `repo/output/` (details in Appendix D). All contain PHI. Copy them, and `data.db` if you want the raw LLM responses for audit, to durable storage. Scratch is purged on a schedule and `preserved/` is still scratch.
+One file, `repo/output/results.csv` (columns in Appendix D). It contains PHI and already includes the raw LLM responses. Copy it, and `data.db`, to durable storage. Scratch is purged on a schedule and `preserved/` is still scratch.
 
 ### 7.6 Compute nodes without internet
 
@@ -586,7 +586,7 @@ PowerShell paths use backslashes (`--csv path\to\endoscopy_notes.csv`). `data.db
 
 - All compute stays on the machine: no network calls, no telemetry, no prompt logging outside SQLite. Ollama listens on loopback.
 - Enable disk encryption on the workstation, restrict OS-level user access, and treat CSV exports (and `data.db`) as PHI.
-- The program never prints note text or results to the terminal; raw LLM output is kept in the database for audit.
+- The program never prints note text or model output to the terminal; the per-note log lines carry only the structured fields. Raw LLM output is kept in the database and in `results.csv` for audit.
 - The software assists with data extraction and research workflows. It does not replace clinical judgment and must be validated per institutional policy.
 
 ---
@@ -761,10 +761,10 @@ Rows identical in all six fields are skipped with a count message. Any change to
 Yes: `python app.py --csv ./notes.csv` ingests and reports how many notes were added. This is cheap and safe on a login node since no model is involved.
 
 **Q: Where do results go?**
-`data.db` (both tables, including raw LLM text) and `output/` (two CSVs) in the repo directory. All are PHI. Copy them off scratch.
+`data.db` (both tables, including raw LLM text) and `output/results.csv` in the repo directory. All are PHI. Copy them off scratch.
 
 **Q: Which notes did the LLM fail on?**
-`sqlite3 data.db "select id from results where LLM_Failed = 1;"`. Those rows keep every extracted field null and are not retried on resume; see 14, "Job finished quickly, exit 0, LLM columns all empty" for reprocessing them.
+The job log ends with `Failed note id(s): ...`, and every note has `LLM_Failed`, `LLM_Attempts` and `LLM_Error` in `results.csv` (or `sqlite3 data.db "select id, LLM_Error from results where LLM_Failed = 1;"`). Those rows keep every extracted field null and are not retried on resume; see 14, "Job finished quickly, exit 0, LLM columns all empty" for reprocessing them.
 
 **Q: Where are the researcher's requirements written down?**
 As five review comments by Alexander P. Kane in `samples/Upper Gl endoscopy Scope details.docx` (also rendered in the margins of the PDF next to it). They are quoted in [15.5](#155-study-requirements-the-researchers-review-comments) and analysed in `BACKLOG.md` section 1. The README does not mention them.
@@ -787,7 +787,7 @@ Regenerate with `NLP_JOB_QUEUE=UI-GPU NLP_JOB_GPU=1 ./setup.sh`, which bakes in 
 `NLP_SKIP_PREFLIGHT=1 qsub ~/nlp-study.job ...` bypasses it. Not recommended; it is the only thing standing between you and a silent all-null run.
 
 **Q: How do I watch progress?**
-`qstat -u apkane` for state, `tail -f ~/nlp-study-logs/nlp-study.o<JOB_ID>` for the log, `~/nlp-study-logs/ollama-<JOB_ID>.log` for the server, and a read-only `sqlite3` count on `data.db` for notes done versus failed.
+`qstat -u apkane` for state, `tail -f ~/nlp-study-logs/nlp-study.o<JOB_ID>` for the log (one line per note, and a `progress` line with the projected time remaining every 10 notes), `~/nlp-study-logs/ollama-<JOB_ID>.log` for the server, and a read-only `sqlite3` count on `data.db` for notes done versus failed.
 
 **Q: The job log shows `exit 143`. Bug?**
 On any queue other than `all.q`, 143 usually means the memory limit was hit. `qacct -j <JOB_ID>` shows `maxvmem`. Request more slots or the `UI-HM` queue. On `all.q`, 143 means eviction by a higher-priority queue.
@@ -890,13 +890,13 @@ The code-side fix (open with `utf-8-sig`, normalise and alias headers) is BACKLO
 
 The path is resolved relative to the current directory. In the job that is the repo dir after `cd`. Interactively, run from the repo dir or give an absolute path.
 
-#### `Skipped N duplicate row(s) during import.`
+#### `Read N row(s) from ...: 0 new note(s) added, N duplicate(s) skipped.`
 
 Not an error. Identical rows already exist in `notes`.
 
 #### `No notes to process.`
 
-The `notes` table is empty. Ingest first, or pass `--csv`.
+The line before it says which: either the `notes` table is empty (ingest first, or pass `--csv`), or every note already has a `results` row (nothing left to do; delete rows to recompute, 15.3 item 26).
 
 ### setup.sh
 
@@ -1120,7 +1120,7 @@ TERM did not stop it and SGE sent KILL. Same causes as 143.
 
 #### Job finished quickly, exit 0, LLM columns all empty
 
-Something started failing after the preflight passed (for example the Ollama server died mid-run). Count failures:
+Something started failing after the preflight passed (for example the Ollama server died mid-run). The job log has a `FAILED` line per note with the error, the final summary lists the failed ids, and `LLM_Error` in `results` keeps the message. Count failures:
 
 ```bash
 sqlite3 data.db "select count(*) from results where LLM_Failed=1;"
@@ -1132,11 +1132,11 @@ Those rows will not be redone on resume because a `results` row exists. Delete t
 sqlite3 data.db "delete from results where LLM_Failed=1;"
 ```
 
-Then resubmit with `--analyze` and regenerate the exports. (A `--reprocess-failed` flag is BACKLOG B21.)
+Then resubmit with `--analyze` and regenerate the export. (A `--reprocess-failed` flag is BACKLOG B21.)
 
-#### `File 'output/combined_results.csv' already exists. Export skipped.`
+#### `File 'output/results.csv' already exists. Export skipped; ...`
 
-Write-once protection. Move the old files aside and re-run `--analyze` (the export is cheap when nothing new is pending).
+Write-once protection. Move the old file aside and re-run `--analyze` (the export is cheap when nothing new is pending).
 
 #### NVIDIA driver too old
 
@@ -1204,20 +1204,20 @@ Things to hold in mind while changing the code, grouped by the layer they affect
 
 ### 15.3 Pipeline semantics
 
-21. **LLM failures are swallowed by design.** Any change to the schema, prompt or model must be followed by a tier 1 preflight; nothing else will tell you it broke. If you add a field, update all of: the prompt schema text, `EXPECTED_FIELDS`, `BOOL_FIELDS` if boolean, `normalize_llm_result` if integer, `RESULTS_TABLE_SCHEMA` and `RESULT_FIELDS` in `database.py` (the insert and the export query are built from `RESULT_FIELDS`), and `HARD`/`SOFT` plus the synthetic note in `setup.sh`.
+21. **LLM failures are swallowed by design.** Any change to the schema, prompt or model must be followed by a tier 1 preflight; nothing else will tell you it broke. If you add a field, update all of: the prompt schema text, `EXPECTED_FIELDS`, `BOOL_FIELDS` if boolean, `normalize_llm_result` if integer, `RESULT_FIELDS` in `database.py` (the table schema, the insert and the export query are all built from it, and `create_db` adds the new column to an existing database), and `HARD`/`SOFT` plus the synthetic note in `setup.sh`.
 22. **Keep `except Exception` in `llm_analysis()`, not `except BaseException`.** The preflight's timeout is a `BaseException` subclass precisely so that wrapper cannot swallow it.
 23. **Validation rejects extra fields and non-0/1 booleans.** A model that adds commentary keys or returns `true`/`false` fails validation and is not retried (only JSON parse errors are). The prompt is the only defence; `format=` with a schema would be stronger (BACKLOG B9).
 24. **Retries are only for JSON decode errors**, up to 5 attempts, each a full generation. Budget runtime accordingly and prefer fixing the prompt or decoding over raising the retry count.
-25. **`CREATE TABLE IF NOT EXISTS` does not migrate.** Changing a schema does nothing to an existing `data.db`. Delete it (after copying out) or write a migration (BACKLOG B19).
+25. **`CREATE TABLE IF NOT EXISTS` does not migrate.** `create_db` adds any `results` column missing from an existing `data.db` (`ALTER TABLE ... ADD COLUMN`; existing rows get null), which covers adding a field. Anything else (renaming or retyping a column, changing `notes`) still needs a fresh database or a hand-written migration (BACKLOG B19).
 26. **Resume logic keys on row existence, not freshness.** Changing the prompt or model does not reprocess notes that already have a `results` row. Delete those rows to recompute.
 27. **Relative paths everywhere.** `data.db` and `output/` are resolved from the current directory. Run from the repo directory, or refactor to pass a path (BACKLOG B18).
-28. **Exports are write-once.** Each of the two CSVs is skipped if it already exists. After a resume the files on disk are stale (BACKLOG B17).
+28. **The export is write-once.** `output/results.csv` is skipped if it already exists. After a resume the file on disk is stale (BACKLOG B17).
 29. **Ingest dedup is whole-row equality and quadratic.** A trailing space in one field creates a second note; identical notes under different CSN ids are analysed twice (BACKLOG B16).
 30. **CSV contract is strict and case-sensitive**, opened with `encoding="utf-8"`. Switching to `encoding="utf-8-sig"` would make BOM-prefixed exports work. `EncounterID` would still need renaming unless the required set is widened (BACKLOG B7).
 
 ### 15.4 Operations and HIPAA
 
-31. **Logs are not PHI-free by construction.** `data_worker` logs exceptions per note id, not note text, but `LLMAnalysisError` messages can echo model output, which copies note sentences, and those messages reach `~/nlp-study-logs/` in `$HOME` (BACKLOG F11). Do not add debug prints of note content, raw LLM output or CSV rows. Ollama at `OLLAMA_DEBUG=INFO` does not log prompts; the Ollama logs now also live in `~/nlp-study-logs/`.
+31. **Logs are not PHI-free by construction.** `data_worker` logs one line per note with the note id, timing and the structured fields (scope model, flags, counts), never the evidence sentences, note text or raw output; but `LLMAnalysisError` messages can echo model output, which copies note sentences, and those messages reach the log in `~/nlp-study-logs/` in `$HOME` and the `LLM_Error` column (BACKLOG F11). Do not add debug prints of note content, raw LLM output or CSV rows. Ollama at `OLLAMA_DEBUG=INFO` does not log prompts; the Ollama logs now also live in `~/nlp-study-logs/`.
 32. **The job emails on end and abort** (`-m ea`). Do not put identifiers in the job name or in anything that reaches stdout at the end.
 33. **Everything binds to `127.0.0.1`.** Keep it that way; never expose the Ollama port on the node's interfaces.
 34. **Walltime versus volume.** 24 h at 8 slots is the default (`NLP_JOB_HRT`, `NLP_JOB_SLOTS`). Projected runtime comes from tier 1, which counts the real rows. Raise `h_rt` or plan resubmissions; the pipeline is resume-safe. Gating non-procedure notes before the LLM (BACKLOG F3) is the big lever.
@@ -1404,15 +1404,14 @@ From the 19:22 and 19:33 server logs, Ollama 0.32.14 inside the container on a c
 
 **notes**: `id` (autoincrement), `mrn`, `encounter`, `note_csn_id`, `note_date`, `note_type`, `note`.
 
-**results** (one row per note id): the ten extracted fields (`ScopeType`, `Colonoscopy`, `ColonoscopyInformation`, `Endoscopy`, `EndoscopyInformation`, `NumberOfDuodenalBiopsies`, `DuodenalBiopsiesTaken`, `DuodenalBiopsiesInformation`, `FellowPresent`, `FellowInformation`); `RawResponse` (verbatim model text, for audit); `LLM_Failed` (1 when the model call or its validation failed; every other column is then null). It carries no `note_csn_id`, so selecting the EGD cohort by CSN needs a join with `notes` (BACKLOG B20); `combined_results.csv` is that join.
+**results** (one row per note id): the ten extracted fields (`ScopeType`, `Colonoscopy`, `ColonoscopyInformation`, `Endoscopy`, `EndoscopyInformation`, `NumberOfDuodenalBiopsies`, `DuodenalBiopsiesTaken`, `DuodenalBiopsiesInformation`, `FellowPresent`, `FellowInformation`) and five debugging columns: `LLM_Failed` (1 when the model call or its validation failed; the extracted fields are then null), `LLM_Attempts` (model calls made for the note), `LLM_Seconds` (wall-clock time over all attempts), `LLM_Error` (the final error message when it failed) and `RawResponse` (verbatim text of the accepted model response, for audit). It carries no `note_csn_id`, so selecting the EGD cohort by CSN needs a join with `notes` (BACKLOG B20); `results.csv` is that join. `create_db` adds any of these columns that an older `data.db` lacks.
 
-Until 2026-10-13 the tables were `working_results` (NLP and LLM answers side by side) and `final_results` (the reconciled subset). A `data.db` from before then still holds those two tables and no `results` table: `CREATE TABLE IF NOT EXISTS` adds `results` beside them, every note is analysed again, and the old tables are ignored except that `full_combined_results.csv` dumps them too. Start from a fresh `data.db` unless you want that.
+Until 2026-10-13 the tables were `working_results` (NLP and LLM answers side by side) and `final_results` (the reconciled subset). A `data.db` from before then still holds those two tables and no `results` table: `CREATE TABLE IF NOT EXISTS` adds `results` beside them, every note is analysed again, and the old tables are ignored. Start from a fresh `data.db` unless you want that.
 
 ### Files in `output/`
 
 | File | Content |
 | --- | --- |
-| `combined_results.csv` | `notes` left-joined with the ten extracted fields and `LLM_Failed` from `results` (no raw model text) |
-| `full_combined_results.csv` | Every table dumped sequentially with a `Table: <name>` header line between them, including raw LLM responses |
+| `results.csv` | One row per note: `id`, `mrn`, `encounter`, `note_csn_id`, `note_date`, `note_type`; the ten extracted fields; `LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `RawResponse`; then `note` last |
 
-Both are written once and never overwritten. Both contain PHI.
+It is written once and never overwritten. It contains PHI.

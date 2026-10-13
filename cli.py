@@ -55,7 +55,9 @@ def main():
         print(f"Error: CSV file not found: {args.csv}", file=sys.stderr)
         sys.exit(1)
 
-    conn = create_db(Path("data.db"))
+    db_path = Path("data.db")
+    print(f"Using database {db_path.resolve()}")
+    conn = create_db(db_path)
 
     try:
         if args.csv:
