@@ -268,7 +268,7 @@ Ollama's upstream `install.sh` binary needs `GLIBC_2.27+`. CentOS 7 ships glibc 
 | Generated preflight script | `/nfsscratch/Users/apkane/nlp-study/nlp-preflight.py` |
 | Setup lock (rewrite): `owner` file holds host, pid, epoch | `/nfsscratch/Users/apkane/nlp-study/.setup.lock/` |
 | Ollama container image | `/nfsscratch/Users/apkane/nlp-study-assets/ollama.sif` (in-progress pull: `ollama.partial.sif`) |
-| Model store (bound to `/models` inside the container) | `/nfsscratch/Users/apkane/nlp-study-assets/ollama-models` with `manifests/<host>/<ns>/<name>/<tag>` (today `manifests/hf.co/ggml-org/gemma-3-12b-it-GGUF/Q4_K_M`) and `blobs/sha256-<hex>` |
+| Model store (bound to `/models` inside the container) | `/nfsscratch/Users/apkane/nlp-study-assets/ollama-models` with `manifests/<host>/<ns>/<name>/<tag>` (today `manifests/registry.ollama.ai/library/medgemma/27b`) and `blobs/sha256-<hex>` |
 | Apptainer cache and tmp | `/nfsscratch/Users/apkane/nlp-study-assets/apptainer-cache`, `.../apptainer-tmp` |
 | Generated `mksquashfs` wrapper (working tree; on `PATH` only during `apptainer pull`) | `/nfsscratch/Users/apkane/nlp-study-assets/bin/mksquashfs` |
 | Notes input (PHI) | `/nfsscratch/Users/apkane/nlp-study/repo/notes.csv` |
@@ -349,7 +349,7 @@ September version: the model step started a temporary Ollama server on the login
 
 `setup.sh` does not hardcode the model. `detect_repo_model()` reads the first line matching `^LOCAL_MODEL *= *"..."` in `llm_analysis.py` (no leading whitespace allowed). `MODEL=name:tag ./setup.sh` overrides but warns if it disagrees with the repo, because the program will call whatever the repo says. If neither source yields a name the script dies. There is no `gemma4:e2b` fallback any more. Names parse as Ollama does: `gemma3:12b` is `registry.ollama.ai/library/gemma3:12b`, and `hf.co/<user>/<repo>:<quant>` is fetched from Hugging Face, which serves the same registry protocol.
 
-Since 2026-10-13 the model is `hf.co/ggml-org/gemma-3-12b-it-GGUF:Q4_K_M` (Gemma 3 12B instruct, Q4_K_M, about 7.8 GB, published March 2025 by the llama.cpp maintainers). Every `gemma3` and `gemma4` tag on `registry.ollama.ai` now declares `requires` 0.30.0 or newer in its config. The image is pinned to Ollama 0.24.0 for the driver-535 GPUs. Ollama 0.24.0 does not check `requires` itself, the registry checks it on `ollama pull`, and curl skips that check, so `setup.sh` reads the field and checks it itself. The Hugging Face build declares no requirement.
+Since 2026-10-13 the model is `medgemma:27b` (MedGemma 27B, Gemma 3 based, Q4_K_M, 17.4 GB, model blob `sha256:4b97da6b21a8...`), called with `think=False`. Its registry config declares no `requires` and it ships no separate projector layer, so it passes `setup.sh`'s check and loads on 0.24.0. Ollama 0.24.0 rejects `think` only when it is true for a model without thinking support, so `think=False` is safe. It replaced `hf.co/ggml-org/gemma-3-12b-it-GGUF:Q4_K_M` (Gemma 3 12B instruct, Q4_K_M, about 7.8 GB, published March 2025 by the llama.cpp maintainers). Every `gemma3` and `gemma4` tag on `registry.ollama.ai` now declares `requires` 0.30.0 or newer in its config. The image is pinned to Ollama 0.24.0 for the driver-535 GPUs. Ollama 0.24.0 does not check `requires` itself, the registry checks it on `ollama pull`, and curl skips that check, so `setup.sh` reads the field and checks it itself. The Hugging Face build declares no requirement.
 
 ### 5.5 Installed package set (venv, 2026-09-14)
 

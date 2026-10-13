@@ -3,9 +3,10 @@ import re
 from typing import Tuple
 import ollama
 
-# Gemma 3 12B instruct, Q4_K_M GGUF from the llama.cpp maintainers. Not the registry.ollama.ai
-# gemma3:12b: every build there now requires Ollama 0.30+, and Argon pins 0.24.0 (driver 535).
-LOCAL_MODEL = "hf.co/ggml-org/gemma-3-12b-it-GGUF:Q4_K_M"
+# MedGemma 27B (Gemma 3 base), Q4_K_M, 17.4 GB. The registry build declares no "requires" and ships
+# no separate projector layer, so it loads on Argon's pinned Ollama 0.24.0 (driver 535).
+# Model blob digest as of 2026-10-13: sha256:4b97da6b21a8fb1405a0d1efee462bfd6c4d3c46307bac8b34373835f07ca758
+LOCAL_MODEL = "medgemma:27b"
 
 EXPECTED_FIELDS = {
     "id": int,
@@ -230,7 +231,7 @@ def llm_analysis(id: int, note: str) -> Tuple[dict, str]:
     ]
 
     try:
-        response = ollama.chat(model=LOCAL_MODEL, messages=messages)
+        response = ollama.chat(model=LOCAL_MODEL, messages=messages, think=False)
     except Exception as e:
         raise LLMAnalysisError(f"LLM call failed: {e}")
 

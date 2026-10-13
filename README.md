@@ -152,13 +152,13 @@ curl -fsSL https://ollama.com/install.sh | sh
 Pull the required model:
 
 ```powershell
-ollama pull hf.co/ggml-org/gemma-3-12b-it-GGUF:Q4_K_M
+ollama pull medgemma:27b
 ```
 
-This is Gemma 3 12B instruct (Q4_K_M, about 7.8 GB) from Hugging Face. The `gemma3:12b` on
-Ollama's own registry now requires Ollama 0.30+, which cannot use the GPUs on the
-Argon cluster (NVIDIA driver 535), so the project uses this build on every machine.
-To match Argon exactly, install Ollama 0.24.0:
+This is MedGemma 27B (Gemma 3 based, Q4_K_M, about 17.4 GB). It is called with thinking
+off (`think=False`). Unlike the current `gemma3` and `gemma4` tags, this build runs on
+Ollama 0.24.0, the last release that can use the GPUs on the Argon cluster (NVIDIA
+driver 535). To match Argon exactly, install Ollama 0.24.0:
 `curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=0.24.0 sh`.
 
 Ollama runs locally and does **not** require internet access after model download.
@@ -390,7 +390,7 @@ Key Safeguards:
 
 Model:
 
-- `hf.co/ggml-org/gemma-3-12b-it-GGUF:Q4_K_M` (Gemma 3 12B instruct; set by `LOCAL_MODEL` in `llm_analysis.py`)
+- `medgemma:27b` (MedGemma 27B, thinking off; set by `LOCAL_MODEL` in `llm_analysis.py`)
 
 HIPAA:
 
