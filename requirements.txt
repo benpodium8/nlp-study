@@ -1,4 +1,23 @@
-rich
-click
-spacy
-ollama
+# Pinned to the Argon venv (/nfsscratch/Users/apkane/nlp-study/venv, Python 3.12.14),
+# as recorded on 2026-09-14 in ARGON_RUNBOOK.md section 5.5.
+# Every pin must have a manylinux2014 (glibc 2.17) wheel for CPython 3.12 x86_64:
+# Argon installs with --only-binary=:all:. Check before changing a pin with
+#   pip download --only-binary=:all: --platform manylinux2014_x86_64 \
+#       --python-version 3.12 --implementation cp --abi cp312 -d /tmp/wheels <pkg>==<ver>
+# Transitive dependencies not listed here were not recorded and are resolved by pip.
+
+# Direct dependencies
+rich==15.0.0
+click==8.4.2
+spacy==3.8.14
+ollama==0.6.2
+
+# Transitive dependencies recorded on Argon
+thinc==8.3.13
+blis==1.3.3
+numpy==2.2.6
+httpx==0.28.1
+pydantic==2.13.4
+typer==0.27.1
+requests==2.34.2
+tqdm==4.70.0

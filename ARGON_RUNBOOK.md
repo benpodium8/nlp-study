@@ -215,7 +215,7 @@ Consequence: a note with no scope mentioned anywhere ends up with an all-null fi
 | sha256sum | coreutils | Required by the rewrite to verify model blobs |
 | apptainer | 1.3.2-1.el7 | Runs the Ollama container unprivileged. Predates the 1.4.0 `--mksquashfs-args` option (see 3.3) |
 | Environment Modules | available | Only `python/3.8.8_*` modules exist on Argon (gcc-5.4.0, gcc-9.3.0, intel-2021.2.0 variants). No 3.12 module |
-| Python actually used | `/Users/apkane/temp/build_python/python3.12/bin/python3.12` | A user-built 3.12 in `$HOME`. The venv reports Python 3.12.14. `.python-version` pinned 3.12.13 until `957c6b8`; it now pins `3.12`, so any 3.12.x satisfies it |
+| Python actually used | `/Users/apkane/temp/build_python/python3.12/bin/python3.12` | A user-built 3.12 in `$HOME`. The venv reports Python 3.12.14. `.python-version` pins `3.12.14` to match it; `setup.sh` reads only major.minor, so any 3.12.x still satisfies the installer |
 
 ### 3.3 Login node limits (the reason for the two-node workflow)
 
@@ -351,7 +351,7 @@ September version: the model step started a temporary Ollama server on the login
 
 ### 5.5 Installed package set (venv, 2026-09-14)
 
-spacy 3.8.14, thinc 8.3.13, blis 1.3.3, numpy 2.2.6, ollama 0.6.2, httpx 0.28.1, pydantic 2.13.4, rich 15.0.0, click 8.4.2, typer 0.27.1, requests 2.34.2, tqdm 4.70.0, pip 26.2.1, setuptools 84.0.0, wheel 0.48.0, plus their transitive dependencies. `requirements.txt` lists only `rich`, `click`, `spacy`, `ollama`, unpinned (`click` is imported by nothing; BACKLOG B24). The local workstation venv has newer spacy and ollama than Argon (BACKLOG B25).
+spacy 3.8.14, thinc 8.3.13, blis 1.3.3, numpy 2.2.6, ollama 0.6.2, httpx 0.28.1, pydantic 2.13.4, rich 15.0.0, click 8.4.2, typer 0.27.1, requests 2.34.2, tqdm 4.70.0, pip 26.2.1, setuptools 84.0.0, wheel 0.48.0, plus their transitive dependencies. `requirements.txt` pins exactly these versions (except pip, setuptools and wheel); the unrecorded transitive dependencies are left to pip (`click` is imported by nothing; BACKLOG B24). The local workstation venv is built from the same file on Python 3.12.14.
 
 ### 5.6 Upgrading Argon from the September script to the rewrite
 
@@ -587,7 +587,7 @@ PowerShell paths use backslashes (`--csv path\to\endoscopy_notes.csv`). `data.db
 
 - There is no preflight gate on a workstation unless you run the generated `nlp-preflight.py` yourself, and no job script. A wrong model name still produces a complete-looking run with `LLM_Failed = 1` on every row; check `--working_results` or the counts in 7.3 before trusting a run.
 - A desktop Ollama with a GPU picks its context length from VRAM; a CPU-only machine gets 4096 tokens, and long notes are truncated server-side with no client-visible error (BACKLOG B10). Set `OLLAMA_CONTEXT_LENGTH=8192` in the Ollama service environment, or pass `num_ctx` in code.
-- The `ollama` Python package and spaCy are unpinned, so a workstation venv will differ from Argon's (local: spacy 3.8.16, ollama 0.6.3; Argon: 3.8.14, 0.6.2 per BACKLOG B25).
+- `requirements.txt` pins the Argon versions (spacy 3.8.14, ollama 0.6.2, see 5.5), so a workstation venv matches Argon's. Use Python 3.12.14 (`.python-version`) for an exact match.
 - The same CSV header rules apply (14, "CSV must contain columns").
 - With Apptainer installed, the Argon env script also works off-cluster: `NLP_ALLOW_INFERENCE=1` lets `nlp_start_ollama` run outside SGE.
 
@@ -1180,7 +1180,7 @@ Things to hold in mind while changing the code, grouped by the layer they affect
 ### 15.1 Platform
 
 1. **Target is CentOS 7, glibc 2.17, GCC 4.8, Bash 4.2, git 1.8.3.1, Apptainer 1.3.2.** No source builds of C extensions. Every new Python dependency must publish a `manylinux2014`-compatible wheel for CPython 3.12 x86_64. `manylinux_2_28` wheels will not install. Check with `pip download --only-binary=:all:` before adding to `requirements.txt`.
-2. **Python 3.12 is a user build, not a module.** `.python-version` pins `3.12`; the Argon venv has 3.12.14. `setup.sh` reads only major.minor from the file. Keep the code compatible with 3.10+ (the installer accepts 3.10 through 3.13) unless you are willing to also tighten `check_python` in `setup.sh`.
+2. **Python 3.12 is a user build, not a module.** `.python-version` pins `3.12.14`, the version of the Argon venv. `setup.sh` reads only major.minor from the file. Keep the code compatible with 3.10+ (the installer accepts 3.10 through 3.13) unless you are willing to also tighten `check_python` in `setup.sh`.
 3. **Compute nodes may have no internet.** Anything that downloads at runtime (`spacy.load("en_core_web_sm")`, Hugging Face, `ollama pull`) must happen in `setup.sh` on a login node. `setup.sh` scans for `spacy.load("<name>")` with a literal quoted name and pre-downloads; keep that call pattern literal if you add one. Today `nlp_analysis.py` uses `spacy.blank("en")` plus the `sentencizer`, so nothing is downloaded.
 4. **Login nodes: 1 CPU, 16 GB, process killer.** Nothing that touches the model may run there. Tier 0 checks are the ceiling, and the rewrite enforces this in `nlp_start_ollama` by hostname and SGE variables. Keep the hostname check if you touch that function; `NLP_ALLOW_INFERENCE` deliberately does not override it.
 5. **Apptainer 1.3 has no pull-time mksquashfs option.** `APPTAINER_MKSQUASHFS_ARGS` is the environment form of `apptainer build --mksquashfs-args` (new in 1.4.0) and `pull` never reads it; the committed script's export of it did nothing. The working tree caps the conversion with a generated `mksquashfs` wrapper placed first on `PATH` during the pull (BACKLOG B14). That only works while Apptainer resolves `mksquashfs` through `PATH`, so if Argon's `apptainer.conf` ever pins `mksquashfs path` the cap silently disappears (the script warns). Confirm on Argon with `./setup.sh --force sif` before relying on it.
@@ -1199,7 +1199,7 @@ Things to hold in mind while changing the code, grouped by the layer they affect
 15. **Ollama is not deterministic by default.** `ollama.chat()` is called without `options`, so the server default temperature (0.8) applies despite the prompt calling itself deterministic. For reproducibility add `options={"temperature": 0, "seed": <int>}` and use `format=` with the JSON schema, which also removes the markdown fences every saved response currently has (BACKLOG B9). Re-run the preflight after any change here.
 16. **Context window.** The rewrite sets `OLLAMA_CONTEXT_LENGTH=8192` on the container (`NLP_CONTEXT_LENGTH`). The September script and a workstation install get Ollama's default, 4096 on CPU. The system prompt is roughly 700 tokens; the 5000-note corpus has notes up to about 10 000 tokens. Ollama truncates server-side and the client sees a normal response. Pass `num_ctx` explicitly and detect over-long notes (BACKLOG B10, F4).
 17. **`OLLAMA_KEEP_ALIVE=-1` keeps the model loaded for the whole job.** Keep it; reloading an 8 GB model per note would dominate runtime. `OLLAMA_NUM_PARALLEL=1` matches the single-threaded `data_worker`. Nothing limits llama.cpp's threads to the requested slots (BACKLOG B26).
-18. **The container tag defaults to `latest`.** Any `--force sif` may change Ollama's version, CUDA requirement and client-API behaviour. The Python `ollama` package (0.6.2 on Argon, 0.6.3 locally) is also unpinned. Pin with `NLP_OLLAMA_IMAGE` and version specifiers in `requirements.txt` when stability matters (BACKLOG B25).
+18. **The container tag defaults to `latest`.** Any `--force sif` may change Ollama's version, CUDA requirement and client-API behaviour. Pin it with `NLP_OLLAMA_IMAGE` (BACKLOG B25). The Python packages, including `ollama` 0.6.2, are pinned in `requirements.txt` to the Argon versions.
 19. **GPU use requires three things to line up:** a `*-GPU` queue, `#$ -l ngpus=1` (and a card-type complex if you need one), and a node driver the container's CUDA runtime accepts. `nlp_start_ollama` only passes `--nv` when `nvidia-smi -L` works. Verify with the preflight placement line every time.
 20. **The on-disk model store is Ollama's own layout.** The rewrite writes `manifests/registry.ollama.ai/<ns>/<name>/<tag>` and `blobs/sha256-<hex>` with curl and prunes unreferenced blobs. If Ollama changes that layout, `create_model`, `verify_model`, `prune_model_store` and the preflight's tier 0 model check all need updating together.
 
