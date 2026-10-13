@@ -360,10 +360,13 @@ Key Safeguards:
 - Strict JSON schema enforcement
 - Type validation, with true/false and numeric strings coerced to integers
 - JSON repair layer
-- Greedy decoding (temperature 0) so a note gives the same answer on every run; retries after
-  invalid JSON sample at temperature 0.8 with the attempt number as the seed, since a greedy
-  retry would repeat the same output
-- Output capped at 1024 tokens (`num_predict`) so a model stuck repeating a phrase fails fast
+- Output constrained to a JSON schema (`format=`): always a bare object with exactly the study
+  fields, 0/1 flags, and text fields capped at 1000 characters
+- Greedy decoding (temperature 0) so a note gives the same answer on every run
+- Retries (up to 5 attempts) when the output is invalid JSON or a text field reaches the
+  1000-character cap (a repetition loop); retries sample at temperature 0.8 with a repeat
+  penalty of 1.1 and the attempt number as the seed, since a greedy retry would repeat the loop
+- Output capped at 2048 tokens (`num_predict`)
 
 Model:
 

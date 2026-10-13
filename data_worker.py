@@ -7,9 +7,9 @@ from rich.markup import escape
 from rich.progress import Progress, BarColumn, TimeElapsedColumn, TimeRemainingColumn
 
 from database import COUNT_NOTES_SQL, SELECT_PENDING_NOTES_SQL, insert_result
-from llm_analysis import LOCAL_MODEL, llm_analysis, LLMAnalysisError
+from llm_analysis import LOCAL_MODEL, llm_analysis, LLMAnalysisError, RetryableLLMError
 
-# Total attempts per note when the model returns something that is not JSON.
+# Total attempts per note when the model's output is unusable (invalid JSON, runaway text).
 # Every other failure is recorded on the first attempt.
 MAX_ATTEMPTS = 5
 
@@ -28,23 +28,23 @@ class Analysis(NamedTuple):
 def analyze_note(note_id: int, note: str, model: str, console: Console) -> Analysis:
     """
     Runs the LLM analysis on one note with the given model.
-    Retries when the model's output cannot be parsed as JSON, up to MAX_ATTEMPTS
+    Retries when the model's output is unusable (RetryableLLMError), up to MAX_ATTEMPTS
     attempts in total; any other failure is recorded immediately.
     """
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             result, raw_response = llm_analysis(note_id, note, model, attempt)
             return Analysis(result, raw_response, 0, attempt, None)
-        except LLMAnalysisError as e:
-            error = str(e)
-            is_json_error = "Invalid JSON" in error or "JSONDecodeError" in error
-            if is_json_error and attempt < MAX_ATTEMPTS:
+        except RetryableLLMError as e:
+            if attempt < MAX_ATTEMPTS:
                 _log(console, 
                     f"[yellow]retry [/yellow] note {note_id}: "
-                    f"attempt {attempt}/{MAX_ATTEMPTS} did not return valid JSON"
+                    f"attempt {attempt}/{MAX_ATTEMPTS}: {escape(str(e))}"
                 )
                 continue
-            return Analysis(None, None, 1, attempt, error)
+            return Analysis(None, None, 1, attempt, str(e))
+        except LLMAnalysisError as e:
+            return Analysis(None, None, 1, attempt, str(e))
         except Exception as e:
             return Analysis(None, None, 1, attempt, f"{type(e).__name__}: {e}")
 

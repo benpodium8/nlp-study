@@ -17,7 +17,7 @@ Evidence comes from running `nlp_analysis.py` over `samples/notes.csv` (10 notes
 > open); `results` records `LLM_Attempts`, `LLM_Seconds` and `LLM_Error` per note (B21); missing `results`
 > columns are added on startup (the column-add half of B19); the system prompt now implements the study definitions
 > (B1 nullable count, B11 attestation-based fellow and performed-only procedures, comment 3 bulb counting; the
-> validation coerces true/false and numeric strings, and `temperature` 0 is passed, the first half of B9); the run logs one line per note, a running
+> validation coerces true/false and numeric strings, `temperature` 0 and a JSON schema `format=` are passed, with seeded retries for invalid JSON and runaway text (most of B9; validation failures are still not retried)); the run logs one line per note, a running
 > summary with the projected time remaining, and the failed ids (the heartbeat half of F9); a bad CSV header
 > now names the missing columns and the header found (the message half of B7; BOM and alias handling are
 > still open); `python app.py` alone prints the requirements and a status check. F3 needs a gate

@@ -16,22 +16,29 @@ DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 # same answer on every run, which a study needs; Ollama's server default is 0.8.
 # A valid answer is ~120 tokens; num_predict stops a model stuck repeating a phrase
 # instead of letting it run to the context limit.
-GENERATION_OPTIONS = {"temperature": 0, "num_predict": 1024}
+GENERATION_OPTIONS = {"temperature": 0, "num_predict": 2048}
 
 # Greedy decoding gives the same output on every call, so a retry after a repetition
 # loop would loop again. Retries therefore sample, with the attempt number as the
-# seed so a rerun of the study still reproduces them.
+# seed so a rerun of the study still reproduces them, and penalise repeated tokens
+# (sampling alone left gemma3:4b looping on some notes; 1.1 cleared them).
 RETRY_TEMPERATURE = 0.8
+RETRY_REPEAT_PENALTY = 1.1
 
 
 def generation_options(attempt: int) -> dict:
     """
     Returns the Ollama options for the given attempt (1-based): greedy on the first
-    attempt, seeded sampling on retries.
+    attempt, seeded sampling with a repeat penalty on retries.
     """
     if attempt == 1:
         return GENERATION_OPTIONS
-    return {**GENERATION_OPTIONS, "temperature": RETRY_TEMPERATURE, "seed": attempt}
+    return {
+        **GENERATION_OPTIONS,
+        "temperature": RETRY_TEMPERATURE,
+        "seed": attempt,
+        "repeat_penalty": RETRY_REPEAT_PENALTY,
+    }
 
 EXPECTED_FIELDS = {
     "id": int,
@@ -65,6 +72,35 @@ NULLABLE_STRING_FIELDS = {
 }
 
 INTEGER_RE = re.compile(r"-?\d+")
+
+# Longest value the model may write in a text field. A real justification quote is one
+# sentence or line, well under this; a value that reaches it is a repetition loop the
+# schema cut off, and the attempt is retried.
+MAX_TEXT_CHARS = 1000
+
+# Passed to Ollama as format=, which constrains decoding to this schema: the reply is
+# always a bare JSON object with exactly these keys, 0/1 flags and bounded strings.
+# It mirrors EXPECTED_FIELDS ("id" is added by the program, not the model).
+_TEXT = {"type": ["string", "null"], "maxLength": MAX_TEXT_CHARS}
+_FLAG = {"type": "integer", "enum": [0, 1]}
+_SCHEMA_PROPERTIES = {
+    "ScopeType": _TEXT,
+    "Colonoscopy": _FLAG,
+    "ColonoscopyInformation": _TEXT,
+    "Endoscopy": _FLAG,
+    "EndoscopyInformation": _TEXT,
+    "NumberOfDuodenalBiopsies": {"type": ["integer", "null"], "minimum": 0},
+    "DuodenalBiopsiesTaken": _FLAG,
+    "DuodenalBiopsiesInformation": _TEXT,
+    "FellowPresent": _FLAG,
+    "FellowInformation": _TEXT,
+}
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": _SCHEMA_PROPERTIES,
+    "required": list(_SCHEMA_PROPERTIES),
+    "additionalProperties": False,
+}
 
 # The study definitions come from the researcher's review comments and highlighted answers on
 # the ten example notes (see ARGON_RUNBOOK.md section 15.5): the upper endoscope only, bulb
@@ -146,6 +182,10 @@ SINGLE_QUOTE_VALUE_RE = re.compile(r":\s*'([^']*)'")
 
 class LLMAnalysisError(Exception):
     pass
+
+
+class RetryableLLMError(LLMAnalysisError):
+    """The model's output was unusable in a way another attempt may fix (invalid JSON, a runaway string)."""
 
 
 class OllamaStatus(NamedTuple):
@@ -289,8 +329,12 @@ def llm_analysis(id: int, note: str, model: str = LOCAL_MODEL, attempt: int = 1)
         {"role": "user", "content": USER_PROMPT.format(note=note)},
     ]
 
+    # Each call (every note and every retry) gets its own client, so its HTTP connection
+    # is closed when the call returns instead of being held open between notes.
     try:
-        response = ollama.chat(model=model, messages=messages, think=False, options=generation_options(attempt))
+        with ollama.Client() as client:
+            response = client.chat(model=model, messages=messages, think=False, format=RESPONSE_SCHEMA,
+                                   options=generation_options(attempt))
     except Exception as e:
         raise LLMAnalysisError(f"LLM call failed: {e}")
 
@@ -300,7 +344,11 @@ def llm_analysis(id: int, note: str, model: str = LOCAL_MODEL, attempt: int = 1)
     try:
         parsed = parse_json_with_repair(clean)
     except json.JSONDecodeError as e:
-        raise LLMAnalysisError(f"Invalid JSON returned by LLM: {e}")
+        raise RetryableLLMError(f"Invalid JSON returned by LLM: {e}")
+
+    runaway = [k for k, v in parsed.items() if isinstance(v, str) and len(v) >= MAX_TEXT_CHARS]
+    if runaway:
+        raise RetryableLLMError(f"Runaway text in {', '.join(runaway)} (reached {MAX_TEXT_CHARS} characters)")
 
     parsed["id"] = id
 
