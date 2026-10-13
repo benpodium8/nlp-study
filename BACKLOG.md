@@ -1,6 +1,6 @@
 # nlp-study: evaluation against the study goals, bugfix list, and feature list
 
-Written 2026-10-13 against commit `957c6b8` plus the uncommitted `setup.sh` rewrite and `ARGON_RUNBOOK.md`.
+Written 2026-10-13 against commit `957c6b8` plus the uncommitted `setup.sh` rewrite (the 13:20 revision, 1,127 lines) and `ARGON_RUNBOOK.md`. Second pass done the same day: every cited line number re-checked against the files on disk, docx comments and highlights extracted, fellow-marker rule measured on the corpus.
 Evidence comes from running `nlp_analysis.py` over `samples/notes.csv` (10 notes) and
 `samples/sample_5000_deidentified.csv` (5,000 notes), from the saved LLM output in
 `samples/working_results.csv`, and from the researcher's comments embedded in
@@ -11,8 +11,11 @@ Evidence comes from running `nlp_analysis.py` over `samples/notes.csv` (10 notes
 ## 1. What the study actually wants (from the PDF comments)
 
 The `.docx`, `.md` and `.pdf` are the same ten example notes (the `.docx` text and `samples/notes.csv`
-match word for word; the `.md` only adds a mailto link). The PDF is the one that matters: it carries
-five review comments by the researcher (Alexander P. Kane, 2025-12-13) that define the targets.
+match word for word; the `.md` only adds a mailto link and drops everything else). The `.docx` is the
+source document and the `.pdf` is its print: both carry five review comments by the researcher
+(Alexander P. Kane, 2025-12-13) that define the targets, and the `.docx` additionally holds 36 yellow
+highlights (`word/document.xml`) that mark the expected answer in every note. The `.md` conversion
+lost both the comments and the highlights, so it must not be used as the reference.
 
 | # | Attached to | Comment | Requirement it implies |
 | --- | --- | --- | --- |
@@ -24,6 +27,32 @@ five review comments by the researcher (Alexander P. Kane, 2025-12-13) that defi
 
 Fields the code extracts: ScopeType, Endoscopy, Colonoscopy, NumberOfDuodenalBiopsies,
 DuodenalBiopsiesTaken, FellowPresent, plus evidence sentences.
+
+### Gold labels from the docx highlights
+
+The highlights fall into exactly three kinds per note: the scope string, the duodenal biopsy sentence,
+and the fellow-presence marker. Two things they settle that the code and prompt currently get wrong:
+
+- **Acceptable scope answers include brand-only and model-only forms.** "Olympus gastroscope" is
+  highlighted as the answer for note 2, "GIF-H 190" for notes 8 and 10.
+- **FellowPresent is decided by the attestation, not by the word "fellow".** "Teaching Statement"
+  (the attending attests that a trainee performed under supervision) is highlighted as the fellow marker
+  in notes 1, 3, 4, 6 and 9; "Staff Only" is highlighted in notes 5, 8 and 10 as the no-fellow marker.
+  In notes 6 and 9 the word "fellow" never appears, yet the fellow's name ("Chinenye Dike",
+  "Sussette Gonzalez, MD") and the Teaching Statement are highlighted.
+
+| Note | ScopeType (highlighted) | Duodenal biopsies | FellowPresent (marker) |
+| --- | --- | --- | --- |
+| 1 | Olympus H190 | 4 | 1 (fellow signature + Teaching Statement) |
+| 2 | Olympus gastroscope | taken, count not stated | 0 (RESIDENT/FELLOW None) |
+| 3 | Olympus Q 180 | 4, one from bulb | 1 |
+| 4 | Olympus Q 180 | 4 | 1 |
+| 5 | Olympus H190 | 6, including 2 from bulb | 0 (Staff Only) |
+| 6 | Olympus GIF XP190N | 0, "BIOPSY: None" | 1 (Chinenye Dike + Teaching Statement) |
+| 7 | Olympus H190 | 6 | 0 (attending signs alone, no attestation) |
+| 8 | GIF-H 190 | 6 | 0 (Staff Only) |
+| 9 | Olympus H190 | 4 | 1 (Sussette Gonzalez + Teaching Statement) |
+| 10 | GIF-H 190 | 4 | 0 (Staff Only) |
 
 ### How the current pipeline does on the ten annotated notes
 
@@ -41,8 +70,13 @@ Using the saved run in `samples/working_results.csv` (gemma3 era, older schema) 
 - **Note 10's saved NLP result says Colonoscopy = 1.** That comes from a sample-data error: the CPT line
   that ends note 9 ("...LONG COLONOSCOPY with biopsy (45380)") was pasted at the head of note 10 in
   `samples/notes.csv`.
-- Notes 1, 4, 6, 7, 9 reconcile correctly (note 6's final scope is `Olympus GIF XP190N video`, with the
-  junk word "video" attached).
+- **Notes 6 and 9: both extractors say FellowPresent = 0 and the gold says 1.** Neither note contains the
+  word "fellow"; both carry a Teaching Statement. Because NLP and LLM agree, the row reconciles
+  "successfully" with the wrong value. Agreement-based reconciliation cannot catch shared blind spots,
+  and the NLP rule (`nlp_analysis.py:159-166`) and the prompt rule 9 (`llm_analysis.py:209-212`,
+  "Set to 1 ONLY if a fellow is explicitly mentioned") share this one.
+- Notes 1, 4, 7 reconcile correctly. Note 6's final scope is `Olympus GIF XP190N video`, with the junk
+  word "video" attached.
 - **All nine successful raw LLM responses start with a ```` ```json ```` fence** despite the prompt
   forbidding markdown, so the repair layer runs on every note.
 
@@ -58,6 +92,8 @@ p99 23,153).
 | Procedures notes with EGD wording but Endoscopy = 0 | 38 (e.g. "endoscope was then placed in the oropharynx ... esophagus was easily intubated") |
 | Colonoscopy = 1 | 353; 131 of the trigger sentences are plan/history/instruction text ("Colonoscopy tomorrow", "AFTER YOUR COLONOSCOPY") |
 | FellowPresent = 1 | 1,073; **976 are non-procedure notes** (attending attestations: "discussed the case with the resident/fellow") |
+| Procedures notes with "Teaching Statement" (the highlight's fellow marker) | 193; **NLP says FellowPresent = 0 in 127 of them**, and 115 of those never contain the word "fellow" |
+| Procedures notes with "Staff Only" | 66; the two markers never co-occur, so they partition the attested notes cleanly |
 | Procedures notes with "Teaching Statement" and the word "fellow" but FellowPresent = 0 | 6 ("Fellow: <NAME>" sits near the top, before the 70% mark) |
 | ScopeType strings that over-capture ("Olympus Q180 endoscope was lubricated") | 52 of 257 |
 | ScopeType = "Olympus" with the model lost ("Olympus endoscope (GIF-H180)") | 19 |
@@ -94,8 +130,8 @@ Severity: **H** = produces wrong study data or blocks a run, **M** = wrong in re
 ### B5 (H) CPT codes, list numbers and other sites become the biopsy count
 `nlp_analysis.py:27-35,150-157,168-173`: the suffix regex `biops... (\d+)` picked up "43239" (CPT) and "2." (list numbering, note 2); the prefix regex has no upper bound, so any 5-digit number qualifies; candidates are accepted if within two sentences of any duodenum sentence, so antrum/stomach counts are attributed to the duodenum when they come first (10 of 288). Fix: require the number and a duodenal site term (duodenum, duodenal, bulb, D1/D2/D3, second/third portion) in the same clause; cap counts at a sane maximum (say 20); ignore numbers followed by `)` or preceded by `(`; prefer the sentence whose site is duodenal over proximity.
 
-### B6 (H) Fellow detection is a position heuristic on a substring
-`nlp_analysis.py:159-166`: "fellow" anywhere in the last 30% of the token stream, unless "none" is also in the sentence. Misses "Fellow: <NAME>" headers near the top (6 procedure notes), fires on attending attestations in 976 non-procedure notes, and ignores the two explicit signals in these notes: "Staff Only: I was present for and participated in the entire procedure" (no fellow) and "Teaching Statement: Dr. X was present and actively participated" (a fellow performed). Fix: pattern on those phrases and on `Fellow:`/`RESIDENT/FELLOW` header lines with a value, treat `none`/`Staff Only` as explicit 0, and drop the 70% rule.
+### B6 (H) Fellow detection looks for the word "fellow"; the gold is decided by the attestation
+`nlp_analysis.py:159-166`: "fellow" anywhere in the last 30% of the token stream, unless "none" is also in the sentence. The docx highlights show the researcher reads FellowPresent from the attending's attestation: "Teaching Statement ... was present and actively participated" means a fellow performed (1), "Staff Only: I was present for and participated in the entire procedure" means no fellow (0). In the 5,000 corpus the NLP misses 127 of 193 Teaching-Statement procedure notes (115 of them never say "fellow"), and in the ten-note sample it is wrong on notes 6 and 9 with the LLM agreeing. It also misses "Fellow: <NAME>" headers near the top (6 notes) and fires on attending attestations in 976 non-procedure notes. Fix: decide in this order: `Staff Only` → 0; `Teaching Statement` / "present and actively participated" → 1; `Fellow:`/`RESIDENT/FELLOW` header with a name → 1, with `none` → 0; a trainee signature line ("Peds GI fellow") → 1; otherwise 0. Drop the 70% rule. Update prompt rule 9 to the same definition (see B11).
 
 ### B7 (H) Ingest rejects both sample CSVs
 `database.py:142,145-155`: `encoding="utf-8"` leaves the BOM on the first header (`﻿MRN`), matching is exact and case-sensitive, and `EncounterID` is not an alias of `Encounter`. The runbook's answer is to `sed` the file. Fix: open with `utf-8-sig`, normalize headers (strip, casefold, remove `_`/spaces) and map aliases (`encounterid`, `encounter`; `note_csn_id`, `notecsnid`; ...), and give a message naming the headers found versus required.
@@ -109,8 +145,8 @@ Note 10 starts with the CPT line that ends note 9 ("EGD, beyond pylorus ... LONG
 ### B10 (H) Long notes are silently truncated
 No `num_ctx` is passed (`llm_analysis.py:231`); the README's local workflow gets Ollama's default 4,096 tokens, and Argon gets 8,192 only because the launcher exports `OLLAMA_CONTEXT_LENGTH`. The 5,000 corpus has p99 = 23K chars (about 6K tokens) and max 41K chars (about 10K tokens), plus a ~700-token system prompt. Ollama truncates the prompt server-side and logs it only in the server log; the client sees a normal response. Fix: pass `num_ctx` explicitly, estimate tokens before the call, and either send only the procedure section (F4) or mark the note `LLM_Failed` with reason "too long" instead of returning a confident wrong answer.
 
-### B11 (M) The prompt's "trigger word" rules cause false positives, and the preflight contradicts them
-`llm_analysis.py:177-180` says Colonoscopy = 1 on the word "colonoscopy"; `:187-189` likewise for "EGD". A note saying "No colonoscopy was performed" or "prior EGD in 2019" is flagged. The synthetic preflight note in `setup.sh:415` contains "No colonoscopy was performed" and `setup.sh:420` treats Colonoscopy = 0 as a HARD failure, so a model that follows the prompt literally blocks job submission. Fix: rewrite both rules as "performed during this procedure, in the procedure/findings section", and make the preflight check consistent with the prompt.
+### B11 (H) The prompt's "trigger word" rules cause false positives, encode the wrong fellow definition, and contradict the preflight
+`llm_analysis.py:177-180` says Colonoscopy = 1 on the word "colonoscopy"; `:187-189` likewise for "EGD". A note saying "No colonoscopy was performed" or "prior EGD in 2019" is flagged. Rule 9 (`:209-212`) says FellowPresent = 1 "ONLY if a fellow is explicitly mentioned", which is why the LLM returned 0 for notes 6 and 9 where the gold is 1 (see B6). The synthetic preflight note in `setup.sh:443` contains "No colonoscopy was performed" and `setup.sh:448` treats Colonoscopy = 0 as a HARD failure, so a model that follows the prompt literally blocks job submission. Fix: rewrite the procedure rules as "performed during this procedure, in the procedure/findings section", rewrite rule 9 around Teaching Statement / Staff Only / Fellow: headers, and make the preflight's synthetic note and expectations consistent with the prompt (give it a Teaching Statement and expect FellowPresent = 1).
 
 ### B12 (M) Endoscopy and colonoscopy flags fire on history, plans and instructions
 `nlp_analysis.py:122-132,142-145`: any sentence with "upper endoscopy"/"egd" plus a verb, or any sentence with "colonoscopy", sets the flag (112 non-procedure notes flagged Endoscopy; 131 of 353 Colonoscopy hits are plan/history text). Procedure notes written as "The endoscope was then placed in the oropharynx ... esophagus was easily intubated" are missed (38) because "upper endoscopy"/"egd" is not in the same sentence. Fix: detect the procedure section (OPERATION/PROCEDURE, Procedure Details, FINDINGS, Upper endoscopy:) and look for insertion language there (esophagus/oropharynx intubated, scope advanced to duodenum); treat "history of", "prior", "tomorrow", "scheduled", "after your" as non-events.
@@ -118,8 +154,8 @@ No `num_ctx` is passed (`llm_analysis.py:231`); the README's local workflow gets
 ### B13 (M) Sentence segmentation ignores newlines and headers
 `nlp_analysis.py:4-5` uses the bare `sentencizer`; these notes separate sections with newlines and `HEADER:` tokens, not periods, so 486 "sentences" in the first 1,500 notes exceed 1,500 chars and the evidence fields become whole-note dumps (note 1's `EndoscopyInformation` is the entire header). Fix: pre-split on newlines and on `[A-Z][A-Z /]+:` headers before the sentencizer (or add a custom boundary component).
 
-### B14 (M) `APPTAINER_MKSQUASHFS_ARGS` does nothing on Argon
-`setup.sh:889` exports it and the comments say mksquashfs is pinned to one thread. Apptainer reads that variable only as the `--mksquashfs-args` flag of `apptainer build`, added in v1.4.0 (2025-03-18), and `apptainer pull` does not register the flag at all. Argon runs 1.3.2. So the image conversion on the login node uses every core and mksquashfs's default memory (25% of physical RAM), under a 1-CPU / 16 GB killer. Fix: put a wrapper named `mksquashfs` first on `PATH` during the pull that execs the real binary with `-processors 1 -mem 2G` (Apptainer finds mksquashfs on PATH unless `mksquashfs path` is set in `apptainer.conf`), or pull from a `qlogin` session if it has outbound HTTPS. Update the comment either way.
+### B14 (M, fixed in the working tree on 2026-10-13, needs an Argon run to confirm) `APPTAINER_MKSQUASHFS_ARGS` did nothing on Argon
+The 11:41 revision of `setup.sh` exported that variable and claimed mksquashfs was pinned to one thread. Apptainer reads it only as the `--mksquashfs-args` flag of `apptainer build`, added in v1.4.0 (2025-03-18), and `apptainer pull` does not register the flag at all; Argon runs 1.3.2. So the login-node pull ran mksquashfs on every core with its default memory (25% of physical RAM) under the 1-CPU / 16 GB killer. The 13:20 revision replaces the export with `make_mksquashfs_wrapper` (`setup.sh:275-302`): a PATH-first wrapper that execs the real binary with `-processors ${NSLOTS:-1} -mem 2G`, skipped with a warning when `apptainer.conf` pins `mksquashfs path`. The code reads correctly. Remaining work: run `./setup.sh --force sif` on a login node and confirm in the transcript that the wrapper was used and the pull survived; then fix the runbook lines that still describe the old mechanism (B27).
 
 ### B15 (M) No HTTP timeout on the LLM call
 `ollama.Client` defaults to `timeout=None`. A wedged server stalls `data_worker` until SGE kills the job at walltime, with no row written for the note. Fix: build a module-level `Client(host=os.environ.get("OLLAMA_HOST"), timeout=NLP_LLM_TIMEOUT)` (keep the `OLLAMA_HOST`-at-import behaviour the runbook relies on) and treat the timeout as a retryable failure with a reason.
@@ -128,19 +164,19 @@ No `num_ctx` is passed (`llm_analysis.py:231`); the README's local workflow gets
 `database.py:108-112,173-181`: one full-table scan per incoming row comparing six columns including the note text; a trailing space creates a new note; the 5,000 corpus has 69 identical notes under different CsnIDs that will all be re-analysed. Fix: `UNIQUE(note_csn_id)` (CsnIDs were unique in the 5,000 sample) with `INSERT OR IGNORE`, plus a `note_sha256` column to reuse results across identical texts.
 
 ### B17 (M) Write-once exports silently serve stale results after a resume
-`database.py:372-388,471-491`: if any of the three CSVs exists the export is skipped with a print. After a resumed run the `output/` files are from the first partial run. Fix: timestamped filenames (`combined_results_<YYYYMMDD-HHMMSS>.csv`) or overwrite with `--force-export`; never skip silently.
+`database.py:372-388,471-491`: if any of the three CSVs exists the export is skipped with a print. After a resumed run the `output/` files are from the first partial run. Worse, `python app.py --analyze` on an empty database (the `No notes to process` path in `data_worker.py:19-21`) still falls through to the exports in `cli.py:120-121` and writes three header-only CSVs that then block every later export. Fix: timestamped filenames (`combined_results_<YYYYMMDD-HHMMSS>.csv`) or overwrite with `--force-export`; skip the export when there are no rows; never skip silently.
 
 ### B18 (M) Exports and the DB path are cwd-relative and duplicated
 `cli.py:114` opens `data.db` relative to cwd; `database.py:346,398,435` open `"data.db"` by name again inside the export functions, and `with sqlite3.connect(...)` commits but never closes. Fix: a single `--db PATH` (default `data.db`) threaded through, exports take the open connection, connections closed in `finally`.
 
-### B19 (M) `final_results` lacks the fields needed to filter the study cohort
+### B19 (M) No schema migration (do this before B20 and B21, which add columns)
+`CREATE TABLE IF NOT EXISTS` (`database.py:126-129`) leaves an old `data.db` with old columns, so any column added by a later fix is silently absent on an existing database and the `INSERT` fails. Fix: a `schema_version` table and `ALTER TABLE ... ADD COLUMN` steps on open.
+
+### B20 (M) `final_results` lacks the fields needed to filter the study cohort
 `database.py:49-58`: only ScopeType, count, taken, fellow. The Endoscopy/Colonoscopy flags and the NoteCsnID live elsewhere, so the researcher cannot select "upper endoscopy notes" from the final export without joining tables. Fix: add `note_csn_id`, `Endoscopy`, `Colonoscopy`, and the evidence sentences to `final_results` and to `combined_results.csv`.
 
-### B20 (M) Failure reasons are not stored
+### B21 (M) Failure reasons are not stored
 `data_worker.py:63,84,88` log exceptions to the console only; the DB keeps a 0/1 flag. The only run we have evidence of (`samples/working_results.csv`) lost 1 of 10 notes to an LLM failure with no recorded reason, and that file predates the `*_Failed` columns entirely. Fix: `LLM_Error TEXT`, `LLM_Attempts INTEGER`, `LLM_Seconds REAL`, `NLP_Error TEXT` in `working_results`; a `--reprocess-failed` CLI flag replacing the runbook's manual `sqlite3 delete`.
-
-### B21 (M) No schema migration
-`CREATE TABLE IF NOT EXISTS` (`database.py:126-129`) leaves an old `data.db` with old columns; B1, B19 and B20 all add columns. Fix: a `schema_version` table and `ALTER TABLE ... ADD COLUMN` steps on open.
 
 ### B22 (L) CLI mode precedence drops the CSV
 `cli.py:117-127`: `--print --csv x` and `--working_results --csv x` never ingest the CSV because of the `elif` chain. Fix: ingest whenever `--csv` is given, then run the requested view.
@@ -152,17 +188,20 @@ No `num_ctx` is passed (`llm_analysis.py:231`); the README's local workflow gets
 README says `ollama pull gemma4:e2b` and "Model: gemma4:e2b"; code says `gemma3:12b` (`llm_analysis.py:6`). README claims "Boolean normalization" and "JSON repair layer"; only the latter exists. README's `curl install.sh` does not work on Argon (glibc 2.17), which the runbook explains. `requirements.txt` lists `click`, which nothing imports. Fix the README in the same commit as any model change (runbook constraint 9) and drop `click`.
 
 ### B25 (L) Unpinned dependencies and container tag
-`requirements.txt` has no versions (local venv: spacy 3.8.16, ollama 0.6.3; Argon: 3.8.14, 0.6.2); `setup.sh:53` defaults to `ollama/ollama:latest`, which is what pulled an image whose CUDA runtime rejects Argon's driver 535. Fix: pin `spacy`, `ollama`, `rich` (check `manylinux2014` wheels per runbook constraint 1) and make a known-good Ollama tag the default.
+`requirements.txt` has no versions (local venv: spacy 3.8.16, ollama 0.6.3; Argon: 3.8.14, 0.6.2); `setup.sh:54` defaults to `ollama/ollama:latest`, which is what pulled an image whose CUDA runtime rejects Argon's driver 535. Fix: pin `spacy`, `ollama`, `rich` (check `manylinux2014` wheels per runbook constraint 1) and make a known-good Ollama tag the default.
 
 ### B26 (L) Job preflight budget and thread count do not match CPU inference
-`setup.sh:647,792`: 600 s per call, 1 rep; a 12B model on CPU can exceed that and the gate aborts the job. `setup.sh:726-729` starts Ollama with no thread limit, so llama.cpp uses every core on the node, not the 8 slots requested. Fix: pass `options={"num_thread": int(os.environ.get("NSLOTS", 0)) or None}` from `llm_analysis.py`, and scale the preflight budget up when `nvidia-smi` is absent.
+`setup.sh:675,820`: 600 s per call, 1 rep; a 12B model on CPU can exceed that and the gate aborts the job. `setup.sh:754-757` starts Ollama with no thread limit, so llama.cpp uses every core on the node, not the 8 slots requested. Fix: pass `options={"num_thread": int(os.environ.get("NSLOTS", 0)) or None}` from `llm_analysis.py`, and scale the preflight budget up when `nvidia-smi` is absent.
+
+### B27 (L) Runbook statements that no longer match the script
+`ARGON_RUNBOOK.md:3` describes a 955-line `setup.sh` dated 11:19; the working-tree file is 1,127 lines, dated 13:20. `:219` and `:805` say mksquashfs is pinned through `APPTAINER_MKSQUASHFS_ARGS`; that variable is gone and the mechanism is now the PATH wrapper (B14). `:308` says the repo is healthy when it contains `app.py`, `cli.py`, `llm_analysis.py`, `requirements.txt`; `verify_repo` (`setup.sh:224-235`) only checks for a valid HEAD and no missing tracked files. `:319` says setup mode "requires outbound HTTPS"; the script warns, sets `HAVE_NET=0` and continues with what is built (`setup.sh:890-894`). Section 2.2 documents "Explicitly stated count, else 0", which is the B1 flaw stated as a feature. Fix the runbook when B1 and B14 land, and re-derive the line count and timestamps from the committed file.
 
 ---
 
 ## 3. Feature improvements (ordered by value to robustness, reliability, accuracy)
 
 ### F1 Gold-label fixture and an `--evaluate` command
-The ten annotated notes plus the five PDF comments are a ready-made gold set. Add `samples/gold.csv` (note id, expected ScopeType canonical, Endoscopy, Colonoscopy, count-or-null, taken, fellow) and `python app.py --evaluate gold.csv` that runs NLP, LLM and reconciliation and prints per-field precision/recall/agreement for each of the three. Every change in sections 2 and 3 is then measurable. Extend the gold set with 50 to 100 hand-labelled notes from the 5,000 corpus (stratified by NoteType) to measure the real false-positive rates listed above. Add pytest unit tests for the regexes using the sentences quoted in B3 to B6. This is the single highest-leverage item.
+The ten annotated notes are already labelled: the docx highlights give the scope, the biopsy sentence and the fellow marker for every note (table in section 1), and the comments give the semantics. Write them into `samples/gold.csv` (note id, expected ScopeType raw and canonical, Endoscopy, Colonoscopy, count-or-null, taken, fellow, evidence) and add `python app.py --evaluate gold.csv` that runs NLP, LLM and reconciliation and prints per-field precision/recall/agreement for each of the three, plus the "agree but wrong" count that notes 6 and 9 expose. Every change in sections 2 and 3 is then measurable. Extend the gold set with 50 to 100 hand-labelled notes from the 5,000 corpus (stratified by NoteType) to measure the real false-positive rates listed above. Add pytest unit tests for the regexes using the sentences quoted in B3 to B6. This is the single highest-leverage item.
 
 ### F2 Replace "when in doubt, discard" with a review queue
 Add `NeedsReview INTEGER` and `ReviewReason TEXT` to `final_results` (disagreement on which field, one-sided scope, LLM failure, note too long, count unknown) and export `output/review_queue.csv` with both answers and both evidence sentences side by side. A research study needs adjudication, not silent nulls; the all-null rows are currently indistinguishable from "nothing in the note".
