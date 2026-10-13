@@ -573,7 +573,7 @@ def tier0(repo, model, models_dir):
     head("Imports")
     sys.path.insert(0, str(repo))
     mods = {}
-    for name in ("llm_analysis", "nlp_analysis", "data_worker", "database", "cli"):
+    for name in ("llm_analysis", "data_worker", "database", "cli"):
         try:
             mods[name] = __import__(name)
             ok(f"import {name}")
@@ -581,7 +581,7 @@ def tier0(repo, model, models_dir):
             fail(f"import {name}: {type(exc).__name__}: {exc}",
                  "A dependency is missing or the repo changed. Re-run setup.sh (without --preflight).")
             return None
-    for name in ("ollama", "spacy", "rich", "click"):
+    for name in ("ollama", "rich"):
         try:
             __import__(name)
             ok(f"import {name}")
@@ -1147,12 +1147,6 @@ else
     fi
     ok "[deps] installed"
 fi
-# Trained spaCy pipelines must be fetched here, where there is internet (the repo uses spacy.blank today).
-for m in $(grep -rhoE "spacy\.load\(\s*['\"][A-Za-z0-9_]+['\"]" "$REPO_DIR" --include='*.py' 2>/dev/null \
-           | grep -oE "[A-Za-z0-9_]+['\"]$" | tr -d "'\"" | sort -u || true); do
-    python -c "import ${m}" 2>/dev/null || { require_net "spaCy pipeline ${m}"; run python -m spacy download "$m"; }
-done
-
 # ============================================================================= 4. container image
 section "Ollama container image"
 ensure_resource sif

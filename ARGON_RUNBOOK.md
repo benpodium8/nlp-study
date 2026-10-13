@@ -113,22 +113,18 @@ nlp_stop_ollama
 
 ## 2. What the program does
 
-A local, offline clinical note pipeline for endoscopy procedure notes. Two independent extractors run on every note and their answers are reconciled conservatively.
+A local, offline clinical note pipeline for endoscopy procedure notes. A local LLM extracts the study fields from every note, and its answer is the result. Until 2026-10-13 a spaCy rule extractor ran alongside it and only answers the two agreed on were kept; that layer was removed because it held the LLM back, and the sections below describe the program as it is now.
 
 ```
 notes.csv ──> SQLite notes table
                  │
                  ▼  data_worker.py, one note at a time
        ┌──────────────────────────────┐
-       │ nlp_analysis.py (spaCy rules)│──┐
-       │ llm_analysis.py (Ollama LLM) │──┤──> working_results (both answers + raw LLM text)
-       └──────────────────────────────┘  │
-                                         ▼  reconcile_working_results.py
-                                   final_results (agreement only, else all null)
-                                         │
-                                         ▼  database.py exports (write-once)
+       │ llm_analysis.py (Ollama LLM) │──> results (extracted fields + raw LLM text)
+       └──────────────────────────────┘
+                 │
+                 ▼  database.py exports (write-once)
                      output/combined_results.csv
-                     output/all_tables_combined_results.csv
                      output/full_combined_results.csv
 ```
 
@@ -137,17 +133,15 @@ notes.csv ──> SQLite notes table
 | Invocation | Effect |
 | --- | --- |
 | `python app.py` | Prints help and exits 0 |
-| `python app.py --csv FILE` | Ingests the CSV (duplicates skipped), then prints the notes table without note text |
-| `python app.py --analyze --csv FILE` | Ingests, runs NLP + LLM on every unprocessed note, reconciles, exports CSVs |
+| `python app.py --csv FILE` | Ingests the CSV (duplicates skipped) and prints how many notes were added |
+| `python app.py --analyze --csv FILE` | Ingests, runs the LLM on every note without a result, exports CSVs |
 | `python app.py --analyze` | Same, without ingesting. Resumes an interrupted run |
-| `python app.py --print` | Prints the notes table with note text truncated to 30 characters |
-| `python app.py --working_results` | Prints the working_results table (raw LLM text and Information fields truncated) |
 
-Precedence inside `main()`: `--analyze` wins, then `--print`, then `--working_results`, then `--csv` alone (so `--print --csv x` does not ingest; BACKLOG B22). The database file is always `data.db` in the current working directory. The export functions open `"data.db"` by relative path as well, so the program must be run from the repository directory.
+`--csv` always ingests first; `--analyze` then runs if given. The database file is always `data.db` in the current working directory and `output/` is created there too, so run the program from the repository directory. There is no command that prints notes or results; use the exports or `sqlite3` (7.3).
 
 ### 2.2 Extracted fields
 
-Both extractors return the same dictionary:
+`llm_analysis()` returns this dictionary, validated against `EXPECTED_FIELDS`:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -164,29 +158,16 @@ Both extractors return the same dictionary:
 
 What the researcher actually needs from these fields is in [15.5](#155-study-requirements-the-researchers-review-comments).
 
-### 2.3 Reconciliation rule (`reconcile_working_results.py`)
+### 2.3 Failure handling in `data_worker.py`
 
-A `final_results` row carries real values only when all of the following hold. Otherwise the row is inserted with every value null ("when in doubt, discard").
-
-- `AllHardDataInAgreement` is 1 (set at insert time when NLP and LLM agree on `NumberOfDuodenalBiopsies`, `DuodenalBiopsiesTaken` and `FellowPresent`).
-- `NLP_Failed` and `LLM_Failed` are both 0.
-- The three numeric fields match again at reconcile time.
-- `reconcile_scope_type()` returns a non-empty scope. Only one side having a scope is accepted. Both sides having one is accepted if the normalised strings match or the digit-bearing tokens match.
-
-Consequence: a note with no scope mentioned anywhere ends up with an all-null final row even when every other field agrees. `final_results` carries only four fields: `ScopeType`, `NumberOfDuodenalBiopsies`, `DuodenalBiopsiesTaken`, `FellowPresent`. The colonoscopy and endoscopy flags live only in `working_results`.
-
-### 2.4 Failure handling in `data_worker.py`
-
-- NLP exception: the default all-zero result is stored with `NLP_Failed = 1`.
 - LLM `LLMAnalysisError` whose message contains `Invalid JSON` or `JSONDecodeError`: retried, up to 5 attempts total. Each retry is a complete generation.
 - Any other `LLMAnalysisError` (missing field, wrong type, unexpected field, boolean not 0/1) or any other exception: stored immediately with `LLM_Failed = 1`, no retry.
 - The loop never raises. The process exits 0 even when every note failed. This is why the preflight exists (section 6).
 
-### 2.5 Idempotency
+### 2.4 Idempotency
 
 - Ingest skips a row only if all six fields match an existing row exactly.
-- `data_worker` skips any note id that already has a `working_results` row.
-- `reconcile` skips any id that already has a `final_results` row.
+- `data_worker` skips any note id that already has a `results` row.
 - Exports are skipped if the target CSV already exists.
 
 ---
@@ -332,7 +313,7 @@ September version: the model check was only "the models directory is non-empty",
 2. Scratch layout: probes `/scratch/Users/$USER` then `/nfsscratch/Users/$USER` for writability, separately for the fast root (repo, venv) and bulk root (image, model). Acquires `.setup.lock` (setup and clean modes); a lock whose owner is dead on this host, or older than six hours, is taken over. Sets Apptainer cache/tmp (the committed version also exports the ineffective `APPTAINER_MKSQUASHFS_ARGS`; the working tree drops it, 3.3). Sweeps Apptainer tmp entries older than an hour. On a login node, kills orphaned `ollama serve` processes left by older script versions. Reads `LOCAL_MODEL` from `llm_analysis.py` if the repo already exists.
 3. Repository: clone (then restore preserved user data), or `pull --ff-only --quiet` if healthy, clean and online. A dirty working tree is left alone with a warning. Warns if `preserved/` holds data from earlier runs. Dies if `LOCAL_MODEL` cannot be read and `MODEL` is not set.
 4. Python: tries `module load python/<wanted>` and a few variants (harmless if none exists), then probes `$NLP_PYTHON`, the interpreter recorded in an existing `venv/pyvenv.cfg` (so re-runs need no `NLP_PYTHON`), `python3.12`, `python3.13`, `python3.11`, `python3.10`, `python3`. Needs 3.10+. `<wanted>` is the major.minor of `.python-version`.
-5. Virtual environment and dependencies, as in 5.2. pip runs with `--only-binary=:all:` by default and needs the network; a failed pip self-upgrade is only a warning. Then scans the repo for `spacy.load("<name>")` and downloads any named pipeline. None today: `nlp_analysis.py` uses `spacy.blank("en")` plus the `sentencizer`, so no trained pipeline is needed.
+5. Virtual environment and dependencies, as in 5.2. pip runs with `--only-binary=:all:` by default and needs the network; a failed pip self-upgrade is only a warning.
 6. Container image: `apptainer pull ollama.partial.sif <image>`, renamed to `ollama.sif` on success, so an existing `.sif` is always complete. Working tree: the generated `mksquashfs` wrapper is placed first on `PATH` for this command (3.3).
 7. Model: first, every stored manifest whose config declares `requires` newer than the image's Ollama version is deleted (`remove_incompatible_models`) and its unshared blobs are pruned. Then the repo's model is fetched with `curl` straight from its registry (`registry.ollama.ai`, or `hf.co` for `hf.co/...` names) into Ollama's on-disk layout. The config blob is fetched first and checked against the image's Ollama version; if the model needs a newer Ollama, the script stops before downloading the weights. The manifest is downloaded to a `.partial` name; each blob is downloaded single-threaded with resume (`curl -C -`; the working tree adds `--connect-timeout 30 --speed-limit 1024 --speed-time 60`, so a transfer under 1 KB/s for 60 s fails and is retried instead of hanging, and the manifest fetch gets `--max-time 120`), up to 5 attempts, progress printed every 30 s, size checked, sha256 verified (a mismatch deletes the blob and retries within the 5 attempts), then renamed. The manifest is moved into place last, so its presence means every blob is complete. Existing complete blobs are reused; `--force model` wipes `blobs/`. Afterwards `prune_model_store` deletes blobs that no manifest references (left over from a model change).
 8. Runtime scripts: writes `~/nlp-study-env.sh` (with `NLP_ENV_VERSION=2`) and `~/nlp-study.job` atomically (temp file plus rename, so a job sourcing the file never sees it half-written). Both are regenerated on every run; do not hand-edit.
@@ -353,7 +334,7 @@ Since 2026-10-13 the model is `medgemma:27b` (MedGemma 27B, Gemma 3 based, Q4_K_
 
 ### 5.5 Installed package set (venv, 2026-09-14)
 
-spacy 3.8.14, thinc 8.3.13, blis 1.3.3, numpy 2.2.6, ollama 0.6.2, httpx 0.28.1, pydantic 2.13.4, rich 15.0.0, click 8.4.2, typer 0.27.1, requests 2.34.2, tqdm 4.70.0, pip 26.2.1, setuptools 84.0.0, wheel 0.48.0, plus their transitive dependencies. `requirements.txt` pins exactly these versions (except pip, setuptools and wheel); the unrecorded transitive dependencies are left to pip (`click` is imported by nothing; BACKLOG B24). The local workstation venv is built from the same file on Python 3.12.14.
+spacy 3.8.14, thinc 8.3.13, blis 1.3.3, numpy 2.2.6, ollama 0.6.2, httpx 0.28.1, pydantic 2.13.4, rich 15.0.0, click 8.4.2, typer 0.27.1, requests 2.34.2, tqdm 4.70.0, pip 26.2.1, setuptools 84.0.0, wheel 0.48.0, plus their transitive dependencies. `requirements.txt` pinned exactly these versions (except pip, setuptools and wheel) until 2026-10-13; since the spaCy extractor was removed it lists only `rich`, `ollama`, `httpx` and `pydantic`, and the unrecorded transitive dependencies are left to pip. A venv built from the old file keeps the spaCy tree until it is rebuilt, which is harmless. The local workstation venv is built from the same file on Python 3.12.14.
 
 ### 5.6 Upgrading Argon from the September script to the rewrite
 
@@ -409,7 +390,7 @@ spacy 3.8.14, thinc 8.3.13, blis 1.3.3, numpy 2.2.6, ollama 0.6.2, httpx 0.28.1,
 
 | Tier | Where | What it checks |
 | --- | --- | --- |
-| 0 | anywhere, including login nodes; seconds; no Ollama process | Imports of `llm_analysis`, `nlp_analysis`, `data_worker`, `database`, `cli`, `ollama`, `spacy`, `rich`, `click`. `LOCAL_MODEL` equals the model setup fetched. The model manifest exists and every blob is present at the right size. Repo dir and `output/` are writable |
+| 0 | anywhere, including login nodes; seconds; no Ollama process | Imports of `llm_analysis`, `data_worker`, `database`, `cli`, `ollama`, `rich`. `LOCAL_MODEL` equals the model setup fetched. The model manifest exists and every blob is present at the right size. Repo dir and `output/` are writable |
 | 1 | inside an SGE job, after `nlp_start_ollama` | Tier 0, then: `OLLAMA_HOST` set, `/api/tags` responds, the model is served, the module-level `ollama` client points at that host. Then real `llm_analysis()` calls on a synthetic PHI-free note under a `SIGALRM` budget. Model placement via `/api/ps` (percentage of the model in VRAM). Extraction spot checks. Latency and projection |
 
 Tier 1 expectations on the synthetic note:
@@ -498,22 +479,22 @@ qdel <JOB_ID>
 After the job ends, `qacct -j <JOB_ID>` shows exit status, wallclock, and `maxvmem`. Checking progress in the database while a job is running is safe for reads:
 
 ```bash
-sqlite3 /nfsscratch/Users/apkane/nlp-study/repo/data.db "select count(*) notes, (select count(*) from working_results) done, (select count(*) from working_results where LLM_Failed=1) llm_failed from notes;"
+sqlite3 /nfsscratch/Users/apkane/nlp-study/repo/data.db "select count(*) notes, (select count(*) from results) done, (select count(*) from results where LLM_Failed=1) llm_failed from notes;"
 ```
 
 ### 7.4 Resuming an interrupted run
 
-Submit again without `--csv`. Notes with a `working_results` row are skipped; the rest are processed; reconciliation covers the new rows.
+Submit again without `--csv`. Notes with a `results` row are skipped; the rest are processed.
 
 ```bash
 qsub ~/nlp-study.job --analyze
 ```
 
-Exports are write-once. If `output/combined_results.csv` or either of the other two files exists, the export is skipped with a message, so after a resume the files on disk are from the first partial run (BACKLOG B17). Move or delete the old files first to regenerate them from the complete database.
+Exports are write-once. If `output/combined_results.csv` or `output/full_combined_results.csv` exists, that export is skipped with a message, so after a resume the files on disk are from the first partial run (BACKLOG B17). Move or delete the old files first to regenerate them from the complete database.
 
 ### 7.5 Collecting results
 
-Three files in `repo/output/` (details in Appendix D). All contain PHI. Copy them, and `data.db` if you want the raw LLM responses for audit, to durable storage. Scratch is purged on a schedule and `preserved/` is still scratch.
+Two files in `repo/output/` (details in Appendix D). All contain PHI. Copy them, and `data.db` if you want the raw LLM responses for audit, to durable storage. Scratch is purged on a schedule and `preserved/` is still scratch.
 
 ### 7.6 Compute nodes without internet
 
@@ -567,7 +548,7 @@ The README describes a workstation deployment (Windows 10/11, with Mac and Linux
    pip install -r requirements.txt
    ```
 
-   `spacy` (deterministic parsing), `ollama` (client for the local LLM), `rich` (progress bars and tables), `click` (listed, unused).
+   `ollama` (client for the local LLM) and `rich` (progress bar).
 
 6. Install Ollama from https://ollama.com. On Linux or Mac the one-liner works on a workstation (it does not on Argon, see 3.6):
 
@@ -595,9 +576,9 @@ PowerShell paths use backslashes (`--csv path\to\endoscopy_notes.csv`). `data.db
 
 ### 8.4 Differences from Argon to keep in mind
 
-- There is no preflight gate on a workstation unless you run the generated `nlp-preflight.py` yourself, and no job script. A wrong model name still produces a complete-looking run with `LLM_Failed = 1` on every row; check `--working_results` or the counts in 7.3 before trusting a run.
+- There is no preflight gate on a workstation unless you run the generated `nlp-preflight.py` yourself, and no job script. A wrong model name still produces a complete-looking run with `LLM_Failed = 1` on every row; check the counts in 7.3 before trusting a run.
 - A desktop Ollama with a GPU picks its context length from VRAM; a CPU-only machine gets 4096 tokens, and long notes are truncated server-side with no client-visible error (BACKLOG B10). Set `OLLAMA_CONTEXT_LENGTH=8192` in the Ollama service environment, or pass `num_ctx` in code.
-- `requirements.txt` pins the Argon versions (spacy 3.8.14, ollama 0.6.2, see 5.5), so a workstation venv matches Argon's. Use Python 3.12.14 (`.python-version`) for an exact match.
+- `requirements.txt` pins the Argon versions (ollama 0.6.2, rich 15.0.0, see 5.5), so a workstation venv matches Argon's. Use Python 3.12.14 (`.python-version`) for an exact match.
 - The same CSV header rules apply (14, "CSV must contain columns").
 - With Apptainer installed, the Argon env script also works off-cluster: `NLP_ALLOW_INFERENCE=1` lets `nlp_start_ollama` run outside SGE.
 
@@ -605,7 +586,7 @@ PowerShell paths use backslashes (`--csv path\to\endoscopy_notes.csv`). `data.db
 
 - All compute stays on the machine: no network calls, no telemetry, no prompt logging outside SQLite. Ollama listens on loopback.
 - Enable disk encryption on the workstation, restrict OS-level user access, and treat CSV exports (and `data.db`) as PHI.
-- `--print` truncates notes to 30 characters by default; raw LLM output is kept in the database for audit.
+- The program never prints note text or results to the terminal; raw LLM output is kept in the database for audit.
 - The software assists with data extraction and research workflows. It does not replace clinical judgment and must be validated per institutional policy.
 
 ---
@@ -730,7 +711,7 @@ Bug-level items are tracked in `BACKLOG.md` (B1 to B26) with proposed fixes; thi
 
 9. **Job preflight budget dropped from 900 s to 600 s** in the rewrite (it inherits the preflight script's default). On a CPU node a 12 B model can exceed 600 s for one call. Export `NLP_PREFLIGHT_BUDGET` at `qsub` time if the gate times out (BACKLOG B26).
 
-10. **The code does not yet implement the study's definitions.** The researcher's comments (15.5) require "biopsies taken, count unknown" to be representable and colonoscopes to be ignored; the current pipeline coerces unknown counts to 0 and nulls a whole row on any disagreement. BACKLOG B1, B2, B4, B5 and B6 cover this.
+10. **The code does not yet implement the study's definitions.** The researcher's comments (15.5) require "biopsies taken, count unknown" to be representable and colonoscopes to be ignored; the prompt coerces unknown counts to 0 and decides fellow presence by the word "fellow" rather than by the attestation. BACKLOG B1 and B11 cover this.
 
 ---
 
@@ -777,13 +758,13 @@ UTF-8 without a byte-order mark, header row containing exactly `MRN, Encounter, 
 Rows identical in all six fields are skipped with a count message. Any change to any field creates a new note with a new id.
 
 **Q: Can I ingest without analysing?**
-Yes: `python app.py --csv ./notes.csv` ingests and prints the notes table without note text. This is cheap and safe on a login node since no model is involved.
+Yes: `python app.py --csv ./notes.csv` ingests and reports how many notes were added. This is cheap and safe on a login node since no model is involved.
 
 **Q: Where do results go?**
-`data.db` (all three tables, including raw LLM text) and `output/` (three CSVs) in the repo directory. All are PHI. Copy them off scratch.
+`data.db` (both tables, including raw LLM text) and `output/` (two CSVs) in the repo directory. All are PHI. Copy them off scratch.
 
-**Q: Why are so many `final_results` rows all null?**
-Any disagreement between NLP and LLM on the three numeric fields, any failure flag, or a missing scope type nulls the row. A note that never names the endoscope will be null regardless. Look at `working_results` for the individual answers. The researcher's comments argue for per-field reconciliation instead (15.5; BACKLOG B2).
+**Q: Which notes did the LLM fail on?**
+`sqlite3 data.db "select id from results where LLM_Failed = 1;"`. Those rows keep every extracted field null and are not retried on resume; see 14, "Job finished quickly, exit 0, LLM columns all empty" for reprocessing them.
 
 **Q: Where are the researcher's requirements written down?**
 As five review comments by Alexander P. Kane in `samples/Upper Gl endoscopy Scope details.docx` (also rendered in the margins of the PDF next to it). They are quoted in [15.5](#155-study-requirements-the-researchers-review-comments) and analysed in `BACKLOG.md` section 1. The README does not mention them.
@@ -794,7 +775,7 @@ As five review comments by Alexander P. Kane in `samples/Upper Gl endoscopy Scop
 Run tier 1 with `notes.csv` staged and read the projection line for its row count. Multiply by up to 5 if the preflight warned that the raw output is not bare JSON (retries). Compare to `h_rt` (24 h by default, `NLP_JOB_HRT`).
 
 **Q: The job ran out of walltime. Did I lose everything?**
-No. Every processed note is already in `working_results`. Resubmit with `qsub ~/nlp-study.job --analyze` (no `--csv`). Delete or move the old `output/*.csv` so the exports regenerate.
+No. Every processed note is already in `results`. Resubmit with `qsub ~/nlp-study.job --analyze` (no `--csv`). Delete or move the old `output/*.csv` so the exports regenerate.
 
 **Q: How do I get more CPU for inference?**
 `NLP_JOB_SLOTS=16 ./setup.sh` and resubmit, or `qsub -pe smp 16 ~/nlp-study.job --analyze ...`. Ollama uses the cores it sees for CPU inference; nothing currently limits it to the requested slots (BACKLOG B26). Returns diminish; measure with the preflight.
@@ -925,7 +906,7 @@ A warning, not an error. You are probably on a compute node. The run continues o
 
 #### `[repo] has to be built or updated, but this node has no outbound internet. Run ... on a login node first.`
 
-(Also `[sif]`, `[model]`, `[deps]`, `[spaCy pipeline ...]`.) Something is absent or broken and cannot be fetched here. Run `./setup.sh` on a login node, then come back.
+(Also `[sif]`, `[model]`, `[deps]`.) Something is absent or broken and cannot be fetched here. Run `./setup.sh` on a login node, then come back.
 
 #### `Another setup run is active on <host> (pid N, since <date>). Wait for it, or if it is dead:  rm -rf .../.setup.lock`
 
@@ -995,7 +976,7 @@ Wheels-only mode found no `manylinux2014` wheel for some package. Identify it:
 source /nfsscratch/Users/apkane/nlp-study/venv/bin/activate && pip download --only-binary=:all: --no-deps -d /tmp/wt <package>
 ```
 
-Then pin an older version with a compatible wheel (the September script suggested `spacy==3.7.5` as the usual culprit), or allow a source build for that one package with `PIP_INSTALL_ARGS='' ./setup.sh --force deps` (slow, usually fails on GCC 4.8).
+Then pin an older version with a compatible wheel, or allow a source build for that one package with `PIP_INSTALL_ARGS='' ./setup.sh --force deps` (slow, usually fails on GCC 4.8).
 
 #### `[sif] unusable (not a valid SIF image); removing the existing copy and rebuilding`
 
@@ -1142,20 +1123,20 @@ TERM did not stop it and SGE sent KILL. Same causes as 143.
 Something started failing after the preflight passed (for example the Ollama server died mid-run). Count failures:
 
 ```bash
-sqlite3 data.db "select count(*) from working_results where LLM_Failed=1;"
+sqlite3 data.db "select count(*) from results where LLM_Failed=1;"
 ```
 
-Those rows will not be redone on resume because a `working_results` row exists. Delete them to reprocess:
+Those rows will not be redone on resume because a `results` row exists. Delete them to reprocess:
 
 ```bash
-sqlite3 data.db "delete from final_results where id in (select id from working_results where LLM_Failed=1); delete from working_results where LLM_Failed=1;"
+sqlite3 data.db "delete from results where LLM_Failed=1;"
 ```
 
 Then resubmit with `--analyze` and regenerate the exports. (A `--reprocess-failed` flag is BACKLOG B21.)
 
 #### `File 'output/combined_results.csv' already exists. Export skipped.`
 
-Write-once protection. Move the old files aside and re-run `--analyze` (reconcile and export are cheap when nothing new is pending).
+Write-once protection. Move the old files aside and re-run `--analyze` (the export is cheap when nothing new is pending).
 
 #### NVIDIA driver too old
 
@@ -1199,7 +1180,7 @@ Things to hold in mind while changing the code, grouped by the layer they affect
 
 1. **Target is CentOS 7, glibc 2.17, GCC 4.8, Bash 4.2, git 1.8.3.1, Apptainer 1.3.2.** No source builds of C extensions. Every new Python dependency must publish a `manylinux2014`-compatible wheel for CPython 3.12 x86_64. `manylinux_2_28` wheels will not install. Check with `pip download --only-binary=:all:` before adding to `requirements.txt`.
 2. **Python 3.12 is a user build, not a module.** `.python-version` pins `3.12.14`, the version of the Argon venv. `setup.sh` reads only major.minor from the file. Keep the code compatible with 3.10+ (the installer accepts 3.10 through 3.13) unless you are willing to also tighten `check_python` in `setup.sh`.
-3. **Compute nodes may have no internet.** Anything that downloads at runtime (`spacy.load("en_core_web_sm")`, Hugging Face, `ollama pull`) must happen in `setup.sh` on a login node. `setup.sh` scans for `spacy.load("<name>")` with a literal quoted name and pre-downloads; keep that call pattern literal if you add one. Today `nlp_analysis.py` uses `spacy.blank("en")` plus the `sentencizer`, so nothing is downloaded.
+3. **Compute nodes may have no internet.** Anything that downloads at runtime (a Hugging Face model, `ollama pull`) must happen in `setup.sh` on a login node. Today nothing in the code downloads at runtime; if you add a dependency that does, give `setup.sh` a step that fetches it.
 4. **Login nodes: 1 CPU, 16 GB, process killer.** Nothing that touches the model may run there. Tier 0 checks are the ceiling, and the rewrite enforces this in `nlp_start_ollama` by hostname and SGE variables. Keep the hostname check if you touch that function; `NLP_ALLOW_INFERENCE` deliberately does not override it.
 5. **Apptainer 1.3 has no pull-time mksquashfs option.** `APPTAINER_MKSQUASHFS_ARGS` is the environment form of `apptainer build --mksquashfs-args` (new in 1.4.0) and `pull` never reads it; the committed script's export of it did nothing. The working tree caps the conversion with a generated `mksquashfs` wrapper placed first on `PATH` during the pull (BACKLOG B14). That only works while Apptainer resolves `mksquashfs` through `PATH`, so if Argon's `apptainer.conf` ever pins `mksquashfs path` the cap silently disappears (the script warns). Confirm on Argon with `./setup.sh --force sif` before relying on it.
 6. **`setup.sh` edits must stay Bash 4.2-safe.** No `"${arr[@]}"` on a possibly-empty array under `set -u` (use `${arr[@]+"${arr[@]}"}` as the pip call does), no `git -C`, mind `${VAR-default}` versus `${VAR:-default}` (`PIP_INSTALL_ARGS=""` must mean "no flags"). `set -Eeuo pipefail` is on; `. activate` and `module` need `set +u` around them, as the script already does. Outside the venv, `python` on CentOS 7 is Python 2.7, so helper code must call `python3` or the venv interpreter (as `manifest_blobs` does). The script carries shellcheck directives; keep it shellcheck-clean.
@@ -1223,26 +1204,24 @@ Things to hold in mind while changing the code, grouped by the layer they affect
 
 ### 15.3 Pipeline semantics
 
-21. **LLM failures are swallowed by design.** Any change to the schema, prompt or model must be followed by a tier 1 preflight; nothing else will tell you it broke. If you add a field, update all of: the prompt schema text, `EXPECTED_FIELDS`, `BOOL_FIELDS` if boolean, `normalize_llm_result` if integer, `default_nlp_result` in `data_worker.py`, `WORKING_RESULTS_TABLE_SCHEMA`, `INSERT_WORKING_RESULT_SQL` and its `values` tuple, `SELECT_ALL_WORKING_RESULTS_SQL` and the positional unpack in `reconcile_working_results`, the export queries, `display.py` truncation rules, and `HARD`/`SOFT` plus the synthetic note in `setup.sh`.
+21. **LLM failures are swallowed by design.** Any change to the schema, prompt or model must be followed by a tier 1 preflight; nothing else will tell you it broke. If you add a field, update all of: the prompt schema text, `EXPECTED_FIELDS`, `BOOL_FIELDS` if boolean, `normalize_llm_result` if integer, `RESULTS_TABLE_SCHEMA` and `RESULT_FIELDS` in `database.py` (the insert and the export query are built from `RESULT_FIELDS`), and `HARD`/`SOFT` plus the synthetic note in `setup.sh`.
 22. **Keep `except Exception` in `llm_analysis()`, not `except BaseException`.** The preflight's timeout is a `BaseException` subclass precisely so that wrapper cannot swallow it.
 23. **Validation rejects extra fields and non-0/1 booleans.** A model that adds commentary keys or returns `true`/`false` fails validation and is not retried (only JSON parse errors are). The prompt is the only defence; `format=` with a schema would be stronger (BACKLOG B9).
 24. **Retries are only for JSON decode errors**, up to 5 attempts, each a full generation. Budget runtime accordingly and prefer fixing the prompt or decoding over raising the retry count.
 25. **`CREATE TABLE IF NOT EXISTS` does not migrate.** Changing a schema does nothing to an existing `data.db`. Delete it (after copying out) or write a migration (BACKLOG B19).
-26. **Resume logic keys on row existence, not freshness.** Changing the prompt, model or NLP rules does not reprocess notes that already have `working_results`. Delete those rows (and their `final_results`) to recompute.
-27. **Relative paths everywhere.** `data.db` and `output/` are resolved from the current directory, and the export functions open `"data.db"` by name rather than reusing the connection. Run from the repo directory, or refactor to pass a path (BACKLOG B18).
-28. **Exports are write-once and interlocked.** If any of the three CSVs exists, the corresponding export is skipped. The second export writes two files and skips both if either exists. After a resume the files on disk are stale (BACKLOG B17).
-29. **Reconciliation nulls the whole row** when any numeric field disagrees, any side failed, or no scope is found, even if everything else agrees. The researcher's comments (15.5) and BACKLOG B2 argue for per-field reconciliation with a review flag; change `insert_null_row` deliberately and document it.
-30. **NLP rule quirks to know before "fixing" disagreements:** `FellowPresent` only fires if the sentence starts after 70% of the document (signature-block heuristic). `ScopeType` needs the word `endoscope` in the sentence and a brand in `Olympus|Pentax|Fujifilm`; the LLM is asked for any brand, so other manufacturers produce one-sided scopes, which reconciliation accepts. Biopsy counts are tied to duodenum sentences within two sentences. Negation and term matching are substring-based (`"no" in "normal"`), and the bare `sentencizer` does not split on newlines or `HEADER:` tokens. BACKLOG B3 to B6 and B12, B13 quantify these on the 5000-note corpus.
-31. **Ingest dedup is whole-row equality and quadratic.** A trailing space in one field creates a second note; identical notes under different CSN ids are analysed twice (BACKLOG B16).
-32. **CSV contract is strict and case-sensitive**, opened with `encoding="utf-8"`. Switching to `encoding="utf-8-sig"` would make BOM-prefixed exports work. `EncounterID` would still need renaming unless the required set is widened (BACKLOG B7).
+26. **Resume logic keys on row existence, not freshness.** Changing the prompt or model does not reprocess notes that already have a `results` row. Delete those rows to recompute.
+27. **Relative paths everywhere.** `data.db` and `output/` are resolved from the current directory. Run from the repo directory, or refactor to pass a path (BACKLOG B18).
+28. **Exports are write-once.** Each of the two CSVs is skipped if it already exists. After a resume the files on disk are stale (BACKLOG B17).
+29. **Ingest dedup is whole-row equality and quadratic.** A trailing space in one field creates a second note; identical notes under different CSN ids are analysed twice (BACKLOG B16).
+30. **CSV contract is strict and case-sensitive**, opened with `encoding="utf-8"`. Switching to `encoding="utf-8-sig"` would make BOM-prefixed exports work. `EncounterID` would still need renaming unless the required set is widened (BACKLOG B7).
 
 ### 15.4 Operations and HIPAA
 
-33. **Logs are not PHI-free by construction.** `data_worker` logs exceptions per note id, not note text, but `LLMAnalysisError` messages can echo model output, which copies note sentences, and those messages reach `~/nlp-study-logs/` in `$HOME` (BACKLOG F11). Do not add debug prints of note content, raw LLM output or CSV rows. Ollama at `OLLAMA_DEBUG=INFO` does not log prompts; the Ollama logs now also live in `~/nlp-study-logs/`.
-34. **The job emails on end and abort** (`-m ea`). Do not put identifiers in the job name or in anything that reaches stdout at the end.
-35. **Everything binds to `127.0.0.1`.** Keep it that way; never expose the Ollama port on the node's interfaces.
-36. **Walltime versus volume.** 24 h at 8 slots is the default (`NLP_JOB_HRT`, `NLP_JOB_SLOTS`). Projected runtime comes from tier 1, which counts the real rows. Raise `h_rt` or plan resubmissions; the pipeline is resume-safe. Gating non-procedure notes before the LLM (BACKLOG F3) is the big lever.
-37. **Windows line endings** in any script copied to Argon need `dos2unix`. Shebangs with `\r` fail with confusing "no such file" errors.
+31. **Logs are not PHI-free by construction.** `data_worker` logs exceptions per note id, not note text, but `LLMAnalysisError` messages can echo model output, which copies note sentences, and those messages reach `~/nlp-study-logs/` in `$HOME` (BACKLOG F11). Do not add debug prints of note content, raw LLM output or CSV rows. Ollama at `OLLAMA_DEBUG=INFO` does not log prompts; the Ollama logs now also live in `~/nlp-study-logs/`.
+32. **The job emails on end and abort** (`-m ea`). Do not put identifiers in the job name or in anything that reaches stdout at the end.
+33. **Everything binds to `127.0.0.1`.** Keep it that way; never expose the Ollama port on the node's interfaces.
+34. **Walltime versus volume.** 24 h at 8 slots is the default (`NLP_JOB_HRT`, `NLP_JOB_SLOTS`). Projected runtime comes from tier 1, which counts the real rows. Raise `h_rt` or plan resubmissions; the pipeline is resume-safe. Gating non-procedure notes before the LLM (BACKLOG F3) is the big lever.
+35. **Windows line endings** in any script copied to Argon need `dos2unix`. Shebangs with `\r` fail with confusing "no such file" errors.
 
 ### 15.5 Study requirements (the researcher's review comments)
 
@@ -1259,7 +1238,7 @@ The ten example notes in `samples/` carry five review comments by Alexander P. K
 The `.docx` also carries 36 yellow highlights marking the expected answer in each note (count and marker phrases verified on 2026-10-13; the per-note table below is `BACKLOG.md` section 1's reading of them; the `.md` conversion in `samples/` lost both comments and highlights and must not be used as the reference). Two things they settle:
 
 - **Acceptable scope answers include brand-only and model-only forms**: "Olympus gastroscope" is the highlighted answer for note 2, "GIF-H 190" for notes 8 and 10.
-- **`FellowPresent` is decided by the attending's attestation, not by the word "fellow"**: a "Teaching Statement" (the attending attests that a trainee performed under supervision) means 1; "Staff Only: I was present for and participated in the entire procedure" means 0. Notes 6 and 9 never contain the word "fellow", yet the gold is 1; both extractors return 0 there and agree, so agreement-based reconciliation cannot catch a shared blind spot.
+- **`FellowPresent` is decided by the attending's attestation, not by the word "fellow"**: a "Teaching Statement" (the attending attests that a trainee performed under supervision) means 1; "Staff Only: I was present for and participated in the entire procedure" means 0. Notes 6 and 9 never contain the word "fellow", yet the gold is 1; prompt rule 9 ("ONLY if a fellow is explicitly mentioned") makes the LLM return 0 there.
 
 | Note | ScopeType (highlighted) | Duodenal biopsies | FellowPresent (marker) |
 | --- | --- | --- | --- |
@@ -1276,15 +1255,13 @@ The `.docx` also carries 36 yellow highlights marking the expected answer in eac
 
 Where the current code falls short of these, with the BACKLOG item that fixes it:
 
-- The prompt says integers are never null and "if no explicit number is stated, return 0"; `normalize_llm_result` and the NLP default also coerce to 0; the columns are plain `INTEGER`. Comments 1 and 4 need "unknown" and "zero" to differ (B1).
-- All-or-nothing reconciliation throws away `DuodenalBiopsiesTaken = 1` when only the count disagrees, which is exactly note 2 (B2).
-- The scope regex requires the word `endoscope`, so "gastroscope" and "GIF-H 190 scope" phrasings yield nothing, while the colonoscope exclusion is a substring list (B4).
-- Biopsy counts attach to any number near a duodenum sentence, so CPT codes and other sites leak in; bulb handling is by proximity, not by site (B5, F6).
-- `FellowPresent` is defined by the word "fellow" in both the NLP rule and prompt rule 9; the gold reads the attestation ("Teaching Statement" versus "Staff Only"). On the 5000-note corpus the NLP misses 127 of 193 Teaching-Statement procedure notes, per BACKLOG (B6, B11).
-- Brand-only ("Olympus gastroscope") and model-only ("GIF-H 190") scopes are valid answers; the NLP regex requires a brand plus the word `endoscope`, and reconciliation has no canonical form to compare (B4, F5).
-- The real input is mixed note types: per BACKLOG section 1, only about 609 of the 5000 deidentified rows are `Procedures` and about 330 are EGDs, so endoscopy and colonoscopy flags must distinguish a performed procedure from history, plans and instructions (B12, F3).
+- The prompt says integers are never null and "if no explicit number is stated, return 0"; `normalize_llm_result` also coerces null to 0; the columns are plain `INTEGER`. Comments 1 and 4 need "unknown" and "zero" to differ (B1).
+- `FellowPresent` is defined by the word "fellow" in prompt rule 9; the gold reads the attestation ("Teaching Statement" versus "Staff Only"), which is why notes 6 and 9 come back 0 (B11).
+- Brand-only ("Olympus gastroscope") and model-only ("GIF-H 190") scopes are valid answers, and nothing canonicalises the strings the model returns, so one scope can appear under several spellings (F5).
+- Bulb biopsies are duodenal biopsies and must be counted once; the prompt lists "bulb" under duodenum but does not say how to combine "6 biopsies ... including 2 from bulb" (comment 3; F6).
+- The real input is mixed note types: per BACKLOG section 1, only about 609 of the 5000 deidentified rows are `Procedures` and about 330 are EGDs, so the prompt's trigger-word rules for endoscopy and colonoscopy must distinguish a performed procedure from history, plans and instructions (B11, F3).
 
-When changing extraction or reconciliation, check behaviour on all ten notes of `samples/notes.csv` against the gold table (after fixing its header and the note 9/10 boundary, B7 and B8). A gold-label fixture and `--evaluate` command are BACKLOG F1.
+When changing the prompt or the model, check behaviour on all ten notes of `samples/notes.csv` against the gold table (after fixing its header and the note 9/10 boundary, B7 and B8). A gold-label fixture and `--evaluate` command are BACKLOG F1.
 
 ---
 
@@ -1427,16 +1404,15 @@ From the 19:22 and 19:33 server logs, Ollama 0.32.14 inside the container on a c
 
 **notes**: `id` (autoincrement), `mrn`, `encounter`, `note_csn_id`, `note_date`, `note_type`, `note`.
 
-**working_results** (one row per note id): the ten extracted fields twice, suffixed `_NLP` and `_LLM`; `RawResponse_LLM` (verbatim model text, for audit); `AllHardDataInAgreement` (1, 0, or null when the LLM failed); `NLP_Failed`; `LLM_Failed`.
+**results** (one row per note id): the ten extracted fields (`ScopeType`, `Colonoscopy`, `ColonoscopyInformation`, `Endoscopy`, `EndoscopyInformation`, `NumberOfDuodenalBiopsies`, `DuodenalBiopsiesTaken`, `DuodenalBiopsiesInformation`, `FellowPresent`, `FellowInformation`); `RawResponse` (verbatim model text, for audit); `LLM_Failed` (1 when the model call or its validation failed; every other column is then null). It carries no `note_csn_id`, so selecting the EGD cohort by CSN needs a join with `notes` (BACKLOG B20); `combined_results.csv` is that join.
 
-**final_results**: `id`, `ScopeType`, `NumberOfDuodenalBiopsies`, `DuodenalBiopsiesTaken`, `FellowPresent`. All null when reconciliation discards the note. It carries neither `note_csn_id` nor the endoscopy/colonoscopy flags, so selecting the EGD cohort needs a join (BACKLOG B20).
+Until 2026-10-13 the tables were `working_results` (NLP and LLM answers side by side) and `final_results` (the reconciled subset). A `data.db` from before then still holds those two tables and no `results` table: `CREATE TABLE IF NOT EXISTS` adds `results` beside them, every note is analysed again, and the old tables are ignored except that `full_combined_results.csv` dumps them too. Start from a fresh `data.db` unless you want that.
 
 ### Files in `output/`
 
 | File | Content |
 | --- | --- |
-| `combined_results.csv` | `notes` left-joined with `final_results` |
-| `all_tables_combined_results.csv` | `notes` left-joined with the numeric and scope columns of `working_results` (both sides) and `final_results` (prefixed `Final_`) |
+| `combined_results.csv` | `notes` left-joined with the ten extracted fields and `LLM_Failed` from `results` (no raw model text) |
 | `full_combined_results.csv` | Every table dumped sequentially with a `Table: <name>` header line between them, including raw LLM responses |
 
-All three are written once and never overwritten. All three contain PHI.
+Both are written once and never overwritten. Both contain PHI.

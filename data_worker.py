@@ -1,103 +1,72 @@
-from database import SELECT_ALL_NOTES_SQL, check_working_result_exists, insert_working_result
-from nlp_analysis import nlp_analysis
+from database import SELECT_NOTES_SQL, check_result_exists, insert_result
 from llm_analysis import llm_analysis, LLMAnalysisError
 from rich.progress import Progress, BarColumn, TimeRemainingColumn, TimeElapsedColumn
 from rich.console import Console
 
+# Total attempts per note when the model returns something that is not JSON.
+# Every other failure is recorded on the first attempt.
+MAX_ATTEMPTS = 5
+
+
+def analyze_note(note_id: int, note: str, console: Console):
+    """
+    Runs the LLM analysis on one note.
+    Retries when the model's output cannot be parsed as JSON, up to MAX_ATTEMPTS
+    attempts in total; any other failure is recorded immediately.
+
+    Returns:
+        tuple: (result dict or None, raw response or None, llm_failed flag 0/1).
+    """
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            result, raw_response = llm_analysis(note_id, note)
+            return result, raw_response, 0
+        except LLMAnalysisError as e:
+            error_msg = str(e)
+            is_json_error = "Invalid JSON" in error_msg or "JSONDecodeError" in error_msg
+            if is_json_error and attempt < MAX_ATTEMPTS:
+                continue
+            console.log(f"[red]LLM ERROR[/red] id={note_id}: {e}")
+            return None, None, 1
+        except Exception as e:
+            console.log(f"[red]LLM ERROR[/red] id={note_id}: {e}")
+            return None, None, 1
+
+
 def data_worker(conn):
     """
-    Processes all notes in the database: runs NLP and LLM analysis on each note,
-    skipping notes that already have results, and stores the results in the database.
+    Processes all notes in the database: runs the LLM analysis on each note,
+    skipping notes that already have a result, and stores the results in the database.
     """
     console = Console()
 
-    if conn is not None:
-        cursor = conn.execute(SELECT_ALL_NOTES_SQL)
-        rows = cursor.fetchall()
+    rows = conn.execute(SELECT_NOTES_SQL).fetchall()
 
-        total = len(rows)
-        if total == 0:
-            console.print("[bold yellow]No notes to process.[/bold yellow]")
-            return
+    total = len(rows)
+    if total == 0:
+        console.print("[bold yellow]No notes to process.[/bold yellow]")
+        return
 
-        with Progress(
-            "[progress.description]{task.description}",
-            BarColumn(),
-            "[progress.percentage]{task.percentage:>3.0f}%",
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            console=console,
-            transient=True,
-        ) as progress:
+    with Progress(
+        "[progress.description]{task.description}",
+        BarColumn(),
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
 
-            task = progress.add_task("Processing notes", total=total)
+        task = progress.add_task("Processing notes", total=total)
 
-            for row in rows:
-                note = row[6]
-                id = row[0]
-
-                if check_working_result_exists(conn, id):
-                    progress.advance(task)
-                    continue
-
-                default_nlp_result = {
-                    "id": id,
-                    "ScopeType": None,
-                    "Colonoscopy": 0,
-                    "ColonoscopyInformation": None,
-                    "Endoscopy": 0,
-                    "EndoscopyInformation": None,
-                    "NumberOfDuodenalBiopsies": 0,
-                    "DuodenalBiopsiesTaken": 0,
-                    "DuodenalBiopsiesInformation": None,
-                    "FellowPresent": 0,
-                    "FellowInformation": None,
-                }
-
-                nlp_failed = 0
-                try:
-                    nlp_result = nlp_analysis(id, note)
-                except Exception as e:
-                    nlp_result = default_nlp_result
-                    nlp_failed = 1
-                    console.log(f"[yellow]NLP ERROR[/yellow] id={id}: {e}")
-
-                llm_result = None
-                raw_llm_response = None
-                llm_failed = 0
-                max_retries = 5
-                retry_count = 0
-                success = False
-
-                while retry_count < max_retries and not success:
-                    try:
-                        llm_result, raw_llm_response = llm_analysis(id, note)
-                        success = True
-                    except LLMAnalysisError as e:
-                        error_msg = str(e)
-                        is_json_error = "Invalid JSON" in error_msg or "JSONDecodeError" in error_msg
-
-                        if is_json_error and retry_count < max_retries - 1:
-                            retry_count += 1
-                        else:
-                            llm_failed = 1
-                            console.log(f"[red]LLM ERROR[/red] id={id}: {e}")
-                            break
-                    except Exception as e:
-                        llm_failed = 1
-                        console.log(f"[red]LLM ERROR[/red] id={id}: {e}")
-                        break
-
-                insert_working_result(
-                    conn,
-                    id,
-                    nlp_result,
-                    llm_result,
-                    raw_llm_response,
-                    nlp_failed,
-                    llm_failed,
-                )
-
+        for note_id, note in rows:
+            if check_result_exists(conn, note_id):
                 progress.advance(task)
+                continue
 
-        console.print("[bold green]Finished processing working results.[/bold green]")
+            result, raw_response, llm_failed = analyze_note(note_id, note, console)
+            insert_result(conn, note_id, result, raw_response, llm_failed)
+
+            progress.advance(task)
+
+    console.print("[bold green]Finished processing notes.[/bold green]")

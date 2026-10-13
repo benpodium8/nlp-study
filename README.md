@@ -1,20 +1,19 @@
-# Clinical NLP + LLM dual evaluation study for clinical notes
+# Clinical note extraction study with a local LLM
 
 ## Overview
 
-This project is a **local, offline-first clinical note analysis pipeline** designed to extract structured data from endoscopy procedure notes using **two independent methods**:
+This project is a **local, offline-first clinical note analysis pipeline** that extracts structured data from endoscopy procedure notes with a **local Large Language Model (LLM via Ollama)**.
 
-1. **Rule-based NLP (spaCy)** for deterministic extraction
-2. **Local Large Language Model (LLM via Ollama)** for semantic extraction and cross‑validation
-
-The system compares results from both methods, stores intermediate and final results in a local SQLite database, and exports reconciled outputs to CSV for downstream analysis.
+Notes are loaded from a CSV into a local SQLite database, each note is sent once to the model, the model's answer is stored next to the note, and the results are exported to CSV for downstream analysis.
 
 > **Key design goals**
 >
 > - Run entirely on a hospital workstation
 > - Never transmit PHI outside the machine
-> - Provide auditability, determinism, and error isolation
+> - Provide auditability and error isolation
 > - Prevent duplicate processing and data overwrites
+
+> **History.** Earlier versions ran a rule-based spaCy extractor alongside the LLM and kept only the answers the two agreed on. That cross-check was built for a small early model that sometimes hallucinated; with the current model it discarded more good answers than bad ones, so it was removed on 2026-10-13. The LLM is now the only extractor.
 
 ---
 
@@ -29,20 +28,12 @@ SQLite Database (notes)
         ▼
 ┌───────────────────────────────┐
 │ data_worker                   │
-│  ├─ NLP analysis (spaCy)      │
 │  ├─ LLM analysis (Ollama)     │
-│  └─ Store working_results     │
+│  └─ Store results             │
 └───────────────────────────────┘
         │
         ▼
-┌───────────────────────────────┐
-│ Reconciliation Layer          │
-│  ├─ Cross-check NLP vs LLM    │
-│  └─ Write final_results       │
-└───────────────────────────────┘
-        │
-        ▼
-CSV Exports (final + audit)
+CSV Exports (results + full audit dump)
 ```
 
 ---
@@ -132,9 +123,8 @@ pip install -r requirements.txt
 
 | Package  | Purpose                     |
 | -------- | --------------------------- |
-| `spacy`  | Deterministic NLP parsing   |
 | `ollama` | Interface to local LLM      |
-| `rich`   | Progress bars & terminal UI |
+| `rich`   | Progress bar                |
 
 ---
 
@@ -173,7 +163,12 @@ Ollama runs locally and does **not** require internet access after model downloa
 python app.py
 ```
 
-This displays CLI help.
+This displays CLI help. There are two options, which can be combined:
+
+| Option         | Effect                                                                                   |
+| -------------- | ---------------------------------------------------------------------------------------- |
+| `--csv FILE`   | Ingest the notes in `FILE` into `data.db` (duplicates skipped); prints how many were added |
+| `--analyze`    | Run the LLM on every note that has no result yet, then write the CSV exports to `output/` |
 
 ---
 
@@ -215,18 +210,20 @@ python app.py --analyze --csv ./notes.csv
 This will:
 
 1. Ingest notes
-2. Run NLP + LLM extraction
-3. Store working results
-4. Reconcile results
-5. Export CSV outputs
+2. Run the LLM extraction on every note without a result
+3. Store each result, with the raw model response, in the database
+4. Export CSV outputs
+
+Running `python app.py --analyze` again resumes: notes that already have a result are skipped.
 
 ---
 
-### View Database Contents
+### Inspecting the Data
 
-```powershell
-python app.py --print
-python app.py --working_results
+The program does not print notes or results to the terminal. Use the CSV exports in `output/`, or query `data.db` directly, for example:
+
+```bash
+sqlite3 data.db "select count(*) notes, (select count(*) from results) done, (select count(*) from results where LLM_Failed=1) failed from notes;"
 ```
 
 ---
@@ -236,18 +233,8 @@ python app.py --working_results
 The `notes.csv` file may replace column names with underscores or dashes depending on client export/import differences in platforms.
 For example, if you see a message like this:
 
-```((.venv) ) ben@deb-developer-vm:~/Documents/GitHub/nlp-study$ python app.py --analyze --csv ./notes.csv
-Traceback (most recent call last):
-File "/home/ben/Documents/GitHub/nlp-study/app.py", line 4, in <module>
-main()
-File "/home/ben/Documents/GitHub/nlp-study/cli.py", line 118, in main
-handle_data_worker_mode(conn, args.csv)
-File "/home/ben/Documents/GitHub/nlp-study/cli.py", line 62, in handle_data_worker_mode
-ingest_csv(csv_file, conn)
-File "/home/ben/Documents/GitHub/nlp-study/database.py", line 155, in ingest_csv
-raise ValueError(f"CSV must contain columns: {required_columns}")
+```
 ValueError: CSV must contain columns: {'NoteType', 'MRN', 'Note', 'Encounter', 'NoteCsnID', 'NoteDate'}
-
 ```
 
 Then the column names have been incorrectly coerced to something like:
@@ -293,8 +280,7 @@ HIPAA:
 Responsibilities:
 
 - Argument parsing
-- Mode selection
-- Safe ordering of pipeline steps
+- Safe ordering of pipeline steps (ingest, then analyze, then export)
 
 HIPAA:
 
@@ -306,19 +292,18 @@ HIPAA:
 
 ### `database.py`
 
-**Purpose:** Local persistence and data integrity
+**Purpose:** Local persistence, data integrity and CSV export
 
 Tables:
 
 - `notes` – raw clinical notes
-- `working_results` – NLP & LLM outputs
-- `final_results` – reconciled outputs
+- `results` – the LLM's extracted fields and raw response, one row per note
 
 Safeguards:
 
 - Duplicate detection on ingest
 - Idempotent inserts
-- No overwrites of final results
+- Write-once exports
 
 HIPAA Compliance:
 
@@ -336,44 +321,20 @@ HIPAA Compliance:
 Workflow per note:
 
 1. Skip if already processed
-2. Run NLP analysis
-3. Run LLM analysis (with retries)
-4. Store results atomically
+2. Run LLM analysis (with retries)
+3. Store the result atomically
 
 Features:
 
 - Progress bar with ETA
 - Retry logic for malformed LLM output
-- Graceful failure isolation
+- Graceful failure isolation: a failed note is recorded with `LLM_Failed = 1` and the run continues
 
 HIPAA:
 
 - Processes one note at a time in memory
 - No caching outside DB
 - Raw LLM output retained for audit
-
----
-
-### `nlp_analysis.py`
-
-**Purpose:** Deterministic rule-based extraction
-
-Techniques:
-
-- Sentence segmentation
-- Regex-based entity detection
-- Negation handling
-
-Why it matters:
-
-- Fully explainable
-- Deterministic baseline
-
-HIPAA:
-
-- No ML training
-- No model downloads
-- No data persistence outside DB
 
 ---
 
@@ -385,7 +346,6 @@ Key Safeguards:
 
 - Strict JSON schema enforcement
 - Type validation
-- Boolean normalization
 - JSON repair layer
 
 Model:
@@ -401,43 +361,6 @@ HIPAA:
 
 ---
 
-### `reconcile_working_results.py`
-
-**Purpose:** Final result decision logic
-
-Logic:
-
-- Compare NLP vs LLM hard fields
-- Require agreement
-- Null-out ambiguous cases
-
-Design philosophy:
-
-> **When in doubt, discard**
-
-HIPAA:
-
-- Prevents silent corruption
-- Ensures conservative outputs
-
----
-
-### `display.py`
-
-**Purpose:** Human-readable inspection
-
-Features:
-
-- Truncated PHI display
-- Rich tables
-
-HIPAA:
-
-- Avoids full-note exposure by default
-- Operator-controlled visibility
-
----
-
 ## HIPAA Compliance Summary
 
 | Requirement            | Implementation                |
@@ -445,8 +368,7 @@ HIPAA:
 | Local processing       | ✅ All compute on workstation |
 | No PHI exfiltration    | ✅ No network calls           |
 | Auditability           | ✅ Raw + structured storage   |
-| Deterministic fallback | ✅ NLP baseline               |
-| Minimal exposure       | ✅ Truncated display          |
+| Minimal exposure       | ✅ Note text is never printed |
 | Data integrity         | ✅ Idempotent inserts         |
 
 ⚠️ **Operational Notes**
@@ -461,9 +383,8 @@ HIPAA:
 
 Generated in `/output`:
 
-- `combined_results.csv`
-- `all_tables_combined_results.csv`
-- `full_combined_results.csv`
+- `combined_results.csv` – every note with its extracted fields and `LLM_Failed` flag
+- `full_combined_results.csv` – every table dumped in full, including raw LLM responses, for audit
 
 Exports are **write-once** by default to prevent overwrites.
 
@@ -473,7 +394,3 @@ Exports are **write-once** by default to prevent overwrites.
 
 This software assists with data extraction and research workflows.
 It **does not replace clinical judgment** and must be validated per institutional policy.
-
-```
-
-```

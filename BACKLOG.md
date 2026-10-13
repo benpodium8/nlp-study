@@ -6,6 +6,17 @@ Evidence comes from running `nlp_analysis.py` over `samples/notes.csv` (10 notes
 `samples/working_results.csv`, and from the researcher's comments embedded in
 `samples/Upper Gl endoscopy Scope details markdown pdf.pdf`.
 
+> **Status, 2026-10-13 (later the same day).** The spaCy extractor (`nlp_analysis.py`), the reconciliation
+> layer (`reconcile_working_results.py`), the `final_results` table, `display.py` and the `--print` and
+> `--working_results` commands were removed: the NLP cross-check was built for a small early model that
+> hallucinated, and with the current model it held the LLM back. The LLM is now the only extractor, its answer
+> goes into a `results` table, and two CSVs are exported. The NLP measurements in section 1 stay as the record
+> of why. Items that are now moot: B2, B3, B4, B5, B6 (its prompt half lives on in B11), B12, B13, B22, B23
+> and F13. Done in the same change: `click` dropped from `requirements.txt` (B24); the exports reuse the open
+> connection and there are two files instead of three (the rest of B17 and B18 is still open). F3 needs a gate
+> that is not the NLP (note type and a procedure regex). Everything else still applies to the LLM path, and
+> the line numbers cited below refer to the files as they were.
+
 ---
 
 ## 1. What the study actually wants (from the PDF comments)
