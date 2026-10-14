@@ -42,10 +42,13 @@ Typical use
   python app.py --clean --analyze --csv notes.csv   start over from scratch
 
 Output
-  {EXPORT_PATH}   one row per note: the identifiers, the ten extracted fields, the
-                       debugging columns (LLM_Failed, LLM_Attempts, LLM_Seconds,
-                       LLM_Error, RawResponse) and the note text last. Write-once:
-                       move it aside to regenerate it from the database.
+  {EXPORT_PATH}   one row per note: the identifiers, the ten extracted fields,
+                       ManualReviewRequired ("true"/"false") with ManualReviewReason,
+                       the debugging columns (LLM_Failed, LLM_Attempts, LLM_Seconds,
+                       LLM_Error, LLM_Rejections, RawResponse) and the note text last.
+                       A note whose answers the note text does not support is recorded
+                       with LLM_Failed 1, empty fields and the reason in LLM_Error.
+                       Write-once: move it aside to regenerate it from the database.
   {DB_PATH}              the same data, kept for audit and for resuming.
   Both contain PHI; treat them accordingly."""
 

@@ -7,10 +7,14 @@ from rich.markup import escape
 from rich.progress import Progress, BarColumn, TimeElapsedColumn, TimeRemainingColumn
 
 from database import COUNT_NOTES_SQL, SELECT_PENDING_NOTES_SQL, insert_result
-from llm_analysis import LOCAL_MODEL, llm_analysis, LLMAnalysisError, RetryableLLMError
+from llm_analysis import (
+    LOCAL_MODEL, llm_analysis, LLMAnalysisError, RetryableLLMError, note_fits_context, too_long_error,
+)
+from review import manual_review
 
-# Total attempts per note when the model's output is unusable (invalid JSON, runaway text,
-# a value that fails validation). A failed call (server down) is recorded on the first attempt.
+# Total attempts per note when the model's answer is rejected (invalid JSON, runaway text,
+# a value that fails validation, or an answer the note does not support). A failed call
+# (server down) is recorded on the first attempt.
 MAX_ATTEMPTS = 5
 
 # A running summary (done, failed, speed, time remaining) is logged after this many notes.
@@ -19,37 +23,50 @@ SUMMARY_EVERY = 10
 
 class Analysis(NamedTuple):
     result: dict | None       # the validated fields, or None when the LLM failed
-    raw_response: str | None  # verbatim model text of the accepted attempt, or None
+    raw_response: str | None  # verbatim model text of the accepted attempt; of the last rejected one when the LLM failed
     llm_failed: int           # 0 or 1
     attempts: int             # model calls made for this note
     error: str | None         # the final error message when llm_failed is 1
+    rejections: list[str]     # why each rejected attempt was rejected, in order
+    brief_error: str | None = None  # error without the rejected value, safe to log (no note text)
 
 
 def analyze_note(note_id: int, note: str, model: str, console: Console) -> Analysis:
     """
     Runs the LLM analysis on one note with the given model.
-    Retries when the model's output is unusable (RetryableLLMError), up to MAX_ATTEMPTS
-    attempts in total, telling the model why its previous answer was rejected; any other
-    failure is recorded immediately.
+    Retries when the model's answer is rejected (RetryableLLMError: unusable output, or an
+    answer the note does not support), up to MAX_ATTEMPTS attempts in total, telling the
+    model why its previous answer was rejected; any other failure is recorded immediately.
+    Every rejection is kept, so the export shows why an accepted answer needed retries and
+    why a failed note failed on each attempt.
+    A note too long for the context window is not sent at all (Ollama would silently drop
+    the instructions and the start of the note); it is recorded as failed with 0 attempts.
     """
+    if not note_fits_context(note):
+        error = too_long_error(note)
+        return Analysis(None, None, 1, 0, error, [], error)
+
     rejected = None
+    rejections = []
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             result, raw_response = llm_analysis(note_id, note, model, attempt, rejected)
-            return Analysis(result, raw_response, 0, attempt, None)
+            return Analysis(result, raw_response, 0, attempt, None, rejections)
         except RetryableLLMError as e:
             rejected = str(e)
+            rejections.append(f"attempt {attempt}: {e}")
             if attempt < MAX_ATTEMPTS:
                 _log(console, 
                     f"[yellow]retry [/yellow] note {note_id}: "
-                    f"attempt {attempt}/{MAX_ATTEMPTS}: {escape(str(e))}"
+                    f"attempt {attempt}/{MAX_ATTEMPTS}: {escape(e.brief)}"
                 )
                 continue
-            return Analysis(None, None, 1, attempt, str(e))
+            return Analysis(None, e.raw, 1, attempt, str(e), rejections, e.brief)
         except LLMAnalysisError as e:
-            return Analysis(None, None, 1, attempt, str(e))
+            return Analysis(None, None, 1, attempt, str(e), rejections, str(e))
         except Exception as e:
-            return Analysis(None, None, 1, attempt, f"{type(e).__name__}: {e}")
+            error = f"{type(e).__name__}: {e}"
+            return Analysis(None, None, 1, attempt, error, rejections, error)
 
 
 def _log(console: Console, message: str):
@@ -96,6 +113,7 @@ def data_worker(conn, model: str = LOCAL_MODEL):
         return
 
     failed_ids = []
+    review_count = 0
     started = time.perf_counter()
 
     with Progress(
@@ -113,6 +131,10 @@ def data_worker(conn, model: str = LOCAL_MODEL):
             note_started = time.perf_counter()
             analysis = analyze_note(note_id, note, model, console)
             seconds = round(time.perf_counter() - note_started, 2)
+            review_required, review_reason = manual_review(
+                note, analysis.result, analysis.llm_failed, analysis.attempts, analysis.error
+            )
+            review_count += review_required
 
             insert_result(
                 conn,
@@ -123,13 +145,20 @@ def data_worker(conn, model: str = LOCAL_MODEL):
                 analysis.attempts,
                 seconds,
                 analysis.error,
+                "\n".join(analysis.rejections) or None,
+                review_required,
+                review_reason,
             )
 
             if analysis.llm_failed:
                 failed_ids.append(note_id)
+                attempts = (
+                    "without a model call" if analysis.attempts == 0
+                    else f"after {analysis.attempts} attempt(s), {seconds:.1f}s"
+                )
                 _log(console, 
                     f"[red]FAILED[/red] note {note_id} ({done}/{pending}) "
-                    f"after {analysis.attempts} attempt(s), {seconds:.1f}s: {escape(analysis.error)}"
+                    f"{attempts}: {escape(analysis.brief_error)}"
                 )
             else:
                 r = analysis.result
@@ -139,6 +168,7 @@ def data_worker(conn, model: str = LOCAL_MODEL):
                     f"scope={escape(repr(r['ScopeType']))} egd={r['Endoscopy']} "
                     f"colonoscopy={r['Colonoscopy']} duodenal_biopsies={r['NumberOfDuodenalBiopsies']} "
                     f"taken={r['DuodenalBiopsiesTaken']} fellow={r['FellowPresent']}"
+                    + (f" [yellow]review:[/yellow] {review_reason}" if review_required else "")
                 )
 
             progress.advance(task)
@@ -149,7 +179,8 @@ def data_worker(conn, model: str = LOCAL_MODEL):
     elapsed = time.perf_counter() - started
     _log(console, 
         f"[bold green]Finished[/bold green] {pending} note(s) in {_duration(elapsed)}: "
-        f"{pending - len(failed_ids)} ok, {len(failed_ids)} failed, {elapsed / pending:.1f}s per note."
+        f"{pending - len(failed_ids)} ok, {len(failed_ids)} failed, {review_count} flagged for "
+        f"manual review, {elapsed / pending:.1f}s per note."
     )
     if failed_ids:
         _log(console, f"Failed note id(s): {', '.join(str(i) for i in failed_ids)}")

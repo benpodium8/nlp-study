@@ -12,7 +12,7 @@ Iowa Argon cluster recorded in `ARGON_RUNBOOK.md`.
 | NVIDIA driver on that node | 535 (not expected to change) | Fixes the newest usable Ollama release, see section 2 |
 | Container runtime | Apptainer 1.3.2, image pulled from Docker Hub | Any `ollama/ollama:<tag>` works; the tag is set with `NLP_OLLAMA_IMAGE` |
 | CPU fallback | 8 SGE slots, 251 GB RAM | A model that falls back to CPU must still be usable, which favours mixture-of-experts models |
-| Context | `OLLAMA_CONTEXT_LENGTH=8192`; notes reach ~10K tokens at the tail | KV cache sized for 8K to 16K |
+| Context | `OLLAMA_CONTEXT_LENGTH=8192`; notes reach ~13K tokens at the tail, and a note that does not fit (about 2% of the corpus) is failed without a model call | KV cache sized for 8K: medgemma:27b fits the A10 at 8192 and spills at anything larger (checked 2026-10-14) |
 | Task | 10-field JSON extraction per note, boolean fields as 0/1 | Structured output (`format=` JSON schema) and deterministic decoding matter more than reasoning depth |
 
 ## 2. The Ollama version is fixed by the driver
@@ -118,7 +118,7 @@ budget); `llama3.3:70b` (over budget on one card).
 2. `NLP_OLLAMA_IMAGE=docker://ollama/ollama:0.24.0`, then `./setup.sh --force sif`
    on a login node. Consider making this tag the setup.sh default (backlog B25).
 3. In the chat call: `think=False`, `format=<JSON schema dict>`,
-   `options={"temperature": 0, "seed": 0, "num_ctx": 8192 or 16384, "num_predict": 512}`
+   `options={"temperature": 0, "seed": 0, "num_ctx": 8192, "num_predict": 512}`
    (backlog B9/F7). Without `think=False` the repo call took 98 s on CPU because
    Gemma 4 reasons first; with it, 16 s. Gemma 4's 256K window makes a 16K
    context cheap (about 0.75 GB of KV cache) and covers the longest notes.

@@ -305,9 +305,9 @@ HIPAA:
 Tables:
 
 - `notes` – raw clinical notes
-- `results` – one row per note: the LLM's ten extracted fields plus the debugging columns `LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error` and `RawResponse`
+- `results` – one row per note: the LLM's ten extracted fields, the review columns `ManualReviewRequired` and `ManualReviewReason`, and the debugging columns `LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `LLM_Rejections` and `RawResponse`
 
-If an older `data.db` lacks one of the `results` columns, it is added on startup (existing rows get an empty value).
+If an older `data.db` lacks one of the `results` columns, it is added on startup (existing rows get an empty value, except the review columns, which are computed for them).
 
 Safeguards:
 
@@ -338,14 +338,32 @@ Features:
 
 - One log line per note (time taken, attempts, and the extracted flags), a running summary every ten notes with the projected time remaining, and a final summary that lists the failed note ids
 - Progress bar with ETA when run in a terminal
-- Retry logic for malformed LLM output; every retry is logged
-- Graceful failure isolation: a failed note is recorded with `LLM_Failed = 1`, its attempt count and the error message, and the run continues
+- Retry logic for malformed LLM output and for answers the note does not support; every retry is logged (without note text) and every rejection reason is kept in `LLM_Rejections`
+- Graceful failure isolation: a failed note is recorded with `LLM_Failed = 1`, its attempt count and the error message, and the run continues. A note the model cannot answer in a way the note supports is a failure, not a guess
 
 HIPAA:
 
 - Processes one note at a time in memory
 - No caching outside DB
 - Raw LLM output retained for audit
+
+---
+
+### `review.py`
+
+**Purpose:** Decides which rows a human should look at before the study uses them
+
+`manual_review` sets `ManualReviewRequired` to `true`, with every trigger listed in `ManualReviewReason`, when:
+
+- the note failed (no answer the note supports, or the model call failed)
+- the answer was accepted only after one or more rejected attempts
+- an upper endoscopy is documented but no scope name was found
+- duodenal biopsies were taken but the note states no count
+- the note was too long for the context window and was not sent to the model (see below)
+
+Everything else is `false`. The flag never changes an answer; it only says where to look.
+
+**Notes too long for the context window are not sent to the model.** Ollama does not refuse an over-long prompt: it keeps a few leading tokens and the tail that fits, silently dropping the instructions and the start of the note, so any answer would be a guess. `data_worker` checks the length first (`llm_analysis.note_fits_context`, a conservative estimate of 3 characters per token plus the prompt overhead) and records such a note with `LLM_Failed = 1`, `LLM_Attempts = 0` and the reason in `LLM_Error`, without a model call. At the default 8192-token window the cut is about 18,000 characters of note; 7 of the 275 sample notes and 111 of the 5,000 corpus notes (about 2%) are longer and are recorded as failed. 8192 is the window at which medgemma:27b and its KV cache fit on Argon's A10; a larger `NLP_CONTEXT_LENGTH` raises the cut but spills the model to the CPU there.
 
 ---
 
@@ -360,15 +378,42 @@ Key Safeguards:
 - Strict JSON schema enforcement
 - Type validation, with true/false and numeric strings coerced to integers
 - JSON repair layer
+- Every answer is checked against the note before it is accepted (`verify_against_note`).
+  Accuracy is preferred over completeness: an answer the note does not support is rejected
+  and retried, and a note that never gets a supported answer is recorded as failed with the
+  reason rather than with a guess. The checks are:
+  - each `...Information` quote must occur in the note (compared ignoring case, spacing and
+    punctuation), so the model cannot paraphrase, stitch sentences together, or copy an
+    example sentence from the prompt
+  - every 1 needs a quote, and the quote must be about the right thing: an endoscopy or
+    colonoscopy quote must mention one, must say it was carried out (a scope passed, advanced
+    or withdrawn, something examined, a findings line) rather than just name it, and must not
+    read as history, a plan or instructions;
+    a duodenal-biopsy quote must mention biopsies and name the duodenum (bulb, D1 to D3,
+    first to third portion, or "to rule out celiac disease") and must not say none were
+    taken; a fellow quote must mention a trainee or a teaching attestation and must not be
+    a Staff Only attestation
+  - the flags must agree: no fellow and no duodenal biopsies without a procedure, no
+    `ScopeType` without `Endoscopy = 1`
+  - `ScopeType` must be a name the note states (brand and model may be joined when the
+    note gives them apart), must look like an endoscope, and must not be a colonoscope
+  - `NumberOfDuodenalBiopsies` must be a number the quoted sentence states, or the sum of
+    its numbers when they are all duodenal sites ("4 from the second portion and 2 from the
+    bulb" is 6); "6 including 2 from the bulb" supports 6, not 8; a count above 20 is
+    rejected as some other number from the note (an eosinophil count, a CPT code)
 - Output constrained to a JSON schema (`format=`): always a bare object with exactly the study
   fields, 0/1 flags, and text fields capped at 1000 characters
 - Greedy decoding (temperature 0) so a note gives the same answer on every run
-- Retries (up to 5 attempts) when the output is invalid JSON, fails validation, or a text field
-  reaches the 1000-character cap (a repetition loop); the retry prompt says why the previous
-  answer was rejected, and retries sample at temperature 0.8 with a repeat
-  penalty of 1.1 and the attempt number as the seed, since a greedy retry would repeat the loop
+- Retries (up to 5 attempts) when the output is invalid JSON, fails validation, fails a check
+  against the note, or the model loops (a text field reaches the 1000-character cap, or Ollama
+  aborts the generation at its token repeat limit); the
+  retry prompt says why the previous answer was rejected, and retries sample at temperature
+  0.8 with a repeat penalty of 1.1 and the attempt number as the seed, since a greedy retry
+  would repeat the loop
 - Output capped at 2048 tokens (`num_predict`); context window `NLP_CONTEXT_LENGTH` tokens
-  (default 8192, `num_ctx`) on every call, the same as an Argon job
+  (default 8192, `num_ctx`) on every call, the same as an Argon job. 8192 is what medgemma:27b
+  fits in on the A10 with its KV cache; anything larger spills to the CPU. Notes that do not
+  fit the window are failed without a model call rather than silently truncated
 
 Model:
 
@@ -407,7 +452,16 @@ Generated in `/output`:
 
 - `results.csv` – one row per note
 
-Columns, in order: the note identifiers (`id`, `mrn`, `encounter`, `note_csn_id`, `note_date`, `note_type`); the ten extracted fields (`ScopeType`, `Colonoscopy`, `ColonoscopyInformation`, `Endoscopy`, `EndoscopyInformation`, `NumberOfDuodenalBiopsies`, `DuodenalBiopsiesTaken`, `DuodenalBiopsiesInformation`, `FellowPresent`, `FellowInformation`); the debugging columns (`LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `RawResponse`); and the note text last. A note the model failed on has empty extracted fields, `LLM_Failed = 1` and the error in `LLM_Error`.
+Columns, in order: the note identifiers (`id`, `mrn`, `encounter`, `note_csn_id`, `note_date`, `note_type`); the ten extracted fields (`ScopeType`, `Colonoscopy`, `ColonoscopyInformation`, `Endoscopy`, `EndoscopyInformation`, `NumberOfDuodenalBiopsies`, `DuodenalBiopsiesTaken`, `DuodenalBiopsiesInformation`, `FellowPresent`, `FellowInformation`); the review columns (`ManualReviewRequired`, `ManualReviewReason`); the debugging columns (`LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `LLM_Rejections`, `RawResponse`); and the note text last.
+
+- `ManualReviewRequired` is `true` when a human should look at the row before the study uses it, else `false`; `ManualReviewReason` lists why (see `review.py` above). Filter the export on this column to get the review queue.
+
+- `LLM_Failed` is 1 when no attempt produced an answer the note supports (or the model call failed). The ten extracted fields are then empty: the note is skipped, not guessed.
+- `LLM_Error` says why the note failed: the last attempt's rejection, naming the field and the rejected value (for example `ScopeType is not stated in the note ... The rejected value was 'Olympus gastroscope'`).
+- `LLM_Rejections` lists every rejected attempt, one per line, for failed and accepted notes alike, so an answer accepted on the third attempt shows what the first two got wrong.
+- `RawResponse` is the model text of the accepted attempt, or of the last rejected attempt when the note failed.
+
+Expect failures. Many notes in a mixed pool are not procedure notes, and a small model will try to answer them anyway; the checks turn those guesses into failures with a stated reason instead of wrong rows.
 
 The export is **write-once**: an existing `results.csv` is never overwritten. Move it aside and run `--analyze` again to regenerate it from the database.
 

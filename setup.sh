@@ -40,7 +40,7 @@
 #     NLP_OLLAMA_IMAGE=docker://ollama/ollama:<tag>    container image (default 0.24.0: last to use driver 535 GPUs)
 #     PIP_INSTALL_ARGS="..."         default: --only-binary=:all:
 #     NLP_JOB_QUEUE=UI NLP_JOB_SLOTS=8 NLP_JOB_HRT=24:00:00 NLP_JOB_GPU=1
-#     NLP_CONTEXT_LENGTH=8192        Ollama context window used by the job
+#     NLP_CONTEXT_LENGTH=8192        Ollama context window used by the job (8192 fits medgemma:27b on the A10; larger spills to CPU)
 #     NLP_PREFLIGHT_REPS=3 NLP_PREFLIGHT_BUDGET=600   live calls / seconds each
 #     NLP_ALLOW_INFERENCE=1          allow inference outside SGE (never on a login node)
 #     NLP_SKIP_PREFLIGHT=1           (job only) skip the fail-fast gate before app.py
@@ -561,12 +561,23 @@ def http_json(url, timeout=10):
         return json.loads(resp.read().decode())
 
 
-def count_notes(repo):
+def count_notes(repo, fits=None):
+    """(rows in notes.csv, rows whose note does not fit the context window); fits is
+    llm_analysis.note_fits_context, or None to skip the second count."""
     path = repo / "notes.csv"
     if not path.is_file():
-        return 0
+        return 0, 0
+    csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
+    total = too_long = 0
     with path.open(newline="", encoding="utf-8", errors="replace") as fh:
-        return max(sum(1 for _ in csv.reader(fh)) - 1, 0)
+        reader = csv.reader(fh)
+        header = next(reader, None) or []
+        col = header.index("Note") if "Note" in header else None
+        for row in reader:
+            total += 1
+            if fits and col is not None and col < len(row) and not fits(row[col]):
+                too_long += 1
+    return total, too_long
 
 
 def tier0(repo, model, models_dir):
@@ -622,10 +633,33 @@ def tier0(repo, model, models_dir):
             ok(f"writable: {path} ({what})")
         except Exception as exc:
             fail(f"not writable: {path} ({exc})")
+
+    head("Context window")
+    llm = mods["llm_analysis"]
+    ctx = getattr(llm, "CONTEXT_LENGTH", None)
+    fits = getattr(llm, "note_fits_context", None)
+    if ctx is None or fits is None:
+        warn("llm_analysis has no CONTEXT_LENGTH / note_fits_context; the repo is older than this preflight")
+    else:
+        source = "from NLP_CONTEXT_LENGTH" if os.environ.get("NLP_CONTEXT_LENGTH") else "the default"
+        try:
+            cut = int((ctx - llm.ANSWER_RESERVE_TOKENS - llm.PROMPT_OVERHEAD_TOKENS) * llm.NOTE_CHARS_PER_TOKEN)
+            ok(f"num_ctx {ctx} ({source}); notes over about {cut:,} characters are failed without a model call")
+        except AttributeError:
+            ok(f"num_ctx {ctx} ({source})")
+        total, too_long = count_notes(repo, fits)
+        if total and too_long:
+            warn(f"notes.csv: {too_long} of {total} notes exceed the cut and will be recorded as failed "
+                 "(LLM_Attempts 0). Expected at 8192 (about 2% of the corpus); a larger window only "
+                 "helps on a GPU with room for the bigger KV cache, which the A10 does not have with medgemma:27b")
+        elif total:
+            ok(f"notes.csv: all {total} notes fit the context window")
     return mods
 
 
-def placement(base):
+def placement(base, want_ctx=None):
+    """Where the loaded model sits (GPU/CPU, including its KV cache) and the context it was
+    loaded with, which must not be smaller than the num_ctx the repo asks for."""
     head("Model placement")
     try:
         loaded = http_json(f"{base}/api/ps").get("models", [])
@@ -637,13 +671,21 @@ def placement(base):
     for entry in loaded:
         size, vram = entry.get("size", 0), entry.get("size_vram", 0)
         pct = 100 * vram // size if size else 0
-        desc = f"{entry.get('name')}: {pct}% on GPU ({vram / 1e9:.1f} of {size / 1e9:.1f} GB)"
+        loaded_ctx = entry.get("context_length")
+        desc = f"{entry.get('name')}: {pct}% on GPU ({vram / 1e9:.1f} of {size / 1e9:.1f} GB, KV cache included)"
+        if loaded_ctx:
+            desc += f", context {loaded_ctx}"
         if pct == 100:
             ok(desc)
         elif vram == 0 and not shutil.which("nvidia-smi"):
             ok(desc + ", CPU-only node")
         else:
-            warn(desc + "; partly or fully on CPU, expect it to be slow")
+            warn(desc + "; partly or fully on CPU, expect it to be slow. The KV cache grows with the "
+                 "context window: a lower NLP_CONTEXT_LENGTH may bring the model back onto the GPU")
+        if loaded_ctx and want_ctx and loaded_ctx < want_ctx:
+            fail(f"loaded context {loaded_ctx} is smaller than the num_ctx {want_ctx} the repo asks for",
+                 "Prompts longer than the loaded context are truncated silently (the system prompt is lost). "
+                 "Check the Ollama version and OLLAMA_CONTEXT_LENGTH.")
 
 
 def tier1(mods, model, reps, budget, notes):
@@ -703,7 +745,7 @@ def tier1(mods, model, reps, budget, notes):
             signal.alarm(0)
         times.append(time.time() - start)
         ok(f"call {i}: schema-valid JSON in {times[-1]:.1f}s")
-    placement(base)
+    placement(base, getattr(mods["llm_analysis"], "CONTEXT_LENGTH", None))
     if len(times) < reps:
         return
 
@@ -749,7 +791,7 @@ def main():
 
     mods = tier0(args.repo, args.model, args.models_dir)
     if args.tier >= 1 and mods and not FAILS:
-        tier1(mods, args.model, args.reps, args.budget, args.notes or count_notes(args.repo))
+        tier1(mods, args.model, args.reps, args.budget, args.notes or count_notes(args.repo)[0])
 
     print()
     if FAILS:
