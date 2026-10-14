@@ -159,6 +159,15 @@ cluster (NVIDIA driver 535), and each fits a 24 GB card on its own at the 8192-t
 To match Argon exactly, install Ollama 0.24.0:
 `curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=0.24.0 sh`.
 
+For a workstation test without the large models, `--location local` runs the same pipeline
+with three small stand-ins instead (about 11 GB in all; these need a current Ollama, not 0.24.0):
+
+```powershell
+ollama pull gemma3:4b
+ollama pull gemma4:e2b
+ollama pull qwen3.5:4b
+```
+
 Ollama runs locally and does **not** require internet access after model download.
 
 ---
@@ -171,13 +180,14 @@ Ollama runs locally and does **not** require internet access after model downloa
 python app.py
 ```
 
-With no options it prints what the program needs (the packages, Ollama and the model, the CSV header, where files go), the typical commands, and a status check of the current directory: whether Ollama is reachable and the model is pulled, how many notes `data.db` holds and how many are still pending, and whether `output/results.csv` already exists. There are three options, which can be combined (`--model` is a local-testing override, see below):
+With no options it prints what the program needs (the packages, Ollama and the model, the CSV header, where files go), the typical commands, and a status check of the current directory: whether Ollama is reachable and the model is pulled, how many notes `data.db` holds and how many are still pending, and whether `output/results.csv` already exists. There are four options, which can be combined:
 
 | Option         | Effect                                                                                   |
 | -------------- | ---------------------------------------------------------------------------------------- |
 | `--csv FILE`   | Ingest the notes in `FILE` into `data.db` (duplicates skipped); reports how many were added |
 | `--analyze`    | Run each model on every note that has no result for it yet, then write `output/results.csv` |
 | `--clean`      | Delete `data.db` (and any SQLite journal files) and `output/results.csv` from earlier runs, before anything else. Discards every stored result |
+| `--location`   | Which model set to run: `server` (the default) is the three study models; `local` is three small stand-ins (`gemma3:4b`, `gemma4:e2b`, `qwen3.5:4b`) for a workstation test. Either way each model gets its own labelled columns |
 
 ---
 
@@ -428,7 +438,7 @@ Key Safeguards:
 
 Model:
 
-- `MODELS` in `llm_analysis.py` lists the models every note is sent to, in run order, each with its context window and `think` setting: `medgemma:27b` (`LOCAL_MODEL`, MedGemma 27B, thinking off), `gemma4:26b-a4b-it-q4_K_M` (Gemma 4 26B A4B, thinking off) and `gpt-oss:20b` (reasoning at `"low"`). All three use the 8192-token window, so they see the same notes, and their columns are labelled `medgemma:27b@8192`, `gemma4:26b-a4b-it-q4_K_M@8192` and `gpt-oss:20b@8192`. To change the list, edit that block (one `ModelSpec` per line, the name as a quoted literal: `setup.sh` reads it) and pull the models. For local testing only, `--model` replaces the list with one model for a run, e.g. `python app.py --analyze --model gemma3:4b`, stored under its own label (`gemma3:4b@8192`); study runs omit it
+- `MODELS` in `llm_analysis.py` lists the models every note is sent to, in run order, each with its context window and `think` setting: `medgemma:27b` (`LOCAL_MODEL`, MedGemma 27B, thinking off), `gemma4:26b-a4b-it-q4_K_M` (Gemma 4 26B A4B, thinking off) and `gpt-oss:20b` (reasoning at `"low"`). All three use the 8192-token window, so they see the same notes, and their columns are labelled `medgemma:27b@8192`, `gemma4:26b-a4b-it-q4_K_M@8192` and `gpt-oss:20b@8192`. To change the list, edit that block (one `ModelSpec` per line, the name as a quoted literal: `setup.sh` reads it) and pull the models. `LOCAL_MODELS` is the small set that `--location local` runs instead (`gemma3:4b`, `gemma4:e2b`, `qwen3.5:4b`, all with thinking off and the same window), for exercising the pipeline on a workstation; its columns are labelled `gemma3:4b@8192` and so on, so a local test never mixes with study results. Study runs use the default, `--location server`
 
 HIPAA:
 

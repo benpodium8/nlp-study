@@ -155,29 +155,29 @@ def create_db(db_path: Path, labels=(), legacy_label: str | None = None):
     with conn:
         conn.execute(NOTES_TABLE_SCHEMA)
         conn.execute(RESULTS_TABLE_SCHEMA)
-        if legacy_label:
-            _label_legacy_columns(conn, legacy_label)
-            if legacy_label not in labels:
-                _backfill_manual_review(conn, legacy_label)
+        # A converted legacy block gets its review columns filled even when this run does not
+        # use that model (the loop below only covers labels); a fresh database has no such block.
+        if legacy_label and _label_legacy_columns(conn, legacy_label) and legacy_label not in labels:
+            _backfill_manual_review(conn, legacy_label)
         for label in labels:
             _add_missing_result_columns(conn, label)
             _backfill_manual_review(conn, label)
     return conn
 
 
-def _label_legacy_columns(conn: sqlite3.Connection, label: str):
+def _label_legacy_columns(conn: sqlite3.Connection, label: str) -> bool:
     """
     Moves the results of a table whose columns carry no label (the bare field names
     ScopeType, LLM_Failed, ...) under label, since those answers came from the first model.
     Columns that version lacked are added empty; columns already labelled are kept.
     SQLite's RENAME COLUMN needs 3.25, which the Argon Python may not have, so the table is
-    rebuilt by copying instead.
+    rebuilt by copying instead. Returns whether there was anything to convert.
     """
     existing = _table_columns(conn, "results")
     names = [name for name, _ in existing]
     legacy = [field for field, _ in RESULTS_COLUMNS if field in names]
     if not legacy:
-        return
+        return False
 
     kept = [(name, sqltype) for name, sqltype in existing if name != "id" and name not in legacy]
     new_columns = [(column_name(field, label), sqltype) for field, sqltype in RESULTS_COLUMNS] + kept
@@ -205,6 +205,7 @@ def _label_legacy_columns(conn: sqlite3.Connection, label: str):
         f"Labelled the {len(legacy)} unlabelled result column(s) of {count} existing result(s) "
         f"as {label!r} (they came from that model)."
     )
+    return True
 
 
 def _add_missing_result_columns(conn: sqlite3.Connection, label: str):
@@ -233,6 +234,9 @@ def _backfill_manual_review(conn: sqlite3.Connection, label: str):
     """
     from review import manual_review  # imported here: review depends on llm_analysis only
 
+    existing = {name for name, _ in _table_columns(conn, "results")}
+    if any(column_name(field, label) not in existing for field, _ in RESULTS_COLUMNS):
+        return   # no block for this label (nothing stored under it yet)
     rows = conn.execute(
         f"""
         SELECT results.id, notes.note, {", ".join(f"results.{_col(f, label)}" for f, _ in RESULT_FIELDS)},

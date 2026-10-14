@@ -4,7 +4,7 @@ from pathlib import Path
 
 from database import REQUIRED_CSV_COLUMNS, create_db, database_status, ingest_csv, export_results
 from data_worker import data_worker
-from llm_analysis import CONTEXT_LENGTH, MODELS, ModelSpec, model_served, ollama_status
+from llm_analysis import LOCATIONS, MODELS, ModelSpec, model_served, ollama_status
 
 DB_PATH = Path("data.db")
 EXPORT_PATH = Path("output") / "results.csv"
@@ -13,17 +13,19 @@ EXPORT_PATH = Path("output") / "results.csv"
 # model a run uses (see database.create_db).
 LEGACY_LABEL = MODELS[0].label
 MODEL_NAMES = ", ".join(m.name for m in MODELS)
+LOCAL_MODEL_NAMES = ", ".join(m.name for m in LOCATIONS["local"])
 PULL_COMMANDS = "\n       ".join(f"ollama pull {m.name}" for m in MODELS)
 
 DESCRIPTION = f"""\
 Extract structured data from endoscopy procedure notes with local LLMs.
 
 Reads notes from a CSV into a local SQLite database ({DB_PATH}), sends each note once to
-each of the default models, one model at a time (or only to the one given with --model):
+each of the study models, one model at a time:
   {MODEL_NAMES}
 through Ollama, stores every model's answers next to the note in columns labelled with the
 model name and context window, for example "ScopeType ({MODELS[0].label})", and writes
-{EXPORT_PATH}. Nothing leaves this machine.
+{EXPORT_PATH}. Nothing leaves this machine. --location local runs the same pipeline with
+small stand-in models ({LOCAL_MODEL_NAMES}) for a workstation test.
 
 Run with no options to see this text plus a check of what is in place right now."""
 
@@ -34,6 +36,7 @@ What the program needs
   2. Ollama running on this machine and reachable at OLLAMA_HOST (default
      http://127.0.0.1:11434), with each model pulled:
        {PULL_COMMANDS}
+     (for --location local: {LOCAL_MODEL_NAMES}).
      Only --analyze talks to the models; ingesting with --csv alone does not.
   3. A CSV of notes, UTF-8 without a byte-order mark, whose header row contains
      exactly these column names (case-sensitive; extra columns are ignored):
@@ -47,8 +50,8 @@ Typical use
   python app.py --csv notes.csv             ingest only (no model needed)
   python app.py --analyze --csv notes.csv   ingest, analyse every note with every model, write {EXPORT_PATH}
   python app.py --analyze                   resume: analyse only the notes a model has no result for
-  python app.py --analyze --model gemma3:4b local testing only: analyse with another model,
-                                            stored under its own label (gemma3:4b@{CONTEXT_LENGTH})
+  python app.py --analyze --location local  workstation test: the same run with the small
+                                            models, each stored under its own label
   python app.py --clean                     delete {DB_PATH} and {EXPORT_PATH} from earlier runs
   python app.py --clean --analyze --csv notes.csv   start over from scratch
 
@@ -71,7 +74,7 @@ def setup_parser():
     Creates and configures the argument parser for the CLI.
 
     Returns:
-        argparse.ArgumentParser: Parser with the --csv, --analyze, --model and --clean options.
+        argparse.ArgumentParser: Parser with the --csv, --analyze, --location and --clean options.
     """
     parser = argparse.ArgumentParser(
         description=DESCRIPTION,
@@ -96,13 +99,13 @@ def setup_parser():
     )
 
     parser.add_argument(
-        "--model",
-        default=None,
-        metavar="NAME",
+        "--location",
+        choices=sorted(LOCATIONS),
+        default="server",
         help=(
-            f"Local testing override: send the notes to this Ollama model only, instead of "
-            f"{MODEL_NAMES}; it must be pulled. Its answers go to their own columns, labelled "
-            f"NAME@{CONTEXT_LENGTH}. Study runs should omit it"
+            f"Which model set to run. server (the default): the study models, {MODEL_NAMES}. "
+            f"local: small stand-ins for a workstation test, {LOCAL_MODEL_NAMES}. Either way "
+            f"every model's answers go to its own labelled columns; the models must be pulled"
         ),
     )
 
@@ -186,7 +189,7 @@ def main():
     """
     parser = setup_parser()
     args = parser.parse_args()
-    models = (ModelSpec(args.model, CONTEXT_LENGTH),) if args.model else MODELS
+    models = LOCATIONS[args.location]
 
     if args.csv and not args.csv.exists():
         print(f"Error: CSV file not found: {args.csv}", file=sys.stderr)

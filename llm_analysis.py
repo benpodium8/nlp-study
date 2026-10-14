@@ -53,7 +53,7 @@ class ModelSpec(NamedTuple):
 #
 # setup.sh and migrate.sh read the names of this block with sed: keep one ModelSpec per line,
 # the first with LOCAL_MODEL and every other with its name as a double-quoted literal first
-# argument (ARGON_RUNBOOK.md 15.2). --model replaces the list with one model for a local test.
+# argument (ARGON_RUNBOOK.md 15.2). --location local swaps in LOCAL_MODELS for a workstation test.
 #
 #   gemma4:26b-a4b-it-q4_K_M  Gemma 4 26B mixture of experts (3.8B active), Q4_K_M, 18.0 GB,
 #       Apache 2.0. Vision is merged into its GGUF and its config requires only Ollama 0.20,
@@ -69,6 +69,19 @@ MODELS = (
     ModelSpec("gemma4:26b-a4b-it-q4_K_M", CONTEXT_LENGTH),
     ModelSpec("gpt-oss:20b", CONTEXT_LENGTH, think="low"),
 )
+
+# Small stand-ins for a workstation run (--location local): the same pipeline, prompt, window
+# and checks, each model in its own labelled block, so the mechanics can be exercised without
+# the 14 to 18 GB study models. Not fetched by setup.sh; pull them with `ollama pull`. Gemma 4
+# and Qwen 3.5 reason by default, so think=False keeps their answers to the JSON.
+LOCAL_MODELS = (
+    ModelSpec("gemma3:4b", CONTEXT_LENGTH),
+    ModelSpec("gemma4:e2b", CONTEXT_LENGTH),
+    ModelSpec("qwen3.5:4b", CONTEXT_LENGTH),
+)
+
+# The model set each --location value selects. "server" (the default) is the study set.
+LOCATIONS = {"server": MODELS, "local": LOCAL_MODELS}
 
 # How much of the context window a note may take. Measured with the Gemma 3 tokenizer, which
 # medgemma:27b and gemma3 share: the system prompt and user template take 1,664 tokens, and
