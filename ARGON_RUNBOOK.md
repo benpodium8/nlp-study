@@ -329,7 +329,7 @@ September version: the model step started a temporary Ollama server on the login
 
 ### 5.4 Model name resolution
 
-`setup.sh` does not hardcode the model. `detect_repo_model()` reads the first line matching `^LOCAL_MODEL *= *"..."` in `llm_analysis.py` (no leading whitespace allowed). `MODEL=name:tag ./setup.sh` overrides but warns if it disagrees with the repo, because the program will call whatever the repo says. If neither source yields a name the script dies. There is no `gemma4:e2b` fallback any more. Names parse as Ollama does: `gemma3:12b` is `registry.ollama.ai/library/gemma3:12b`, and `hf.co/<user>/<repo>:<quant>` is fetched from Hugging Face, which serves the same registry protocol.
+`setup.sh` does not hardcode the model. `detect_repo_model()` reads the first line matching `^LOCAL_MODEL *= *"..."` in `llm_analysis.py` (no leading whitespace allowed). `MODEL=name:tag ./setup.sh` overrides but warns if it disagrees with the repo, because the program will call whatever the repo says. If neither source yields a name the script dies. There is no `gemma4:e2b` fallback any more. Names parse as Ollama does: `medgemma:27b` is `registry.ollama.ai/library/medgemma:27b`, and `hf.co/<user>/<repo>:<quant>` is fetched from Hugging Face, which serves the same registry protocol.
 
 Since 2026-10-13 the model is `medgemma:27b` (MedGemma 27B, Gemma 3 based, Q4_K_M, 17.4 GB, model blob `sha256:4b97da6b21a8...`), called with `think=False`. Its registry config declares no `requires` and it ships no separate projector layer, so it passes `setup.sh`'s check and loads on 0.24.0. Ollama 0.24.0 rejects `think` only when it is true for a model without thinking support, so `think=False` is safe. It replaced `hf.co/ggml-org/gemma-3-12b-it-GGUF:Q4_K_M` (Gemma 3 12B instruct, Q4_K_M, about 7.8 GB, published March 2025 by the llama.cpp maintainers). Every `gemma3` and `gemma4` tag on `registry.ollama.ai` now declares `requires` 0.30.0 or newer in its config. The image is pinned to Ollama 0.24.0 for the driver-535 GPUs. Ollama 0.24.0 does not check `requires` itself, the registry checks it on `ollama pull`, and curl skips that check, so `setup.sh` reads the field and checks it itself. The Hugging Face build declares no requirement.
 
@@ -414,7 +414,7 @@ September version: tier 0 also probed the endpoint (so it needed a running serve
 ### 6.4 Direct invocation
 
 ```bash
-python /nfsscratch/Users/apkane/nlp-study/nlp-preflight.py --repo /nfsscratch/Users/apkane/nlp-study/repo --model gemma3:12b --models-dir /nfsscratch/Users/apkane/nlp-study-assets/ollama-models --tier 1 --reps 3 --budget 600 --notes 5000
+python /nfsscratch/Users/apkane/nlp-study/nlp-preflight.py --repo /nfsscratch/Users/apkane/nlp-study/repo --model medgemma:27b --models-dir /nfsscratch/Users/apkane/nlp-study-assets/ollama-models --tier 1 --reps 3 --budget 600 --notes 5000
 ```
 
 `--models-dir` is required in the rewrite. For tier 1, `OLLAMA_HOST` must already be exported and a server listening; `nlp_start_ollama` from `~/nlp-study-env.sh` does both. `NLP_COLOR=1` forces colour when stdout is not a TTY.
@@ -557,10 +557,10 @@ The README describes a workstation deployment (Windows 10/11, with Mac and Linux
    curl -fsSL https://ollama.com/install.sh | sh
    ```
 
-7. Pull the model the code asks for. `LOCAL_MODEL` in `llm_analysis.py` is the authority and currently says `hf.co/ggml-org/gemma-3-12b-it-GGUF:Q4_K_M` (about 7.8 GB):
+7. Pull the model the code asks for. `LOCAL_MODEL` in `llm_analysis.py` is the authority and currently says `medgemma:27b` (MedGemma 27B, Q4_K_M, about 17.4 GB; see 5.4). To match Argon exactly, install Ollama 0.24.0 (`OLLAMA_VERSION=0.24.0` on the one-liner in step 6):
 
    ```bash
-   ollama pull hf.co/ggml-org/gemma-3-12b-it-GGUF:Q4_K_M
+   ollama pull medgemma:27b
    ```
 
    Ollama needs internet only for this download. Afterwards it serves on `127.0.0.1:11434`, which is the `ollama` client's default, so `OLLAMA_HOST` need not be set.
@@ -662,7 +662,7 @@ Implications for nlp-study:
 
 - Nothing in this project is installed centrally. Python 3.12 is a user build in `$HOME`, the venv and all pip packages are on scratch, Ollama runs from an Apptainer image on scratch, and the model weights are on scratch. No review is triggered and no module needs to exist.
 - The only Argon Python modules are 3.8.8 variants, which is why a user-built 3.12 was needed. The rewrite still tries `module load python/3.12` first in case one appears, then falls back to `$NLP_PYTHON`, the existing venv's base interpreter, and the PATH.
-- If a central install were ever requested: Ollama is MIT-licensed (approved category). The Gemma model weights are under Google's Gemma Terms of Use, a non-standard licence, which would require review before central deployment.
+- If a central install were ever requested: Ollama is MIT-licensed (approved category). The MedGemma weights (`medgemma:27b`) are under Google's Health AI Developer Foundations Terms of Use, a non-standard licence, which would require review before central deployment.
 
 ---
 
@@ -691,13 +691,13 @@ Between 18:54 and 20:04 the repository advanced to commit `1052cdd` ("change to 
 
 Bug-level items are tracked in `BACKLOG.md` (B1 to B26) with proposed fixes; this list is about the deployment state.
 
-1. **`gemma3:12b` may not be on Argon yet.** The 20:04 status showed a 6.5 GB store, which matches `gemma4:e2b` alone. The code wants `gemma3:12b` (roughly 8 GB more). Under the September script, `--status` cannot tell and the job's tier 1 preflight is the first thing that would notice. Under the rewrite, `--status` reports `model absent` and `./setup.sh` on a login node downloads the missing blobs with resume and checksum, then prunes the old `gemma4:e2b` blobs. Either way: run `./setup.sh` on a login node before the next submission. Since 2026-10-13 the code wants `hf.co/ggml-org/gemma-3-12b-it-GGUF:Q4_K_M` instead, and `setup.sh` deletes any stored `gemma3`/`gemma4` from `registry.ollama.ai` whose config requires Ollama newer than 0.24.0.
+1. **`gemma3:12b` may not be on Argon yet.** The 20:04 status showed a 6.5 GB store, which matches `gemma4:e2b` alone. The code wants `gemma3:12b` (roughly 8 GB more). Under the September script, `--status` cannot tell and the job's tier 1 preflight is the first thing that would notice. Under the rewrite, `--status` reports `model absent` and `./setup.sh` on a login node downloads the missing blobs with resume and checksum, then prunes the old `gemma4:e2b` blobs. Either way: run `./setup.sh` on a login node before the next submission. Since 2026-10-13 the code wants `medgemma:27b` instead (17.4 GB from `registry.ollama.ai`; its config declares no `requires`, see 5.4), and `setup.sh` deletes any stored `gemma3`/`gemma4` from `registry.ollama.ai` whose config requires Ollama newer than 0.24.0.
 
 2. **Argon still runs the September script.** The rewrite is committed locally in `f8f76c0` but Argon's checkout only changes when `main` is pushed and pulled. See [5.6](#56-upgrading-argon-from-the-september-script-to-the-rewrite) for the order. After the upgrade, a full `./setup.sh` run is required before `--preflight` will accept the env script (`NLP_ENV_VERSION=2` check).
 
 3. **The login-node image pull was never thread-limited in the committed script** (`APPTAINER_MKSQUASHFS_ARGS` is a no-op on Apptainer 1.3.2, 3.3). The working tree fixes this with a `mksquashfs` PATH wrapper, which still needs one confirming run on Argon: `./setup.sh --force sif` on a login node, then check the transcript shows the capped pull surviving (BACKLOG B14). BACKLOG B27 tracks runbook statements that drift from the script; this pass resolves the ones it lists.
 
-4. **README is behind the code.** The README still says `gemma4:e2b` in the Ollama pull command and in the `llm_analysis.py` section; the code says `gemma3:12b`. It claims a "Boolean normalization" step that does not exist. Its "curl install.sh" instruction does not apply to Argon. (BACKLOG B24.)
+4. **README was behind the code** (resolved 2026-10-13). The README said `gemma4:e2b` in the Ollama pull command and in the `llm_analysis.py` section while the code said `gemma3:12b`; both now say `medgemma:27b`, and the README's description of value coercion matches `normalize_llm_result`. Its "curl install.sh" instruction is for workstations; Argon uses the container (3.6). (BACKLOG B24.)
 
 5. **GPU nodes with driver 535 run on CPU.** The A10 node seen on 2026-09-14 could not be used by `ollama/ollama:latest`. `setup.sh` now pins `ollama/ollama:0.24.0`, which uses the A10 on driver 535; the next `./setup.sh` on a login node replaces the old `latest` image automatically (unconfirmed on Argon until a GPU job's placement line says GPU). Always read the placement line the preflight prints.
 
@@ -706,11 +706,11 @@ Bug-level items are tracked in `BACKLOG.md` (B1 to B26) with proposed fixes; thi
    - `samples/sample_5000_deidentified.csv` starts with a UTF-8 byte-order mark (`EF BB BF`) and names the second column `EncounterID`. With `encoding="utf-8"` the first header parses as `\ufeffMRN`, and `EncounterID` is not `Encounter`. Two failures (BACKLOG B7).
    Fixes are in [Troubleshooting](#csv-must-contain-columns). `samples/` and `environment-notes/` are in `.gitignore` and must stay out of git (names and MRNs).
 
-7. **Runtime versus walltime.** 5000 notes at 24 h walltime allows about 17 s per note including retries. CPU inference on a 12 B model is unlikely to meet that. Plan on multiple resubmissions (resume is automatic) or set `NLP_JOB_HRT` higher, and read the tier 1 projection, which counts the real rows in `notes.csv`. Most of the 5000-note corpus is not procedure notes, so a relevance gate before the LLM (BACKLOG F3) would cut the work by roughly ten times.
+7. **Runtime versus walltime.** 5000 notes at 24 h walltime allows about 17 s per note including retries. CPU inference on a 27 B model (medgemma:27b decodes at about 3 tokens per second on CPU) cannot meet that. Plan on multiple resubmissions (resume is automatic) or set `NLP_JOB_HRT` higher, and read the tier 1 projection, which counts the real rows in `notes.csv`. Most of the 5000-note corpus is not procedure notes, so a relevance gate before the LLM (BACKLOG F3) would cut the work by roughly ten times.
 
 8. **Container tag pinned to 0.24.0.** Before 2026-10-13 the default was `latest` (0.32.14 when pulled), which needs driver 550+. Do not move the default past 0.24.x until Argon's GPU nodes run driver 550 or newer (BACKLOG B25).
 
-9. **Job preflight budget dropped from 900 s to 600 s** in the rewrite (it inherits the preflight script's default). On a CPU node a 12 B model can exceed 600 s for one call. Export `NLP_PREFLIGHT_BUDGET` at `qsub` time if the gate times out (BACKLOG B26).
+9. **Job preflight budget dropped from 900 s to 600 s** in the rewrite (it inherits the preflight script's default). On a CPU node a 27 B model can exceed 600 s for one call. Export `NLP_PREFLIGHT_BUDGET` at `qsub` time if the gate times out (BACKLOG B26).
 
 10. **The code does not yet implement the study's definitions.** The researcher's comments (15.5) require "biopsies taken, count unknown" to be representable and colonoscopes to be ignored; as of 2026-10-13 the prompt implements them (null count when taken but not stated, scope from the upper endoscope only, fellow from the attestation; BACKLOG B1 and B11), measured against the ten annotated notes on a workstation. Not yet confirmed on Argon: run the tier 1 preflight after pulling.
 
@@ -997,7 +997,7 @@ The `name:tag` does not exist on the registry, or (on `hf.co`) the repository ne
 
 #### `<model> requires Ollama X, but the image has 0.24.0 ...`
 
-The model's config declares a minimum Ollama version newer than the pinned image. Every `gemma3`/`gemma4` tag on `registry.ollama.ai` does this now. Nothing large was downloaded. Use a GGUF from `hf.co` in `LOCAL_MODEL` (the current one is), or move the image up with `NLP_OLLAMA_IMAGE` and accept CPU inference on driver-535 nodes.
+The model's config declares a minimum Ollama version newer than the pinned image. Every `gemma3`/`gemma4` tag on `registry.ollama.ai` does this now. Nothing large was downloaded. Use a build without that requirement in `LOCAL_MODEL` (the current `medgemma:27b` declares none; a GGUF from `hf.co` is the other option), or move the image up with `NLP_OLLAMA_IMAGE` and accept CPU inference on driver-535 nodes.
 
 #### `[model] removing <host>/<ns>/<name>/<tag>: requires Ollama X, the image has 0.24.0`
 
@@ -1017,7 +1017,7 @@ Five attempts exhausted. Re-run `./setup.sh`; completed blobs are kept, the fail
 
 #### `[model] pruned N blob(s) that no manifest references`
 
-Informational. Weights for a model the code no longer asks for were deleted (for example `gemma4:e2b` after the move to `gemma3:12b`, or `gemma3:12b` after the move to the Hugging Face build).
+Informational. Weights for a model the code no longer asks for were deleted (for example `gemma4:e2b` after the move to `gemma3:12b`, or the Hugging Face Gemma 3 12B build after the move to `medgemma:27b`).
 
 #### `Killing orphaned Ollama server(s) on this login node`
 
@@ -1049,7 +1049,7 @@ Tier 0 ran. Repeat `./setup.sh` (or `--preflight`) inside `qlogin`.
 
 A non-login host without SGE variables. Use `qlogin`; off-cluster only, set the variable.
 
-#### `llm_analysis.LOCAL_MODEL is 'gemma3:12b' but setup fetched 'gemma4:e2b'`
+#### `llm_analysis.LOCAL_MODEL is 'medgemma:27b' but setup fetched 'hf.co/ggml-org/gemma-3-12b-it-GGUF:Q4_K_M'`
 
 The repo changed models after setup, or `MODEL=` was given. Run `./setup.sh` on a login node; it follows the repo.
 
@@ -1057,7 +1057,7 @@ The repo changed models after setup, or `MODEL=` was given. Run `./setup.sh` on 
 
 Tier 0 found the on-disk model store incomplete for the model the code wants. Run `./setup.sh` on a login node; it resumes the download. This is the on-disk form of [open item 1](#12-open-items-and-known-discrepancies).
 
-#### `'gemma3:12b' is not served (server has: [...])`
+#### `'medgemma:27b' is not served (server has: [...])`
 
 The server is running but does not see the model: `OLLAMA_MODELS` inside the container does not point at the fetched blobs, or the blobs are for a different tag. Check the bind mount (`--bind <models_dir>:/models --env OLLAMA_MODELS=/models`).
 
@@ -1194,11 +1194,11 @@ Things to hold in mind while changing the code, grouped by the layer they affect
 ### 15.2 Model and Ollama
 
 12. **`LOCAL_MODEL` in `llm_analysis.py` is parsed by `sed`.** Keep it a single line of the form `LOCAL_MODEL = "name:tag"` at column 0. Any model change requires `./setup.sh` on a login node to fetch the weights (and it prunes the old ones), and the README should be updated in the same commit (BACKLOG B24).
-13. **Model size budget.** `gemma4:e2b` is 5.12 B parameters at Q4_K_M, about 7.2 GB, and is a reasoning model that emits a thinking trace by default. Gemma 3 12B (`hf.co/ggml-org/gemma-3-12b-it-GGUF:Q4_K_M`) is about 7.8 GB. Budget 8 to 10 GB of VRAM once the KV cache is allocated. The September job script pinned `gpu_p100` (16 GB) for that reason; the rewrite requests only `ngpus=1`, so pin a card type with `#$ -l <complex>` if a small card would silently fall back to CPU. CPU inference needs that much RAM plus headroom.
+13. **Model size budget.** `medgemma:27b` is 17.4 GB of Q4_K_M weights and needs about 20 GB of VRAM once the 8192-token KV cache and compute buffers are allocated (`model_candidates.md` section 3), so it needs a 24 GB card: the A10 holds it, the P100 (16 GB) does not, and a larger `NLP_CONTEXT_LENGTH` spills it to the CPU. The September job script pinned `gpu_p100` for the 7 to 8 GB models of that time (`gemma4:e2b`, then Gemma 3 12B); the rewrite requests only `ngpus=1`, so pin the A10 or a larger card with `#$ -l <complex>`, or a smaller card will silently fall back to CPU. CPU inference needs about 20 GB of RAM plus headroom and decodes at roughly 3 tokens per second.
 14. **The module-level `ollama` client is wired by `OLLAMA_HOST` at import time.** Do not create `ollama.Client()` with a hard-coded host or port, and do not import `ollama` before the host is exported. The port is random per job to avoid collisions with other users on the node. If you add a client with a timeout (BACKLOG B15), keep it reading `OLLAMA_HOST`. `ollama_status()` in `llm_analysis.py` follows that rule: the no-argument `python app.py` builds a short-lived `ollama.Client(timeout=3)` that reads `OLLAMA_HOST` at call time and only lists models.
 15. **Decoding is greedy and schema-constrained.** `ollama.chat()` passes `format=RESPONSE_SCHEMA` (the JSON schema of the ten study fields: 0/1 enums, nullable strings with `maxLength` 1000) and `GENERATION_OPTIONS` (`temperature` 0, `seed` 0, `num_ctx` from `NLP_CONTEXT_LENGTH`, `num_predict` 2048), so the reply is always a bare JSON object and the same note gives the same answer on the same model build; Ollama's server default temperature would be 0.8. Greedy decoding can lock into a repetition loop (seen with gemma3:4b), which the schema cuts off at 1000 characters; a value that reaches the cap raises `RetryableLLMError`, as do invalid JSON and any validation failure, and the retry prompt says why the previous answer was rejected. A greedy retry would repeat the loop, so `generation_options()` makes attempts 2+ sample at temperature 0.8 with `repeat_penalty` 1.1 and `seed` = attempt number (still reproducible). Schema-constrained output needs Ollama 0.5 or newer; confirm the pinned 0.24.0 honours `maxLength` with the preflight. Re-run the preflight after any change here.
 16. **Context window.** The rewrite sets `OLLAMA_CONTEXT_LENGTH=8192` on the container (`NLP_CONTEXT_LENGTH`), and `llm_analysis.py` passes the same value as `num_ctx` on every call, so a workstation run uses the same window as a job. The September script and a workstation install without it get Ollama's default, 4096 on CPU. The prompt overhead is about 1,700 tokens; the 5000-note corpus has notes up to about 41,000 characters (roughly 13,000 tokens). Ollama truncates an over-long prompt server-side, keeping 5 leading tokens plus the tail so the system prompt is lost, and the client sees a normal response; that is why `data_worker.py` fails any note that `llm_analysis.note_fits_context` says would not fit, without calling the model (BACKLOG B10, fixed 2026-10-14). The default 8192 is what the A10 holds with medgemma:27b; a larger `NLP_CONTEXT_LENGTH` moves the cut up but pushes the model off the GPU, and the preflight prints both the cut and the placement.
-17. **`OLLAMA_KEEP_ALIVE=-1` keeps the model loaded for the whole job.** Keep it; reloading an 8 GB model per note would dominate runtime. `OLLAMA_NUM_PARALLEL=1` matches the single-threaded `data_worker`. Nothing limits llama.cpp's threads to the requested slots (BACKLOG B26).
+17. **`OLLAMA_KEEP_ALIVE=-1` keeps the model loaded for the whole job.** Keep it; reloading a 17 GB model per note would dominate runtime. `OLLAMA_NUM_PARALLEL=1` matches the single-threaded `data_worker`. Nothing limits llama.cpp's threads to the requested slots (BACKLOG B26).
 18. **The container tag is pinned.** Now pinned to `0.24.0`, the last release that uses a driver-535 GPU; a newer tag needs driver 550+ (BACKLOG B25). The Python packages, including `ollama` 0.6.2, are pinned in `requirements.txt` to the Argon versions.
 19. **GPU use requires three things to line up:** a `*-GPU` queue, `#$ -l ngpus=1` (and a card-type complex if you need one), and a node driver the container's CUDA runtime accepts. `nlp_start_ollama` only passes `--nv` when `nvidia-smi -L` works. Verify with the preflight placement line every time.
 20. **The on-disk model store is Ollama's own layout.** The rewrite writes `manifests/<host>/<ns>/<name>/<tag>` and `blobs/sha256-<hex>` with curl, removes models whose config `requires` a newer Ollama than the image, and prunes unreferenced blobs. If Ollama changes that layout, `create_model`, `verify_model`, `prune_model_store` and the preflight's tier 0 model check all need updating together.

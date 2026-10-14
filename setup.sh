@@ -330,7 +330,7 @@ refresh_sif_ollama() {
 # (manifests/<host>/<ns>/<name>/<tag> plus blobs/sha256-<hex>), so no Ollama
 # process ever runs on the login node. The manifest is written last: its
 # presence means every blob is complete. Downloads resume after interruption.
-# Names parse as Ollama does: gemma3:12b is registry.ollama.ai/library/gemma3:12b,
+# Names parse as Ollama does: medgemma:27b is registry.ollama.ai/library/medgemma:27b,
 # and hf.co/<user>/<repo>:<quant> is served by Hugging Face over the same protocol.
 model_parts() {
     local ref="${MODEL%%:*}"

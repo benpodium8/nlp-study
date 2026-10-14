@@ -4,6 +4,14 @@ Date of evaluation: 2026-10-13. Scope: which local LLM the pipeline should call
 through Ollama, given the hardware and software constraints of the University of
 Iowa Argon cluster recorded in `ARGON_RUNBOOK.md`.
 
+**Outcome (2026-10-13, commit `9ad3a13`): the pipeline adopted `medgemma:27b`**, not
+the recommendation in section 4. `LOCAL_MODEL` in `llm_analysis.py` is the authority;
+`README.md` and `ARGON_RUNBOOK.md` section 5.4 describe the current setup. The call
+passes `think=False`, `format=` the JSON schema and `options={"temperature": 0,
+"seed": 0, "num_ctx": 8192, "num_predict": 2048}`; the context stays at 8192 because
+that is the window at which medgemma:27b and its KV cache fit the A10 (section 1).
+Sections 3 to 6 are kept as the record of the evaluation.
+
 ## 1. Constraints that decide the answer
 
 | Constraint | Value | Consequence |
@@ -64,8 +72,8 @@ field matched the expected answer.
 | `gemma4:26b` (default tag) | **no** | fails | fails | n/a | n/a | n/a |
 | `gemma4:26b-a4b-it-q4_K_M` | yes (Go engine) | 6/6 | 6/6, schema enforced | 17.6 | ~20 GB | yes |
 | `gpt-oss:20b` | yes (Go engine) | 6/6 | works with `think` unset or `low`; empty content with boolean `think=False` | n/a | ~15 GB | yes |
-| `medgemma:27b` | yes (Go engine) | 6/6 | 6/6, schema enforced | 3.2 | ~20 GB | yes |
-| `gemma3:12b` (current) | yes (llama.cpp fallback) | 6/6 | 6/6, schema enforced | 7.2 | ~10.5 GB | yes |
+| `medgemma:27b` (current since 2026-10-13) | yes (Go engine) | 6/6 | 6/6, schema enforced | 3.2 | ~20 GB | yes |
+| `gemma3:12b` (previous) | yes (llama.cpp fallback) | 6/6 | 6/6, schema enforced | 7.2 | ~10.5 GB | yes |
 | `qwen3.6:27b` (default tag) | **no** (same cause as gemma4:26b) | not run | not run | n/a | n/a | n/a |
 | `qwen3.6:27b-q4_K_M` | yes (Go engine) | 6/6, but 20 min on CPU with thinking on | schema **not enforced** (model-chosen keys; only follows the schema when it is pasted into the prompt) | 2.4 | ~19 GB | yes |
 | `gemma4:31b` (every tag) | **no** (all ship a projector) | not run | not run | n/a | ~23.7 GB | no |
@@ -109,22 +117,28 @@ on CPU, non-Apache licence); `qwen3.6:27b-q4_K_M` (schema not enforced on
 v0.24.0, dense, very slow with thinking on); `gemma4:31b` (no loadable tag, over
 budget); `llama3.3:70b` (over budget on one card).
 
-## 5. Changes to make
+## 5. Changes proposed, with their status
 
 1. `LOCAL_MODEL = "gemma4:26b-a4b-it-q4_K_M"` in `llm_analysis.py`. The model
    blob digest is `sha256:7121486771cb...` (17.99 GB); record it, because the
    library has already re-pointed the `gemma4:26b` tag once. Blobs already on
-   scratch are never re-fetched by setup.sh.
+   scratch are never re-fetched by setup.sh. **Not adopted:** `LOCAL_MODEL` is
+   `medgemma:27b` (blob `sha256:4b97da6b21a8...`, 17.4 GB).
 2. `NLP_OLLAMA_IMAGE=docker://ollama/ollama:0.24.0`, then `./setup.sh --force sif`
    on a login node. Consider making this tag the setup.sh default (backlog B25).
+   **Done:** `setup.sh` defaults to `0.24.0`.
 3. In the chat call: `think=False`, `format=<JSON schema dict>`,
    `options={"temperature": 0, "seed": 0, "num_ctx": 8192, "num_predict": 512}`
    (backlog B9/F7). Without `think=False` the repo call took 98 s on CPU because
    Gemma 4 reasons first; with it, 16 s. Gemma 4's 256K window makes a 16K
    context cheap (about 0.75 GB of KV cache) and covers the longest notes.
+   **Done for `medgemma:27b`**, with `num_predict` 2048 rather than 512 (the
+   1000-character schema cap and the retries stop a looping model) and the context
+   kept at 8192: medgemma:27b's dense KV cache does not fit the A10 at 16K.
 4. Pin the card type to the A10 or newer with a `#$ -l <complex>` line. The P100
-   has 16 GB and the V100 line had kernel problems on this Ollama version.
-5. Confirm with the tier 1 preflight that placement reads 100% on GPU.
+   has 16 GB and the V100 line had kernel problems on this Ollama version. **Open.**
+5. Confirm with the tier 1 preflight that placement reads 100% on GPU. **Open:**
+   unconfirmed on Argon (runbook section 12, item 5).
 
 ## 6. What was not verified directly
 
