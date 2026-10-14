@@ -15,6 +15,11 @@ passes `format=` the JSON schema and `options={"temperature": 0, "seed": 0,
 `think="low"` for gpt-oss (section 3). The context stays at 8192 for all three, so they
 see the same notes, and because medgemma:27b fits the A10 only at that window (section 1).
 The models run one after another (`OLLAMA_MAX_LOADED_MODELS=1`): each fits the A10 alone.
+Verified 2026-10-14 on the v0.24.0 Linux build kept from this evaluation (CPU only,
+`OLLAMA_KEEP_ALIVE=-1`, `OLLAMA_MAX_LOADED_MODELS=1`, context 8192): the repo's own
+`llm_analysis()` call returned schema-valid JSON scoring 6/6 on the synthetic note for all
+three models, each on the Go engine, in 197 s (medgemma:27b), 41 s (gemma4) and 59 s
+(gpt-oss, `think="low"`); loaded sizes 20.0, 19.8 and 14.2 GB with the 8K cache.
 Sections 3 to 6 are kept as the record of the evaluation.
 
 ## 1. Constraints that decide the answer
