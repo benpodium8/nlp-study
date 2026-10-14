@@ -4,7 +4,7 @@
 
 This project is a **local, offline-first clinical note analysis pipeline** that extracts structured data from endoscopy procedure notes with a **local Large Language Model (LLM via Ollama)**.
 
-Notes are loaded from a CSV into a local SQLite database, each note is sent once to each of the three default models (`medgemma:27b`, `gemma4:26b-a4b-it-q4_K_M` and `gpt-oss:20b`, one model at a time), every model's answers are stored next to the note in columns labelled with the model name and context window (`medgemma:27b@8192` and so on), and the results are exported to CSV for a comparison across the models.
+Notes are loaded from a CSV into a local SQLite database, each note is sent once to each of the three default models (`medgemma:27b`, `gemma4:26b-a4b-it-q4_K_M` and `gpt-oss:20b`, one model at a time), every model's answers are stored next to the note in columns labelled with the model name and context window (`medgemma:27b@8192` and so on), the three answers are consolidated into a cautious consensus block labelled `(consensus)` (a value only where at least two models agree, a review flag wherever they do not), and the results are exported to CSV with the consensus first and every model's answers beside it.
 
 > **Key design goals**
 >
@@ -30,6 +30,13 @@ SQLite Database (notes)
 │ data_worker                   │
 │  ├─ LLM analysis (Ollama)     │
 │  └─ Store results             │
+└───────────────────────────────┘
+        │
+        ▼
+┌───────────────────────────────┐
+│ consensus                     │
+│  └─ Consolidate the models'   │
+│     answers per note          │
 └───────────────────────────────┘
         │
         ▼
@@ -185,7 +192,7 @@ With no options it prints what the program needs (the packages, Ollama and the m
 | Option         | Effect                                                                                   |
 | -------------- | ---------------------------------------------------------------------------------------- |
 | `--csv FILE`   | Ingest the notes in `FILE` into `data.db` (duplicates skipped); reports how many were added |
-| `--analyze`    | Run each model on every note that has no result for it yet, then write `output/results.csv` |
+| `--analyze`    | Run each model on every note that has no result for it yet, rebuild the consensus of the models for every note, then write `output/results.csv` |
 | `--clean`      | Delete `data.db` (and any SQLite journal files) and `output/results.csv` from earlier runs, before anything else. Discards every stored result |
 | `--location`   | Which model set to run: `server` (the default) is the three study models; `local` is three small stand-ins (`gemma3:4b`, `gemma4:e2b`, `qwen3.5:4b`) for a workstation test. Either way each model gets its own labelled columns |
 
@@ -229,11 +236,12 @@ python app.py --analyze --csv ./notes.csv
 This will:
 
 1. Ingest notes
-2. Run the LLM extraction on every note without a result
+2. Run the LLM extraction on every note without a result, one model at a time
 3. Store each result, with the raw model response and per-note debugging columns, in the database
-4. Export `output/results.csv`
+4. Build the consensus of the models for every note (see `consensus.py` below)
+5. Export `output/results.csv`
 
-Running `python app.py --analyze` again resumes: notes that already have a result for a model are skipped for that model.
+Running `python app.py --analyze` again resumes: notes that already have a result for a model are skipped for that model. The consensus is rebuilt for every note on each run, so it always reflects every model's stored answers.
 
 While it runs, the program reports what it is doing:
 
@@ -326,9 +334,9 @@ HIPAA:
 Tables:
 
 - `notes` – raw clinical notes
-- `results` – one row per note, with one block of columns per model, each column named `<field> (<model>@<context>)`, for example `ScopeType (medgemma:27b@8192)`: the ten extracted fields, the review columns `ManualReviewRequired` and `ManualReviewReason`, and the debugging columns `LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `LLM_Rejections` and `RawResponse`. The label is the model's full name and the context window it was called with, so two models, or one model at two window sizes, never share a column
+- `results` – one row per note, with one block of columns per model, each column named `<field> (<model>@<context>)`, for example `ScopeType (medgemma:27b@8192)`: the ten extracted fields, the review columns `ManualReviewRequired` and `ManualReviewReason`, and the debugging columns `LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `LLM_Rejections` and `RawResponse`. The label is the model's full name and the context window it was called with, so two models, or one model at two window sizes, never share a column. The same row also holds the consensus block, labelled `(consensus)`: the ten fields the models agree on, its own `ManualReviewRequired` and `ManualReviewReason`, and `Outcome`, `Models` and `Agreement` (see `consensus.py` below)
 
-A `data.db` from before the columns were labelled is converted on startup: its unlabelled columns become the first model's block, since those answers came from that model. A column a block lacks is added on startup (existing rows get an empty value, except the review columns, which are computed for them), and a model that has not yet run on the database gets a whole new block.
+A `data.db` from before the columns were labelled is converted on startup: its unlabelled columns become the first model's block, since those answers came from that model. A column a block lacks is added on startup (existing rows get an empty value, except the review columns, which are computed for them), a model that has not yet run on the database gets a whole new block, and so does the consensus.
 
 Safeguards:
 
@@ -383,6 +391,24 @@ HIPAA:
 - the note was too long for the context window and was not sent to the model (see below)
 
 Everything else is `false`. The flag never changes an answer; it only says where to look.
+
+---
+
+### `consensus.py`
+
+**Purpose:** Consolidates the models' answers for each note into one consensus block
+
+After every model has run, `consolidate` builds a consensus for every note from the answers of the run's models and stores it under the label `consensus` (`ScopeType (consensus)` and so on), rebuilding it in full on every `--analyze`. The rules prefer an empty value to a wrong one:
+
+- A field gets a value only when at least two models gave an answer the note supports (`LLM_Failed` 0) and they agree on it. The models vote on `Endoscopy`, `Colonoscopy`, `ScopeType`, `DuodenalBiopsiesTaken`, `NumberOfDuodenalBiopsies` and `FellowPresent`; a null count ("taken, number not stated") and a null scope are answers the models can agree on.
+- A strict majority (2 of 3) settles a disagreement, and the note is flagged for manual review. A field with no majority (one against one, or three different answers) is left empty, and the note is flagged.
+- Scope names that differ only in form (`Olympus GIF-H190`, `GIF-H190`, `GIF-H 190`) count as the same scope: the form most models gave is kept (the fullest on a tie) and the difference is noted in `Agreement` without a flag. `Olympus gastroscope` against `Olympus GIF-H190` is a disagreement.
+- The agreed fields must agree with each other, as one model's answer must: `FellowPresent` 1 without a procedure, duodenal biopsies without an upper endoscopy, or a scope name without one, is left empty.
+- Each `...Information` column is the quote of a model that gave the agreed answer: the quote most of them gave, the first model's on a tie, and for the biopsy sentence one from a model that also gave the agreed count. It is null when the flag is not 1.
+- `ManualReviewRequired (consensus)` is `true`, with every trigger in `ManualReviewReason (consensus)`, when a model has not analysed the note; when no model, or only one, gave an answer the note supports (one answer is not a consensus, so the fields stay empty and the reason points at that model's columns); when a model failed (the consensus rests on the others); when the models disagreed on a field; and when the agreed answer leaves a study field open (an upper endoscopy without a scope name, biopsies taken without a count). A model's own `ManualReviewRequired` does not carry over: it describes how that model reached its answer, and the consensus is judged on whether the models agree.
+- `Outcome` is `unanimous` (every model answered and they agree on every field), `majority` (every field has a value, but one was settled by a majority or a model gave no answer), `partial` (a field was left empty) or `none` (no consensus). `Models` lists the models consulted, marking those that failed or have not run; `Agreement` says how many answered and how they voted on every field they did not simply agree on. Neither holds note text, only scope names, counts and model labels.
+
+The consensus needs at least two models: a run with one model gets an empty block with `Outcome` `none` on every note.
 
 **Notes too long for the context window are not sent to the model.** Ollama does not refuse an over-long prompt: it keeps a few leading tokens and the tail that fits, silently dropping the instructions and the start of the note, so any answer would be a guess. `data_worker` checks the length first (`llm_analysis.note_fits_context`, a conservative estimate of 3 characters per token plus the prompt overhead) and records such a note with `LLM_Failed = 1`, `LLM_Attempts = 0` and the reason in `LLM_Error`, without a model call. At the default 8192-token window the cut is about 18,000 characters of note; 7 of the 275 sample notes and 111 of the 5,000 corpus notes (about 2%) are longer and are recorded as failed. 8192 is the window at which medgemma:27b and its KV cache fit on Argon's A10; a larger `NLP_CONTEXT_LENGTH` raises the cut but spills the model to the CPU there.
 
@@ -473,7 +499,11 @@ Generated in `/output`:
 
 - `results.csv` – one row per note
 
-Columns, in order: the note identifiers (`id`, `mrn`, `encounter`, `note_csn_id`, `note_date`, `note_type`); then one block per model, every column of it named `<field> (<model>@<context>)`, for example `ScopeType (medgemma:27b@8192)`: the ten extracted fields (`ScopeType`, `Colonoscopy`, `ColonoscopyInformation`, `Endoscopy`, `EndoscopyInformation`, `NumberOfDuodenalBiopsies`, `DuodenalBiopsiesTaken`, `DuodenalBiopsiesInformation`, `FellowPresent`, `FellowInformation`), the review columns (`ManualReviewRequired`, `ManualReviewReason`) and the debugging columns (`LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `LLM_Rejections`, `RawResponse`); and the note text last. The label is the model's full name and the context window it was called with, so answers from different models (or the same model at another window size) are never mixed.
+Columns, in order: the note identifiers (`id`, `mrn`, `encounter`, `note_csn_id`, `note_date`, `note_type`); then the consensus block, every column of it named `<field> (consensus)`: the ten fields (`ScopeType`, `Colonoscopy`, `ColonoscopyInformation`, `Endoscopy`, `EndoscopyInformation`, `NumberOfDuodenalBiopsies`, `DuodenalBiopsiesTaken`, `DuodenalBiopsiesInformation`, `FellowPresent`, `FellowInformation`), the review columns (`ManualReviewRequired`, `ManualReviewReason`) and `Outcome`, `Models`, `Agreement`; then one block per model, every column of it named `<field> (<model>@<context>)`, for example `ScopeType (medgemma:27b@8192)`: the same ten fields, the review columns and the debugging columns (`LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `LLM_Rejections`, `RawResponse`); and the note text last. The label is the model's full name and the context window it was called with, so answers from different models (or the same model at another window size) are never mixed.
+
+The consensus block is the study's answer; the model blocks are the evidence behind it:
+
+- A consensus field is filled only where at least two models agree (a strict majority on a disagreement); otherwise it is empty. `ManualReviewRequired (consensus)` is `true` wherever a model failed, has not run or disagreed, where only one model answered, or where the agreed answer leaves a field open; `ManualReviewReason (consensus)` lists why, and `Agreement (consensus)` shows every model's value for each disputed field. Filter on `ManualReviewRequired (consensus)` to get the review queue, and on `Outcome (consensus)` = `unanimous` for the rows every model agreed on. See `consensus.py` above for the rules.
 
 Within each model's block:
 

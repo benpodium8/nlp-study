@@ -120,8 +120,11 @@ notes.csv ──> SQLite notes table
                  │
                  ▼  data_worker.py, one note at a time
        ┌──────────────────────────────┐
-       │ llm_analysis.py (Ollama LLM) │──> results (extracted fields + debugging columns + raw LLM text)
+       │ llm_analysis.py (Ollama LLM) │──> results (extracted fields + debugging columns + raw LLM text, one block per model)
        └──────────────────────────────┘
+                 │
+                 ▼  consensus.py, after every model has run
+                     results (the consensus block: the fields the models agree on, its review flag)
                  │
                  ▼  database.py export (write-once)
                      output/results.csv
@@ -133,7 +136,7 @@ notes.csv ──> SQLite notes table
 | --- | --- |
 | `python app.py` | Prints what the program needs, typical use, and a status check of the current directory (Ollama reachable, model pulled, notes in `data.db` and how many are pending, export present), then exits 0. On a login node the Ollama line says NOT reachable, which is expected there; the probe is a 3 s client request and starts nothing |
 | `python app.py --csv FILE` | Ingests the CSV (duplicates skipped) and reports rows read, notes added and duplicates skipped |
-| `python app.py --analyze --csv FILE` | Ingests, runs each of the three models on every note that lacks its result, writes `output/results.csv` |
+| `python app.py --analyze --csv FILE` | Ingests, runs each of the three models on every note that lacks its result, rebuilds the consensus block for every note, writes `output/results.csv` |
 | `python app.py --analyze` | Same, without ingesting. Resumes an interrupted run |
 | `python app.py --clean` | Deletes `data.db` (with any `-journal`/`-wal`/`-shm` file) and `output/results.csv`, and `output/` if that leaves it empty. No prompt. Combined with `--csv`/`--analyze` it runs first, giving a fresh run; a missing `--csv` file aborts before anything is deleted |
 
@@ -169,6 +172,7 @@ What the researcher actually needs from these fields is in [15.5](#155-study-req
 
 - Ingest skips a row only if all six fields match an existing row exactly.
 - `data_worker` runs one model at a time and skips any note that already has a result under that model's label (its `LLM_Failed` column is not null).
+- The consensus block (`consensus.py`) is rebuilt for every note on every `--analyze`, from the stored answers of the run's models, so it never goes stale after a resume.
 - The export is skipped if `output/results.csv` already exists.
 
 ---
@@ -1217,6 +1221,7 @@ Things to hold in mind while changing the code, grouped by the layer they affect
 28. **The export is write-once.** `output/results.csv` is skipped if it already exists. After a resume the file on disk is stale (BACKLOG B17).
 29. **Ingest dedup is whole-row equality and quadratic.** A trailing space in one field creates a second note; identical notes under different CSN ids are analysed twice (BACKLOG B16).
 30. **CSV contract is strict and case-sensitive** (`REQUIRED_CSV_COLUMNS` in `database.py`; the error names the missing columns and the header found), opened with `encoding="utf-8"`. Switching to `encoding="utf-8-sig"` would make BOM-prefixed exports work. `EncounterID` would still need renaming unless the required set is widened (BACKLOG B7).
+31. **The consensus block is derived, never edited.** `consensus.py` rebuilds it for every note from the model blocks on each `--analyze`, over the models of that run (`--location`), so a hand edit in `data.db` is lost on the next run, and a run with a different model set replaces the consensus with that set's; `Models (consensus)` records which labels built each row. A consensus value needs two agreeing models, so a one-model run leaves the block empty with `Outcome` `none`. If you add a field, add it to the vote (`VOTED_FIELDS`) or to the evidence rule (`EVIDENCE_FOR_FLAG`) as well.
 
 ### 15.4 Operations and HIPAA
 
@@ -1410,12 +1415,14 @@ From the 19:22 and 19:33 server logs, Ollama 0.32.14 inside the container on a c
 
 **results** (one row per note id, one block of columns per model): every column is named `<field> (<model>@<context>)`, the label being the model's full name and the context window it was called with (`llm_analysis.ModelSpec.label`, today `medgemma:27b@8192`), so two models, or one model at two window sizes, never share a column, and SQL must double-quote the names. A block holds the ten extracted fields (`ScopeType`, `Colonoscopy`, `ColonoscopyInformation`, `Endoscopy`, `EndoscopyInformation`, `NumberOfDuodenalBiopsies`, `DuodenalBiopsiesTaken`, `DuodenalBiopsiesInformation`, `FellowPresent`, `FellowInformation`), the review columns `ManualReviewRequired` and `ManualReviewReason`, and six debugging columns: `LLM_Failed` (1 when no attempt gave an answer the note supports, or the call failed; the extracted fields are then null; null means the model has not run on the note), `LLM_Attempts` (model calls made for the note), `LLM_Seconds` (wall-clock time over all attempts), `LLM_Error` (the final error message when it failed), `LLM_Rejections` (why each rejected attempt was rejected) and `RawResponse` (verbatim text of the accepted model response, for audit). It carries no `note_csn_id`, so selecting the EGD cohort by CSN needs a join with `notes` (BACKLOG B20); `results.csv` is that join. `create_db` converts a table from before the labels (bare field names) into the first model's block, adds any column a block lacks, and adds a whole block for a model that has not run on that `data.db`.
 
+The same row holds the **consensus block**, labelled `(consensus)` (`ScopeType (consensus)` and so on; `database.CONSENSUS_COLUMNS`): the ten fields the models agree on, `ManualReviewRequired` and `ManualReviewReason` for the consensus, and `Outcome` (`unanimous`, `majority`, `partial` or `none`), `Models` (the labels consulted, marking those that failed or have not run) and `Agreement` (how the models voted on each disputed field). `consensus.py` rebuilds it for every note after the models have run: a field is filled only where at least two models that answered agree (a strict majority settles a 2-against-1 split and flags the note; no majority leaves the field empty), and the note is flagged whenever a model failed, has not run or disagreed, when only one model answered, or when the agreed answer leaves a field open. The README's `consensus.py` section has the full rules.
+
 Until 2026-10-13 the tables were `working_results` (NLP and LLM answers side by side) and `final_results` (the reconciled subset). A `data.db` from before then still holds those two tables and no `results` table: `CREATE TABLE IF NOT EXISTS` adds `results` beside them, every note is analysed again, and the old tables are ignored. Start from a fresh `data.db` unless you want that.
 
 ### Files in `output/`
 
 | File | Content |
 | --- | --- |
-| `results.csv` | One row per note: `id`, `mrn`, `encounter`, `note_csn_id`, `note_date`, `note_type`; then one block per model, each column named `<field> (<model>@<context>)`: the ten extracted fields, `ManualReviewRequired`, `ManualReviewReason`, `LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `LLM_Rejections`, `RawResponse`; then `note` last |
+| `results.csv` | One row per note: `id`, `mrn`, `encounter`, `note_csn_id`, `note_date`, `note_type`; then the consensus block, each column named `<field> (consensus)`: the ten fields, `ManualReviewRequired`, `ManualReviewReason`, `Outcome`, `Models`, `Agreement`; then one block per model, each column named `<field> (<model>@<context>)`: the ten extracted fields, `ManualReviewRequired`, `ManualReviewReason`, `LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `LLM_Rejections`, `RawResponse`; then `note` last |
 
 It is written once and never overwritten. It contains PHI.

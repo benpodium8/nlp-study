@@ -586,7 +586,7 @@ NUMBER_WORDS["single"] = 1
 NO_SUM_RE = re.compile(r"includ|of which|total|\(", re.I)
 
 
-def _squash(text: str) -> str:
+def squash(text: str) -> str:
     """
     Lower-cases text and drops everything but letters and digits, so that a quote and the
     note can be compared regardless of spacing, punctuation, quotation marks and line breaks.
@@ -627,7 +627,7 @@ def _scope_in_note(scope: str, squashed_note: str) -> bool:
     The scope name occurs in the note as given, or, when the model joined a brand and a model
     number that the note states apart ("Olympus endoscope (GIF-H180)"), each part does.
     """
-    if _squash(scope) in squashed_note:
+    if squash(scope) in squashed_note:
         return True
     parts = re.findall(r"[a-z0-9]+", scope.lower())
     return bool(parts) and all(part in squashed_note for part in parts)
@@ -671,12 +671,12 @@ def verify_against_note(result: dict, note: str):
     state or that is a colonoscope, or a biopsy count the quoted sentence does not state.
     The message says what was wrong, for the retry prompt and for LLM_Error.
     """
-    squashed_note = _squash(note)
+    squashed_note = squash(note)
 
     # Every quote must come from the note.
     for field in EVIDENCE_FOR_FLAG.values():
         quote = result[field]
-        if quote is not None and _squash(quote) not in squashed_note:
+        if quote is not None and squash(quote) not in squashed_note:
             raise RetryableLLMError(
                 f"{field} is not a sentence from the note. Copy the sentence exactly as the "
                 f"note has it, or answer 0 with {field} null if the note does not support it.",

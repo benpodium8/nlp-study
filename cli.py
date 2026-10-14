@@ -2,6 +2,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from consensus import consolidate
 from database import REQUIRED_CSV_COLUMNS, create_db, database_status, ingest_csv, export_results
 from data_worker import data_worker
 from llm_analysis import LOCATIONS, MODELS, ModelSpec, model_served, ollama_status
@@ -23,7 +24,8 @@ Reads notes from a CSV into a local SQLite database ({DB_PATH}), sends each note
 each of the study models, one model at a time:
   {MODEL_NAMES}
 through Ollama, stores every model's answers next to the note in columns labelled with the
-model name and context window, for example "ScopeType ({MODELS[0].label})", and writes
+model name and context window, for example "ScopeType ({MODELS[0].label})", consolidates
+the models' answers into a cautious consensus block labelled "(consensus)", and writes
 {EXPORT_PATH}. Nothing leaves this machine. --location local runs the same pipeline with
 small stand-in models ({LOCAL_MODEL_NAMES}) for a workstation test.
 
@@ -48,22 +50,33 @@ What the program needs
 
 Typical use
   python app.py --csv notes.csv             ingest only (no model needed)
-  python app.py --analyze --csv notes.csv   ingest, analyse every note with every model, write {EXPORT_PATH}
-  python app.py --analyze                   resume: analyse only the notes a model has no result for
+  python app.py --analyze --csv notes.csv   ingest, analyse every note with every model, build the
+                                            consensus, write {EXPORT_PATH}
+  python app.py --analyze                   resume: analyse only the notes a model has no result for,
+                                            then rebuild the consensus
   python app.py --analyze --location local  workstation test: the same run with the small
                                             models, each stored under its own label
   python app.py --clean                     delete {DB_PATH} and {EXPORT_PATH} from earlier runs
   python app.py --clean --analyze --csv notes.csv   start over from scratch
 
 Output
-  {EXPORT_PATH}   one row per note: the identifiers, then one block of columns per
-                       model, each column named "<field> (<model>@<context>)", for example
-                       "ScopeType ({MODELS[0].label})". A block holds the ten extracted
-                       fields, ManualReviewRequired ("true"/"false") with ManualReviewReason,
-                       and the debugging columns (LLM_Failed, LLM_Attempts, LLM_Seconds,
-                       LLM_Error, LLM_Rejections, RawResponse). The note text comes last.
-                       A note whose answers the note text does not support is recorded
-                       with LLM_Failed 1, empty fields and the reason in LLM_Error.
+  {EXPORT_PATH}   one row per note: the identifiers; the consensus block, each column
+                       named "<field> (consensus)"; one block of columns per model, each
+                       column named "<field> (<model>@<context>)", for example
+                       "ScopeType ({MODELS[0].label})"; and the note text last.
+                       The consensus block holds the ten fields the models agree on: a
+                       value needs at least two models that answered and agree, a strict
+                       majority settles a disagreement (and flags the note), and a field
+                       with no majority stays empty. ManualReviewRequired ("true"/"false")
+                       with ManualReviewReason flags every note where a model failed or
+                       disagreed, or the agreed answer leaves a study field open; Outcome
+                       (unanimous, majority, partial, none), Models and Agreement say how
+                       the consensus was reached. A model's block holds the ten extracted
+                       fields, its own ManualReviewRequired with ManualReviewReason, and
+                       the debugging columns (LLM_Failed, LLM_Attempts, LLM_Seconds,
+                       LLM_Error, LLM_Rejections, RawResponse). A note whose answers the
+                       note text does not support is recorded with LLM_Failed 1, empty
+                       fields and the reason in LLM_Error.
                        Write-once: move it aside to regenerate it from the database.
   {DB_PATH}              the same data, kept for audit and for resuming.
   Both contain PHI; treat them accordingly."""
@@ -95,7 +108,10 @@ def setup_parser():
     parser.add_argument(
         "--analyze",
         action="store_true",
-        help=f"Run each model on every note that has no result for it yet, then write {EXPORT_PATH}",
+        help=(
+            f"Run each model on every note that has no result for it yet, rebuild the consensus "
+            f"of the models for every note, then write {EXPORT_PATH}"
+        ),
     )
 
     parser.add_argument(
@@ -218,6 +234,7 @@ def main():
                 sys.exit(1)
         if args.analyze:
             data_worker(conn, models)
+            consolidate(conn, models)
             export_results(conn)
     finally:
         conn.close()

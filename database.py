@@ -51,6 +51,17 @@ DEBUG_FIELDS = (
 # per model, and so does the export.
 RESULTS_COLUMNS = RESULT_FIELDS + REVIEW_FIELDS + DEBUG_FIELDS
 
+# The consensus block (consensus.py) consolidates the models' answers for a note. It is
+# stored and exported under this label, "ScopeType (consensus)" and so on, with the ten
+# fields, the review columns, and three columns that say how the consensus was reached.
+CONSENSUS_LABEL = "consensus"
+CONSENSUS_FIELDS = (
+    ("Outcome", "TEXT"),    # unanimous, majority, partial or none (consensus.OUTCOMES)
+    ("Models", "TEXT"),     # the model labels consulted, "; "-separated, each marked (failed) or (not analysed) when it gave no answer
+    ("Agreement", "TEXT"),  # how many models answered and how they voted on each field they did not agree on
+)
+CONSENSUS_COLUMNS = RESULT_FIELDS + REVIEW_FIELDS + CONSENSUS_FIELDS
+
 # Every model's block is labelled with the model's name and context window, as
 # llm_analysis.ModelSpec.label gives it ("medgemma:27b@8192"): the column that holds a field
 # for that model is named "<field> (<label>)", e.g. "ScopeType (medgemma:27b@8192)". Two
@@ -121,11 +132,14 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> list[tuple[str, str]
 
 
 def results_labels(conn: sqlite3.Connection) -> list[str]:
-    """The model labels that have columns in the results table, in the order they were added."""
+    """
+    The model labels that have columns in the results table, in the order they were added.
+    The consensus block is not a model's and is left out.
+    """
     labels = []
     for name, _ in _table_columns(conn, "results"):
         label = column_label(name)
-        if label is not None and label not in labels:
+        if label is not None and label != CONSENSUS_LABEL and label not in labels:
             labels.append(label)
     return labels
 
@@ -139,7 +153,7 @@ def create_db(db_path: Path, labels=(), legacy_label: str | None = None):
     become the block of legacy_label, the first model of the default list (those answers
     came from that model, whatever model this run uses), so an existing data.db keeps its
     results. Any column a label's block lacks is added, and the review columns are filled
-    for results stored before they existed.
+    for results stored before they existed. The consensus block is added the same way.
 
     Parameters:
         db_path: Path to the database file.
@@ -162,6 +176,7 @@ def create_db(db_path: Path, labels=(), legacy_label: str | None = None):
         for label in labels:
             _add_missing_result_columns(conn, label)
             _backfill_manual_review(conn, label)
+        _add_missing_result_columns(conn, CONSENSUS_LABEL, CONSENSUS_COLUMNS)
     return conn
 
 
@@ -208,20 +223,21 @@ def _label_legacy_columns(conn: sqlite3.Connection, label: str) -> bool:
     return True
 
 
-def _add_missing_result_columns(conn: sqlite3.Connection, label: str):
+def _add_missing_result_columns(conn: sqlite3.Connection, label: str, columns=RESULTS_COLUMNS):
     """
-    Adds every column of label's block that the results table lacks: the whole block for
-    a model that has not been run on this database, or a column introduced since.
+    Adds every column of label's block (columns: a model's RESULTS_COLUMNS, or the
+    CONSENSUS_COLUMNS) that the results table lacks: the whole block for a model that has
+    not been run on this database, or a column introduced since.
     Existing rows get NULL in any column added here.
     """
     existing = {name for name, _ in _table_columns(conn, "results")}
     added = []
-    for field, sqltype in RESULTS_COLUMNS:
+    for field, sqltype in columns:
         name = column_name(field, label)
         if name not in existing:
             conn.execute(f"ALTER TABLE results ADD COLUMN {quoted(name)} {sqltype};")
             added.append(name)
-    if len(added) == len(RESULTS_COLUMNS):
+    if len(added) == len(columns):
         print(f"Added the result columns for {label!r} to the results table.")
     elif added:
         print(f"Added missing column(s) {', '.join(added)} to the results table.")
@@ -380,6 +396,17 @@ def database_status(db_path: Path, labels=(), legacy_label: str | None = None) -
                 done = conn.execute("SELECT COUNT(*) FROM results WHERE LLM_Failed IS NOT NULL;").fetchone()[0]
                 where = f"; the next run labels them {legacy_label!r}" if legacy_label else ""
                 lines.append(f"{done} result(s) in unlabelled columns from an earlier version{where}")
+            if column_name("ManualReviewRequired", CONSENSUS_LABEL) in names:
+                built, review = conn.execute(
+                    f"SELECT COUNT(*), COALESCE(SUM({_col('ManualReviewRequired', CONSENSUS_LABEL)} = 'true'), 0) "
+                    f"FROM results WHERE {_col('ManualReviewRequired', CONSENSUS_LABEL)} IS NOT NULL;"
+                ).fetchone()
+                lines.append(
+                    f"{CONSENSUS_LABEL}: {built} consolidated ({review} flagged for manual review), "
+                    f"{notes - built} not consolidated yet (--analyze rebuilds the consensus)"
+                )
+            else:
+                lines.append(f"{CONSENSUS_LABEL}: not built yet (--analyze builds it after the models run)")
         finally:
             conn.close()
     except sqlite3.Error as e:
@@ -431,33 +458,85 @@ def insert_result(
         "RawResponse": raw_response,
     }
     values = (*extracted, *review, *(debug[name] for name, _ in DEBUG_FIELDS))
-    assignments = ", ".join(f"{_col(field, label)} = ?" for field, _ in RESULTS_COLUMNS)
 
     with conn:
-        conn.execute("INSERT OR IGNORE INTO results (id) VALUES (?);", (id,))
-        conn.execute(f"UPDATE results SET {assignments} WHERE id = ?;", (*values, id))
+        _write_block(conn, id, label, RESULTS_COLUMNS, values)
+
+
+def _write_block(conn: sqlite3.Connection, id: int, label: str, columns, values):
+    """
+    Writes one block of columns (a model's RESULTS_COLUMNS or the CONSENSUS_COLUMNS, values
+    in the same order) for note id, creating the note's results row if it has none. Commits
+    nothing itself: the caller holds the transaction.
+    """
+    assignments = ", ".join(f"{_col(field, label)} = ?" for field, _ in columns)
+    conn.execute("INSERT OR IGNORE INTO results (id) VALUES (?);", (id,))
+    conn.execute(f"UPDATE results SET {assignments} WHERE id = ?;", (*values, id))
+
+
+def model_answers(conn: sqlite3.Connection, labels) -> list[tuple[int, list[tuple]]]:
+    """
+    Every note's answers from the models with the given labels, for the consensus: a list of
+    (note id, [(label, LLM_Failed, LLM_Error, fields), ...]) in id and label order, where
+    fields is the dict of RESULT_FIELDS values. LLM_Failed is None (and the fields null) for
+    a model that has not analysed the note, or whose block the table lacks.
+    """
+    existing = {name for name, _ in _table_columns(conn, "results")}
+    wanted = [(label, field) for label in labels for field in ("LLM_Failed", "LLM_Error", *(f for f, _ in RESULT_FIELDS))]
+    select = ", ".join(
+        f"results.{_col(field, label)}" if column_name(field, label) in existing else "NULL"
+        for label, field in wanted
+    )
+    rows = conn.execute(
+        f"SELECT notes.id, {select} FROM notes LEFT JOIN results ON notes.id = results.id ORDER BY notes.id;"
+    ).fetchall()
+
+    width = 2 + len(RESULT_FIELDS)
+    answers = []
+    for row in rows:
+        per_model = []
+        for index, label in enumerate(labels):
+            llm_failed, error, *values = row[1 + index * width : 1 + (index + 1) * width]
+            fields = dict(zip((f for f, _ in RESULT_FIELDS), values))
+            per_model.append((label, llm_failed, error, fields))
+        answers.append((row[0], per_model))
+    return answers
+
+
+def store_consensus(conn: sqlite3.Connection, rows: dict[int, dict]):
+    """
+    Stores the consensus block for every note in rows ({note id: values}, values keyed by
+    the CONSENSUS_COLUMNS field names, as consensus.consensus returns them), in one
+    transaction, replacing whatever consensus the notes had.
+    """
+    with conn:
+        for id, values in rows.items():
+            _write_block(conn, id, CONSENSUS_LABEL, CONSENSUS_COLUMNS, tuple(values[f] for f, _ in CONSENSUS_COLUMNS))
 
 
 def export_columns(conn: sqlite3.Connection) -> list[str]:
     """
-    The result columns the export carries, in order: one block per model label (in the order
-    the labels were added), each in RESULTS_COLUMNS order. A column the table lacks is skipped.
+    The result columns the export carries, in order: the consensus block first (when the
+    table has it), then one block per model label (in the order the labels were added), each
+    block in its column order. A column the table lacks is skipped.
     """
     existing = {name for name, _ in _table_columns(conn, "results")}
+    blocks = [(CONSENSUS_LABEL, CONSENSUS_COLUMNS)] + [(label, RESULTS_COLUMNS) for label in results_labels(conn)]
     return [
         column_name(field, label)
-        for label in results_labels(conn)
-        for field, _ in RESULTS_COLUMNS
+        for label, columns in blocks
+        for field, _ in columns
         if column_name(field, label) in existing
     ]
 
 
 def export_results(conn: sqlite3.Connection, output_folder="output"):
     """
-    Writes every note with each model's labelled result columns to output_folder/results.csv,
-    creating the folder if needed: the identifiers first, then one block of columns per
-    model, then the note text last. The file is written only if it does not already exist
-    (write-once); an existing file is left alone and a message is printed.
+    Writes every note with the consensus block and each model's labelled result columns to
+    output_folder/results.csv, creating the folder if needed: the identifiers first, then
+    the consensus block, then one block of columns per model, then the note text last. The
+    file is written only if it does not already exist (write-once); an existing file is left
+    alone and a message is printed.
     """
     output_path = Path(output_folder)
     output_path.mkdir(parents=True, exist_ok=True)
