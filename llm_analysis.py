@@ -102,6 +102,11 @@ def estimated_prompt_tokens(note: str) -> int:
     return PROMPT_OVERHEAD_TOKENS + int(len(note) / NOTE_CHARS_PER_TOKEN)
 
 
+def max_note_chars(context_length: int = CONTEXT_LENGTH) -> int:
+    """The longest note (in characters) whose prompt, plus a normal answer, fits context_length tokens."""
+    return int((context_length - ANSWER_RESERVE_TOKENS - PROMPT_OVERHEAD_TOKENS) * NOTE_CHARS_PER_TOKEN)
+
+
 def note_fits_context(note: str, context_length: int = CONTEXT_LENGTH) -> bool:
     """Whether the prompt for note, plus a normal answer, fits a context window of context_length."""
     return estimated_prompt_tokens(note) + ANSWER_RESERVE_TOKENS <= context_length
@@ -328,12 +333,37 @@ class RetryableLLMError(LLMAnalysisError):
         super().__init__(message)
 
 
+class ModelInfo(NamedTuple):
+    """What the server lists about one pulled model."""
+    name: str
+    size_bytes: int | None       # on disk
+    parameter_size: str | None   # "26.4B"
+    quantization: str | None     # "Q4_K_M"
+
+    def describe(self) -> str:
+        """'26.4B parameters, Q4_K_M, 17.4 GB on disk', with whatever the server gave."""
+        parts = []
+        if self.parameter_size:
+            parts.append(f"{self.parameter_size} parameters")
+        if self.quantization:
+            parts.append(self.quantization)
+        if self.size_bytes:
+            parts.append(f"{self.size_bytes / 1e9:.1f} GB on disk")
+        return ", ".join(parts) or "no details from the server"
+
+
 class OllamaStatus(NamedTuple):
     host: str                   # the server address the client uses
     reachable: bool             # the server answered /api/tags
     model_available: bool       # the requested model is among the models it serves
     detail: str                 # the error when unreachable, else the served model names
     served: tuple[str, ...] = ()  # the served model names, for checking further models
+    version: str | None = None  # the server's version, when it told us
+    infos: dict = {}            # served model name -> ModelInfo
+
+    def info(self, model: str) -> ModelInfo | None:
+        """The listing of model (or model:latest), if the server serves it."""
+        return self.infos.get(model) or self.infos.get(f"{model}:latest")
 
 
 def model_served(model: str, served: tuple[str, ...]) -> bool:
@@ -347,12 +377,66 @@ def ollama_status(model: str = LOCAL_MODEL, timeout: float = 3.0) -> OllamaStatu
     bounded by timeout seconds, and reports whether model is available there.
     """
     host = os.environ.get("OLLAMA_HOST") or DEFAULT_OLLAMA_HOST
+    version = None
     try:
-        models = ollama.Client(timeout=timeout).list().models
+        with ollama.Client(timeout=timeout) as client:
+            models = client.list().models
+            try:
+                version = client._client.get("/api/version").json().get("version")
+            except Exception:
+                pass  # an older server, or no /api/version: the version is just unknown
     except Exception as e:
         return OllamaStatus(host, False, False, f"{type(e).__name__}: {e}")
     names = tuple(m.model for m in models if m.model)
-    return OllamaStatus(host, True, model_served(model, names), ", ".join(names) or "no models pulled", names)
+    infos = {
+        m.model: ModelInfo(
+            m.model, m.size,
+            m.details.parameter_size if m.details else None,
+            m.details.quantization_level if m.details else None,
+        )
+        for m in models if m.model
+    }
+    return OllamaStatus(host, True, model_served(model, names), ", ".join(names) or "no models pulled", names, version, infos)
+
+
+class LoadResult(NamedTuple):
+    """How loading a model ahead of its first note went (load_model)."""
+    seconds: float
+    placement: str | None       # "100% GPU", "100% CPU" or "40%/60% CPU/GPU", as `ollama ps` puts it, with the loaded size
+    context_length: int | None  # the window the server loaded it with, when it says
+
+
+def load_model(spec: ModelSpec, timeout: float | None = None) -> LoadResult:
+    """
+    Loads spec's model into memory with the window and think setting the notes are sent
+    with (a chat call with no messages, which Ollama answers once the model is loaded), and
+    asks the server where it put it. Raises whatever the server raised.
+    """
+    import time
+    started = time.perf_counter()
+    with ollama.Client(timeout=timeout) as client:
+        client.chat(model=spec.name, messages=[], think=spec.think, options={"num_ctx": spec.num_ctx})
+        seconds = time.perf_counter() - started
+        placement = context_length = None
+        try:
+            for running in client.ps().models:
+                if model_served(spec.name, (running.model or "", running.name or "")):
+                    placement = _placement(running.size or 0, running.size_vram or 0)
+                    context_length = running.context_length
+        except Exception:
+            pass  # a server without /api/ps: the placement is just unknown
+    return LoadResult(seconds, placement, context_length)
+
+
+def _placement(size: int, size_vram: int) -> str:
+    """Where a loaded model sits, the way `ollama ps` reports it, with its loaded size."""
+    loaded = f"{size / 1e9:.1f} GB loaded"
+    if size_vram == 0:
+        return f"100% CPU, {loaded}"
+    if size_vram >= size:
+        return f"100% GPU, {loaded}"
+    cpu = round(100 * (size - size_vram) / size)
+    return f"{cpu}%/{100 - cpu}% CPU/GPU, {loaded}"
 
 
 def _strip_markdown_fences(text: str) -> str:
@@ -805,13 +889,17 @@ def verify_against_note(result: dict, note: str):
 
 
 def llm_analysis(
-    id: int, note: str, model: ModelSpec | str = LOCAL_MODEL, attempt: int = 1, rejected: str | None = None
+    id: int, note: str, model: ModelSpec | str = LOCAL_MODEL, attempt: int = 1, rejected: str | None = None,
+    observer=None,
 ) -> Tuple[dict, str]:
     """
     Analyzes a clinical note using an LLM (the Ollama model given by model, a ModelSpec or a
     bare model name called with the default context window) to extract the study fields.
     attempt (1-based) selects the generation options; see generation_options. rejected is the
     reason the previous attempt failed (a RetryableLLMError message); it is added to the prompt.
+    The response is streamed; observer, when given, is called with every chunk (an ollama
+    ChatResponse: a token of thinking or content, and last the done chunk with the server's
+    token counts and timings), so the caller can show what the model is doing.
 
     Raises:
         RetryableLLMError: the output was unusable or the note does not support the answer;
@@ -830,19 +918,26 @@ def llm_analysis(
         messages[1]["content"] += RETRY_PROMPT.format(reason=rejected)
 
     # Each call (every note and every retry) gets its own client, so its HTTP connection
-    # is closed when the call returns instead of being held open between notes.
+    # is closed when the call returns instead of being held open between notes. The answer
+    # is streamed token by token and joined here; the text is the same as an unstreamed call's.
+    content = []
     try:
         with ollama.Client() as client:
-            response = client.chat(model=spec.name, messages=messages, think=spec.think,
-                                   format=RESPONSE_SCHEMA, options=generation_options(attempt, spec.num_ctx))
+            stream = client.chat(model=spec.name, messages=messages, think=spec.think, stream=True,
+                                 format=RESPONSE_SCHEMA, options=generation_options(attempt, spec.num_ctx))
+            for chunk in stream:
+                if chunk.message.content:
+                    content.append(chunk.message.content)
+                if observer is not None:
+                    observer(chunk)
     except Exception as e:
         # Ollama stops a model that keeps repeating itself ("prediction aborted, token repeat
-        # limit reached", a 500). That is the repetition loop the retries exist for.
+        # limit reached", an error in the stream). That is the repetition loop the retries exist for.
         if "repeat limit" in str(e).lower():
             raise RetryableLLMError(f"the model repeated itself until Ollama stopped it ({e}).")
         raise LLMAnalysisError(f"LLM call failed: {e}")
 
-    raw = response["message"]["content"]
+    raw = "".join(content)
     try:
         parsed = _parse_and_check(id, note, raw)
     except RetryableLLMError as e:

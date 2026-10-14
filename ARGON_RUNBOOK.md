@@ -165,8 +165,8 @@ What the researcher actually needs from these fields is in [15.5](#155-study-req
 
 - `RetryableLLMError` (invalid JSON, a text field that reached the 1000-character cap, a missing field, wrong type, unexpected field, flag not 0/1, negative count): retried, up to 5 attempts total. Each retry is a complete generation with the rejection reason appended to the prompt (the rejected answer is not sent back), sampled at temperature 0.8 with `repeat_penalty` 1.1 and `seed` = attempt number.
 - `LLMAnalysisError` from the call itself (`LLM call failed: ...`, e.g. the server is down) or any other exception: stored immediately with `LLM_Failed = 1`, no retry.
-- Every note gets a `results` row, and every model its own block of columns in it (`<field> (<model>@<context>)`, Appendix D) with `LLM_Attempts`, `LLM_Seconds` and, on failure, `LLM_Error`. The log carries one timestamped line per note (`ok` or `FAILED`, with the time taken, the attempt count and the structured fields, never note text), a `retry` line with the reason for every retry, a `progress` line every 10 notes with the projected time remaining, and a final summary that lists the failed ids.
-- The loop never raises. The process exits 0 even when every note failed. This is why the preflight exists (section 6).
+- Every note gets a `results` row, and every model its own block of columns in it (`<field> (<model>@<context>)`, Appendix D) with `LLM_Attempts`, `LLM_Seconds` and, on failure, `LLM_Error`. The log (`reporter.py`) carries a run header (database, Ollama version, each model's size and quantization, the steps, the work left per model), a `load` line per model saying how long the load took and where the server put the model (`100% GPU` or a CPU share), one timestamped line per note (`ok` or `FAILED`, with the time taken, the attempt count, Ollama's prompt and answer token counts with the speed, and the structured fields, never note text), a `retry` line with the reason for every retry, a `progress` and a `fields` line every 10 notes with the projected time remaining for the model and for the rest of the run and the tally of the fields so far, a `...` heartbeat line every 60 s (`NLP_HEARTBEAT_SECONDS`) while a model call is in progress (the job log is not a terminal, so there is no live panel), a `Finished` summary per model that lists the failed ids and tallies the review and rejection reasons, the consensus summary with each model's agreement, and two closing tables.
+- Before each model the program checks that the server is reachable and the model is served; it stops a model's pass after 3 consecutive notes whose call failed (`LLM call failed`), after re-probing the server to say whether it died or the model is gone, and leaves the remaining notes pending. The export is skipped when the run is incomplete. Exit codes: 0 complete, 2 incomplete (a model skipped or the run stopped early), 130 on SIGINT (`qdel` sends SIGKILL after its grace period; the stored results are kept either way). A run where every note fails on content still exits 0, which is why the preflight exists (section 6).
 
 ### 2.4 Idempotency
 
@@ -483,7 +483,7 @@ tail -f /Users/apkane/nlp-study-logs/nlp-study.o<JOB_ID>
 qdel <JOB_ID>
 ```
 
-After the job ends, `qacct -j <JOB_ID>` shows exit status, wallclock, and `maxvmem`. The job log (`tail -f` above) carries one line per note with the time taken and the extracted flags, a `progress` line every 10 notes with the projected time remaining, and a final summary with the failed ids. Checking progress in the database while a job is running is also safe for reads:
+After the job ends, `qacct -j <JOB_ID>` shows exit status, wallclock, and `maxvmem`. The job log (`tail -f` above) carries one line per note with the time taken, the token counts and the extracted flags, a `...` heartbeat line every 60 s while a call is in progress (what the model is doing, tokens so far, time on the attempt), a `progress` line every 10 notes with the projected time remaining for the model and for the rest of the run, and a final summary with the failed ids (section 2.3). Checking progress in the database while a job is running is also safe for reads:
 
 ```bash
 sqlite3 /nfsscratch/Users/apkane/nlp-study/repo/data.db 'select count(*) notes, (select count(*) from results where "LLM_Failed (medgemma:27b@8192)" is not null) done, (select count(*) from results where "LLM_Failed (medgemma:27b@8192)"=1) llm_failed from notes;'
@@ -794,7 +794,7 @@ Regenerate with `NLP_JOB_QUEUE=UI-GPU NLP_JOB_GPU=1 ./setup.sh`, which bakes in 
 `NLP_SKIP_PREFLIGHT=1 qsub ~/nlp-study.job ...` bypasses it. Not recommended; it is the only thing standing between you and a silent all-null run.
 
 **Q: How do I watch progress?**
-`qstat -u apkane` for state, `tail -f ~/nlp-study-logs/nlp-study.o<JOB_ID>` for the log (one line per note, and a `progress` line with the projected time remaining every 10 notes), `~/nlp-study-logs/ollama-<JOB_ID>.log` for the server, and a read-only `sqlite3` count on `data.db` for notes done versus failed.
+`qstat -u apkane` for state, `tail -f ~/nlp-study-logs/nlp-study.o<JOB_ID>` for the log (one line per note, a `...` heartbeat every 60 s during a call, and a `progress` line with the projected time remaining every 10 notes; the `load` line says whether the model landed on the GPU), `~/nlp-study-logs/ollama-<JOB_ID>.log` for the server, and a read-only `sqlite3` count on `data.db` for notes done versus failed.
 
 **Q: The job log shows `exit 143`. Bug?**
 On any queue other than `all.q`, 143 usually means the memory limit was hit. `qacct -j <JOB_ID>` shows `maxvmem`. Request more slots or the `UI-HM` queue. On `all.q`, 143 means eviction by a higher-priority queue.

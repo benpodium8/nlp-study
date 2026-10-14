@@ -1,7 +1,10 @@
 import csv
 import re
 import sqlite3
+import time
+from collections import Counter
 from pathlib import Path
+from typing import NamedTuple
 
 
 NOTES_TABLE_SCHEMA = """
@@ -287,15 +290,33 @@ def label_context_length(label: str) -> int | None:
     return int(ctx) if ctx.isdigit() else None
 
 
-def ingest_csv(csv_path: Path, conn: sqlite3.Connection):
+# How often ingest_csv reports its progress (rows checked against the database).
+INGEST_PROGRESS_EVERY = 100
+
+
+class IngestSummary(NamedTuple):
+    """What ingest_csv read and added."""
+    rows: int                    # rows in the file
+    new: int                     # notes added
+    duplicates: int              # rows identical to a stored note, skipped
+    note_types: Counter          # NoteType -> rows in the file
+    new_note_lengths: list       # characters of each note added
+    seconds: float
+
+
+def ingest_csv(csv_path: Path, conn: sqlite3.Connection, report=print, progress=None) -> IngestSummary:
     """
     Ingests CSV data into the database, skipping duplicate rows.
     Raises ValueError, naming the headers found, when a REQUIRED_CSV_COLUMNS entry is missing.
+    Calls report with one summary line at the end and, when given, progress(checked, total,
+    new, duplicates) every INGEST_PROGRESS_EVERY rows while the rows are checked against the
+    database (the slow part of a large file).
 
     Parameters:
         csv_path: Path to the CSV file to ingest.
         conn: Database connection object.
     """
+    started = time.perf_counter()
     with csv_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
 
@@ -324,7 +345,9 @@ def ingest_csv(csv_path: Path, conn: sqlite3.Connection):
         new_rows = []
         duplicates_count = 0
 
-        for row in rows:
+        if progress is not None:
+            progress(0, len(rows), 0, 0)
+        for checked, row in enumerate(rows, start=1):
             cursor = conn.execute(CHECK_DUPLICATE_NOTE_SQL, row)
             count = cursor.fetchone()[0]
 
@@ -332,13 +355,20 @@ def ingest_csv(csv_path: Path, conn: sqlite3.Connection):
                 new_rows.append(row)
             else:
                 duplicates_count += 1
+            if progress is not None and (checked % INGEST_PROGRESS_EVERY == 0 or checked == len(rows)):
+                progress(checked, len(rows), len(new_rows), duplicates_count)
 
         if new_rows:
             conn.executemany(INSERT_NOTE_SQL, new_rows)
 
-    print(
-        f"Read {len(rows)} row(s) from {csv_path}: "
+    seconds = time.perf_counter() - started
+    report(
+        f"Read {len(rows)} row(s) from {csv_path} in {seconds:.1f}s: "
         f"{len(new_rows)} new note(s) added, {duplicates_count} duplicate(s) skipped."
+    )
+    return IngestSummary(
+        len(rows), len(new_rows), duplicates_count,
+        Counter(row[4] for row in rows), [len(row[5]) for row in new_rows], seconds,
     )
 
 
@@ -353,6 +383,60 @@ def pending_notes(conn: sqlite3.Connection, label: str) -> list[tuple[int, str]]
         ORDER BY notes.id;
         """
     ).fetchall()
+
+
+class ModelStatistics(NamedTuple):
+    """What the results stored under one model's label add up to (model_statistics)."""
+    analysed: int           # notes with a result
+    failed: int             # of which LLM_Failed
+    flagged: int            # of which ManualReviewRequired
+    sent: int               # of which were sent to the model (LLM_Attempts > 0)
+    retries: int            # rejected attempts over all notes
+    seconds: list           # LLM_Seconds of each note sent, in id order
+    fields: Counter         # egd, colonoscopy, biopsies, counted, fellow, scope: notes answering 1 (or naming a scope)
+
+    @property
+    def ok(self) -> int:
+        return self.analysed - self.failed
+
+    @property
+    def mean_seconds(self) -> float | None:
+        return sum(self.seconds) / len(self.seconds) if self.seconds else None
+
+    @property
+    def median_seconds(self) -> float | None:
+        return sorted(self.seconds)[len(self.seconds) // 2] if self.seconds else None
+
+
+def model_statistics(conn: sqlite3.Connection, label: str) -> ModelStatistics | None:
+    """The ModelStatistics of label's stored results, or None when the table has no block for it."""
+    existing = {name for name, _ in _table_columns(conn, "results")}
+    if column_name("LLM_Failed", label) not in existing:
+        return None
+    columns = (
+        "LLM_Failed", "LLM_Attempts", "LLM_Seconds", "LLM_Rejections", "ManualReviewRequired", "Endoscopy",
+        "Colonoscopy", "DuodenalBiopsiesTaken", "NumberOfDuodenalBiopsies", "FellowPresent", "ScopeType",
+    )
+    select = ", ".join(_col(field, label) if column_name(field, label) in existing else "NULL" for field in columns)
+    rows = conn.execute(f"SELECT {select} FROM results WHERE {_col('LLM_Failed', label)} IS NOT NULL ORDER BY id;").fetchall()
+    stats = ModelStatistics(len(rows), 0, 0, 0, 0, [], Counter())
+    failed = flagged = sent = retries = 0
+    for llm_failed, attempts, seconds, rejections, review, egd, colonoscopy, taken, count, fellow, scope in rows:
+        failed += llm_failed == 1
+        flagged += review == "true"
+        if attempts:
+            sent += 1
+            retries += len(rejections.split("\n")) if rejections else 0
+            if seconds is not None:
+                stats.seconds.append(seconds)
+        if not llm_failed:
+            stats.fields["egd"] += egd == 1
+            stats.fields["colonoscopy"] += colonoscopy == 1
+            stats.fields["biopsies"] += taken == 1
+            stats.fields["counted"] += taken == 1 and count is not None
+            stats.fields["fellow"] += fellow == 1
+            stats.fields["scope"] += scope is not None
+    return stats._replace(failed=failed, flagged=flagged, sent=sent, retries=retries)
 
 
 def database_status(db_path: Path, labels=(), legacy_label: str | None = None) -> list[str]:
@@ -530,24 +614,25 @@ def export_columns(conn: sqlite3.Connection) -> list[str]:
     ]
 
 
-def export_results(conn: sqlite3.Connection, output_folder="output"):
+def export_results(conn: sqlite3.Connection, output_folder="output", report=print) -> Path | None:
     """
     Writes every note with the consensus block and each model's labelled result columns to
     output_folder/results.csv, creating the folder if needed: the identifiers first, then
     the consensus block, then one block of columns per model, then the note text last. The
     file is written only if it does not already exist (write-once); an existing file is left
-    alone and a message is printed.
+    alone and a message is reported. Returns the path written, or None when it was not.
     """
+    started = time.perf_counter()
     output_path = Path(output_folder)
     output_path.mkdir(parents=True, exist_ok=True)
 
     output_file = output_path / "results.csv"
     if output_file.exists():
-        print(
+        report(
             f"File '{output_file}' already exists. Export skipped; "
             "move it aside and run --analyze again to regenerate it from the database."
         )
-        return
+        return None
 
     columns = export_columns(conn)
     cursor = conn.execute(
@@ -565,4 +650,9 @@ def export_results(conn: sqlite3.Connection, output_folder="output"):
             writer.writerow(row)
             row_count += 1
 
-    print(f"Wrote {row_count} row(s) to {output_file}.")
+    size = output_file.stat().st_size
+    report(
+        f"Wrote {row_count} row(s) and {len(column_names)} columns to {output_file} "
+        f"({size / 1e6:.1f} MB) in {time.perf_counter() - started:.1f}s."
+    )
+    return output_file

@@ -131,7 +131,7 @@ pip install -r requirements.txt
 | Package  | Purpose                     |
 | -------- | --------------------------- |
 | `ollama` | Interface to local LLM      |
-| `rich`   | Progress bar                |
+| `rich`   | Live panel and log lines    |
 
 ---
 
@@ -243,26 +243,97 @@ This will:
 
 Running `python app.py --analyze` again resumes: notes that already have a result for a model are skipped for that model. The consensus is rebuilt for every note on each run, so it always reflects every model's stored answers.
 
-While it runs, the program reports what it is doing:
+While it runs, the program reports what it is doing in two layers.
+
+**The log.** Timestamped lines, the same whether stdout is a terminal, a pipe or an SGE job log, so `tail -f` on a job log always shows where the run is:
+
+- a run header: the database and its note count, the Ollama version and address, each model with its parameter count, quantization and size, the steps to come, and the work left per model (pending notes, how many of them are too long to send, and the model's time per note so far when it has run before);
+- a `== Step n of m ==` marker per phase; after an ingest, the note types read and how many of the new notes exceed the context window;
+- per model: its details, what is pending, and a `load` line once it is in memory, with how long that took and where the server put it (`100% GPU`, or a CPU share: the first thing to look at when a model runs slowly);
+- one `ok` or `FAILED` line per note with the time taken, the attempts, Ollama's own prompt and answer token counts with the generation speed, the structured fields, and the review reason when the row is flagged; a `retry` line with the reason and the attempt's token counts for every rejected attempt;
+- a `progress` line every 10 notes (done, ok, failed, flagged, rejected attempts, seconds per note overall and over the last 10, elapsed, the time left for this model and for the rest of the run) followed by a `fields` line with the tally of the fields extracted so far and the most common rejection reasons;
+- when stdout is not a terminal, a `...` heartbeat line every 60 seconds (`NLP_HEARTBEAT_SECONDS`) while a model call is in progress: whether the model is still reading the prompt or already answering, how many tokens it has produced at what speed, and how long the attempt and the note have taken;
+- a `Finished` summary per model with the failed ids and the review and rejection reasons tallied; the consensus summary (outcomes, the fields the models disputed, each model's agreement with the consensus, the review reasons); the export line with rows, columns and size; and two closing tables of every model's stored results and field tallies, the outcome, and what to do next.
+
+**The live panel.** In a terminal, a panel at the bottom of the screen (refreshed four times a second, with the log lines scrolling above it) shows the note and attempt in progress, what the model is doing right now (waiting for the first token while the server reads the prompt, thinking, or answering, with the token count and the tokens per second over the last five seconds; its spinner turns faster the more tokens a second arrive, and crawls while none do), the progress bar, the running totals and rates, the time left for the model and for the run, and the field tally. `NLP_PLAIN=1` turns the panel off and gives the heartbeat lines instead.
+
+A workstation test (`--location local`, three small models, three notes, interrupted once and resumed) looks like this in a log:
 
 ```
-[15:48:30] Model: medgemma:27b@8192 (1 of 3)
-[15:48:30] 330 note(s) in the database, 0 already analysed with medgemma:27b@8192, 330 to process.
-[15:49:26] ok     note 1 (1/330) 56.2s, attempt 1: scope='Olympus H190' egd=1 colonoscopy=0 duodenal_biopsies=4 taken=1 fellow=1
-[15:50:40] retry  note 2: attempt 1/5 did not return valid JSON
-[15:51:55] ok     note 2 (2/330) 149.1s, attempt 2: scope=None egd=0 colonoscopy=0 duodenal_biopsies=0 taken=0 fellow=0
+[10:55:21] database  /home/ben/nlp-study/data.db · 0 notes
+[10:55:21] Ollama    version 0.40.3 at http://127.0.0.1:11434
+[10:55:21] models    3 (--location local): gemma3:4b@8192 (3.9B parameters, Q4_K_M, 3.4 GB on disk) · gemma4:e2b@8192 (4.6B parameters, Q4_K_M, 4.6 GB on disk) · qwen3.5:4b@8192 (4.2B parameters, Q4_K_M, 3.3 GB on disk)
+[10:55:21] steps     1. ingest three.csv · 2. analyse with 3 models · 3. build the consensus · 4. write output/results.csv
+[10:55:21] feedback  one line per note, one per rejected attempt, a progress summary every 10 notes, a heartbeat line every 5s during a long model call (NLP_HEARTBEAT_SECONDS)
+[10:55:21] == Step 1 of 4: Ingest three.csv ==
+[10:55:21] ingest    3/3 rows checked against the database: 3 new, 0 duplicates
+[10:55:21] Read 3 row(s) from three.csv in 0.0s: 3 new note(s) added, 0 duplicate(s) skipped.
+[10:55:21] types     Procedures 3
+[10:55:21] == Step 2 of 4: Analyse with 3 models ==
+[10:55:21] work      9 model calls at least: gemma3:4b@8192 3 pending · gemma4:e2b@8192 3 pending · qwen3.5:4b@8192 3 pending
+[10:55:21] == Analyse · model 1 of 3: gemma3:4b@8192 ==
+[10:55:21] model     gemma3:4b: 3.9B parameters, Q4_K_M, 3.4 GB on disk; context 8,192 tokens; think=False
+[10:55:21] notes     3 note(s) in the database, 0 already analysed with gemma3:4b@8192, 3 to process.
+[10:55:21] load      loading gemma3:4b into memory, context 8,192 tokens ...
+[10:55:21] load      loaded in 0.0s: 100% GPU, 3.0 GB loaded
+[10:55:27] ...    note 1 (1/3) attempt 1/5: answering · 9 tokens · 4.0 tok/s · 0:00:06 on this attempt, 0:00:06 on this note; 0 done, 0 failed, 0:00:06 elapsed
+[10:55:42] retry  note 1 (1/3) attempt 1/5 rejected after 20.5s, 2,094 prompt + 154 answer tokens: EndoscopyInformation does not mention an upper endoscopy. Quote the sentence that documents the procedure being performed in this note, or answer 0.
 ...
-[16:02:10] FAILED note 7 (7/330) after 5 attempt(s), 301.4s: the output was not valid JSON (Expecting value: line 1 column 1 (char 0)).
-[16:08:33] progress 10/330 done, 1 failed, 68.1s per note, 0:11:21 elapsed, about 6:03:12 remaining
-...
-[21:51:02] Finished 330 note(s) with medgemma:27b@8192 in 6:02:32: 326 ok, 4 failed, 31 flagged for manual review, 65.9s per note.
-[21:51:02] Failed note id(s): 7, 118, 240, 301
-[21:51:02] Model: gemma4:26b-a4b-it-q4_K_M@8192 (2 of 3)
-[21:51:02] 330 note(s) in the database, 0 already analysed with gemma4:26b-a4b-it-q4_K_M@8192, 330 to process.
-...
+[10:57:37] FAILED note 1 (1/3) after 5 attempts, 28.6s, 10,762 prompt + 686 answer tokens, 24.9 tok/s: EndoscopyInformation does not mention an upper endoscopy. Quote the sentence that documents the procedure being performed in this note, or answer 0.
+[10:57:43] ...    note 2 (2/3) attempt 1/5: answering · 82 tokens · 25.0 tok/s · 0:00:05 on this attempt, 0:00:05 on this note; 1 done, 1 failed, 0:00:34 elapsed, about 0:00:52 left for this model
+[10:57:54] Interrupted. gemma3:4b@8192 had stored 1 of 3 notes in this pass; note 2 was in progress and is not stored. Every stored result is kept; resume with: python app.py --analyze --location local
 ```
 
-Only the structured fields are logged, never note text or the model's prose; the evidence sentences and raw responses are in the database and the export.
+The resumed run (`python app.py --analyze --location local`) continues with note 2 and goes on to the other models, the consensus and the export:
+
+```
+[10:57:54] == Analyse · model 1 of 3: gemma3:4b@8192 ==
+[10:57:54] notes     3 note(s) in the database, 1 already analysed with gemma3:4b@8192, 2 to process.
+...
+[10:58:38] ok     note 3 (2/2) 7.2s, attempt 2, 5,296 prompt + 375 answer tokens, 63.4 tok/s: scope='GIF-H 190' egd=1 colonoscopy=0 duodenal_biopsies=4 taken=1 fellow=0 review: accepted on attempt 2 after 1 rejected answer(s), repetition loops not counted; see LLM_Rejections
+[10:58:38] Finished 2 notes with gemma3:4b@8192 in 0:00:44: 1 ok, 1 failed, 2 flagged for manual review, 6 rejected attempts; 22.2s per note (median 37.1s); 16,421 prompt and 1,727 answer tokens, 47.1 tok/s.
+[10:58:38] fields   egd 1 · colonoscopy 0 · duodenal biopsies 1 (count stated 1) · fellow 0 · scope named 1
+[10:58:38] Failed note id(s): 2
+[10:58:38] Review reasons: no answer the note supports (1), accepted only after a rejected answer (1)
+[10:58:38] Rejection reasons: FellowInformation is not a sentence from the note (4), the model repeated itself until Ollama stopped it (1), ...
+...
+[10:58:46] == Analyse · model 3 of 3: qwen3.5:4b@8192 ==
+[10:58:46] load      loading qwen3.5:4b into memory, context 8,192 tokens ...
+[10:59:01] load      loaded in 14.3s: 94%/6% CPU/GPU, 3.2 GB loaded
+[10:59:06] ...    note 1 (1/3) attempt 1/5: waiting for the first token (the server is reading a prompt of about 2,267 tokens) · 0:00:05 on this attempt, 0:00:05 on this note; 0 done, 0 failed, 0:00:20 elapsed
+[10:59:16] ok     note 1 (1/3) 15.4s, attempt 1, 2,211 prompt + 88 answer tokens, 10.4 tok/s: scope=None egd=0 colonoscopy=0 duodenal_biopsies=0 taken=0 fellow=0
+...
+[11:00:10] == Step 2 of 3: Build the consensus ==
+[11:00:10] Consensus of 3 model(s) built for 3 note(s) in 0.0s: 1 unanimous, 2 by majority, 0 partial, 0 without consensus; 2 flagged for manual review.
+[11:00:10] Agreement with the consensus, over the field votes where a consensus value exists: gemma3:4b@8192 100.0% (6 of 6); gemma4:e2b@8192 100.0% (18 of 18); qwen3.5:4b@8192 100.0% (18 of 18).
+[11:00:10] Review reasons: a model failed on the note 2.
+[11:00:10] == Step 3 of 3: Write output/results.csv ==
+[11:00:10] Wrote 3 row(s) and 76 columns to output/results.csv (0.0 MB) in 0.0s.
+Results stored per model (every run so far)
+model           | analysed | ok | failed | flagged | rejected attempts | s/note | median | model time
+----------------+----------+----+--------+---------+-------------------+--------+--------+-----------
+gemma3:4b@8192  |        3 |  1 |      2 |       3 |                11 |   24.3 |   28.6 |    0:01:13
+gemma4:e2b@8192 |        3 |  3 |      0 |       0 |                 0 |    1.7 |    1.6 |    0:00:05
+qwen3.5:4b@8192 |        3 |  3 |      0 |       1 |                 1 |   23.1 |   20.4 |    0:01:09
+
+Notes answered with 1 (or a scope name) per model
+model           | egd | colonoscopy | duodenal biopsies | count stated | fellow | scope named
+----------------+-----+-------------+-------------------+--------------+--------+------------
+gemma3:4b@8192  |   1 |           0 |                 1 |            1 |      0 |           1
+gemma4:e2b@8192 |   2 |           0 |                 2 |            2 |      0 |           2
+qwen3.5:4b@8192 |   2 |           0 |                 2 |            2 |      0 |           2
+
+[11:00:10] elapsed   0:02:16
+[11:00:10] outcome   complete: 8 notes analysed in this run
+[11:00:10] export    output/results.csv (write-once; move it aside to regenerate it)
+[11:00:10] next      the review queue is every row with "ManualReviewRequired (consensus)" = true; "Outcome (consensus)" = unanimous marks the rows every model agreed on
+```
+
+The `load` line for `qwen3.5:4b` is the kind of thing to watch for: the server put 94% of it on the CPU and it ran at about 10 tokens per second, against 180 for `gemma4:e2b`, which sat entirely on the GPU.
+
+Only the structured fields are logged, never note text or the model's prose; the evidence sentences and raw responses are in the database and the export. Rejection reasons are logged without the rejected value.
+
+Before each model the program checks that Ollama is reachable (otherwise the run stops) and that the model is pulled (otherwise that model is skipped and its notes stay pending), and it stops a model's pass after three consecutive notes whose model call itself failed, since that means the server rather than the notes is the problem: the remaining notes stay pending for the next `--analyze`. The export is skipped when a run is incomplete, so a partial file never blocks the complete one (it is write-once). Ctrl-C stops the run cleanly: every stored result is kept, the note in progress is not stored, and `--analyze` resumes. Exit codes: 0 complete, 1 bad input, 2 incomplete (a model skipped or the run stopped early), 130 interrupted.
 
 ---
 
@@ -317,7 +388,8 @@ HIPAA:
 Responsibilities:
 
 - Argument parsing
-- Safe ordering of pipeline steps (ingest, then analyze, then export)
+- Safe ordering of pipeline steps (ingest, then analyze, then consensus, then export), each reported as a numbered step with the run header, the work plan and the closing summary
+- Exit codes: 0 complete, 1 bad input, 2 incomplete, 130 interrupted
 
 HIPAA:
 
@@ -365,9 +437,10 @@ Workflow, one model at a time (so Ollama holds a single model loaded), per note:
 
 Features:
 
-- One log line per note (time taken, attempts, and the extracted flags), a running summary every ten notes with the projected time remaining, and a final summary that lists the failed note ids
-- Progress bar with ETA when run in a terminal
+- Checks before each model that Ollama is reachable and the model is pulled, then loads the model and reports where the server placed it (GPU or CPU share) and how long it took
+- Streams every answer, so the reporter (`reporter.py`) can show what the model is doing while it works: one log line per note (time taken, attempts, prompt and answer tokens, speed, and the extracted flags), a running summary every ten notes with the projected time remaining for the model and the run, the tally of the fields so far, a final summary per model with the failed note ids and the review and rejection reasons, and in a terminal the live panel
 - Retry logic for malformed LLM output and for answers the note does not support; every retry is logged (without note text) and every rejection reason is kept in `LLM_Rejections`
+- Stops a model's pass after three consecutive notes whose model call failed (server down, model gone), leaving the rest pending, instead of recording every remaining note as failed
 - Graceful failure isolation: a failed note is recorded with `LLM_Failed = 1`, its attempt count and the error message, and the run continues. A note the model cannot answer in a way the note supports is a failure, not a guess
 
 HIPAA:
@@ -375,6 +448,18 @@ HIPAA:
 - Processes one note at a time in memory
 - No caching outside DB
 - Raw LLM output retained for audit
+
+---
+
+### `reporter.py`
+
+**Purpose:** Everything the program shows while it runs
+
+One `Reporter` receives every event from the CLI, the worker, the consensus and the export, and writes the timestamped log lines described under "Run Full Analysis Pipeline". When stdout is a terminal it also keeps the live panel (a `rich` live display, refreshed four times a second) fed from the streamed response of the note in progress: which attempt it is on, whether the server is still reading the prompt or the model is thinking or answering, tokens and tokens per second, the running totals, the time left for the model and the run, and the field tally. When stdout is not a terminal there is no panel; a heartbeat thread writes a `...` line every `NLP_HEARTBEAT_SECONDS` (default 60) while a call is in progress, so a job log always shows the program is alive and what it is waiting for. `NLP_PLAIN=1` forces the plain mode in a terminal.
+
+HIPAA:
+
+- Logs identifiers, counts, timings, token counts, the structured fields and rejection reasons without their values; never note text or model output
 
 ---
 

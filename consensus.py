@@ -16,6 +16,7 @@ A model's own ManualReviewRequired flag (review.py) does not carry over: it desc
 that model reached its answer; the consensus is judged on whether the models agree.
 """
 
+import time
 from collections import Counter
 from typing import NamedTuple, Sequence
 
@@ -160,13 +161,16 @@ def _evidence(flag: str, info: str, answered: Sequence[ModelAnswer], values: dic
     return max(quotes.values(), key=lambda q: q[1])[0] if quotes else None
 
 
-def consensus(answers: Sequence[ModelAnswer]) -> dict:
+def consensus(answers: Sequence[ModelAnswer], votes: dict | None = None) -> dict:
     """
     The consensus block for one note from the models' answers (one ModelAnswer per model
     consulted, in run order): the ten fields, ManualReviewRequired ("true"/"false") with
     ManualReviewReason, and Outcome, Models and Agreement (database.CONSENSUS_COLUMNS).
     No text from the note goes into the reason or the agreement: only scope names, numbers
     and model labels.
+    votes, when a dict is given, receives how each voted field went when at least two models
+    answered: field -> (decided, unanimous, labels of the answering models, labels of those
+    that gave the winning value), for the run's agreement tally.
     """
     values = {field: None for field, _ in RESULT_FIELDS}
     answered = [a for a in answers if a.answered]
@@ -212,6 +216,8 @@ def consensus(answers: Sequence[ModelAnswer]) -> dict:
         lines, empty, by_majority = [], [], []
         for field in VOTED_FIELDS:
             vote = _vote(field, answered)
+            if votes is not None:
+                votes[field] = (vote.decided, vote.unanimous, [a.label for a in answered], _agreeing(field, vote, answered))
             values[field] = vote.value
             if vote.text:
                 lines.append(vote.text)
@@ -266,25 +272,100 @@ def consensus(answers: Sequence[ModelAnswer]) -> dict:
     return values
 
 
-def consolidate(conn, models: Sequence[ModelSpec] = MODELS):
+def _agreeing(field: str, vote: _Vote, answered: Sequence[ModelAnswer]) -> list:
+    """The labels of the models whose value for field is the consensus value (any form of a scope)."""
+    if not vote.decided:
+        return []
+    if field == "ScopeType":
+        for cluster in _scope_clusters([(a.label, a.fields[field]) for a in answered]):
+            if cluster.value == vote.value:
+                return list(cluster.labels)
+        return []
+    return [a.label for a in answered if a.fields[field] == vote.value]
+
+
+# How often consolidate reports its progress (notes consolidated).
+CONSENSUS_PROGRESS_EVERY = 100
+
+# How a consensus review reason is counted in the summary: the first marker found in it.
+REASON_KEYS = (
+    ("has not analysed this note", "a model has not analysed the note"),
+    ("not sent to any model", "note too long for the window"),
+    ("no model gave an answer", "no model gave an answer the note supports"),
+    ("which is not a consensus", "only one model answered"),
+    ("failed on this note", "a model failed on the note"),
+    ("models disagree", "the models disagree on a field"),
+    ("left empty:", "fields in conflict, left empty"),
+    ("no scope name found", "upper endoscopy but no scope name"),
+    ("no count stated", "duodenal biopsies but no count"),
+)
+
+
+class ConsensusSummary(NamedTuple):
+    """What consolidate built, for the run's report."""
+    notes: int
+    outcomes: Counter          # Outcome -> notes
+    flagged: int               # notes with ManualReviewRequired (consensus) true
+    disputed: Counter          # field -> notes where the answering models did not all agree on it
+    agreement: dict            # label -> (votes agreeing with the decided consensus value, votes cast)
+    reasons: Counter           # review reason category -> notes
+    seconds: float
+
+
+def consolidate(conn, models: Sequence[ModelSpec] = MODELS, report=print, progress=None) -> ConsensusSummary:
     """
     Builds the consensus of the given models for every note in the database and stores it
     under the consensus label, replacing any earlier consensus (a model's answers may have
-    been added since). Prints one summary line.
+    been added since). Reports the summary lines through report (one line each) and, when
+    given, calls progress(done, total) every CONSENSUS_PROGRESS_EVERY notes.
     """
+    started = time.perf_counter()
     labels = [model.label for model in models]
+    answers = model_answers(conn, labels)
     rows = {}
     outcomes = Counter()
+    disputed = Counter()
+    reasons = Counter()
+    agreement = {label: [0, 0] for label in labels}
     flagged = 0
-    for note_id, per_model in model_answers(conn, labels):
-        row = consensus([ModelAnswer(*answer) for answer in per_model])
+    for done, (note_id, per_model) in enumerate(answers, start=1):
+        votes = {}
+        row = consensus([ModelAnswer(*answer) for answer in per_model], votes)
         rows[note_id] = row
         outcomes[row["Outcome"]] += 1
         flagged += row["ManualReviewRequired"] == "true"
+        for field, (decided, unanimous, voters, agreeing) in votes.items():
+            if not unanimous:
+                disputed[field] += 1
+            if decided:
+                for label in voters:
+                    agreement[label][1] += 1
+                    agreement[label][0] += label in agreeing
+        for reason in (row["ManualReviewReason"] or "").split("; "):
+            for marker, key in REASON_KEYS:
+                if marker in reason:
+                    reasons[key] += 1
+                    break
+        if progress is not None and (done % CONSENSUS_PROGRESS_EVERY == 0 or done == len(answers)):
+            progress(done, len(answers))
     store_consensus(conn, rows)
-    print(
-        f"Consensus of {len(labels)} model(s) built for {len(rows)} note(s): "
+    seconds = time.perf_counter() - started
+
+    report(
+        f"Consensus of {len(labels)} model(s) built for {len(rows)} note(s) in {seconds:.1f}s: "
         f"{outcomes['unanimous']} unanimous, {outcomes['majority']} by majority, "
         f"{outcomes['partial']} partial, {outcomes['none']} without consensus; "
         f"{flagged} flagged for manual review."
+    )
+    if disputed:
+        report("Fields the models did not all agree on: " + ", ".join(f"{field} {n}" for field, n in disputed.most_common()) + " note(s).")
+    if any(total for _, total in agreement.values()):
+        report("Agreement with the consensus, over the field votes where a consensus value exists: " + "; ".join(
+            f"{label} {100 * agree / total:.1f}% ({agree:,} of {total:,})" if total else f"{label} no votes"
+            for label, (agree, total) in agreement.items()
+        ) + ".")
+    if reasons:
+        report("Review reasons: " + ", ".join(f"{key} {n}" for key, n in reasons.most_common()) + ".")
+    return ConsensusSummary(
+        len(rows), outcomes, flagged, disputed, {label: tuple(pair) for label, pair in agreement.items()}, reasons, seconds,
     )
