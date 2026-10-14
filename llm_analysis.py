@@ -666,8 +666,12 @@ NUMBER_WORDS = {
 }
 NUMBER_WORDS["single"] = 1
 # A quote with one of these contains a number that is part of another ("6 ... including 2
-# from the bulb", "4 biopsies (one from the bulb)"), so its numbers must not be added up.
-NO_SUM_RE = re.compile(r"includ|of which|total|\(", re.I)
+# from the bulb", "4 biopsies (one from the bulb)", "5 biopsies with 2 from the bulb"), so its
+# numbers must not be added up. Either parenthesis counts: a quote may hold only the closing one.
+NO_SUM_RE = re.compile(r"includ|of which|total|[()]|\bwith\s+\w+\s+from\b", re.I)
+# Numbers in a biopsy sentence that are not counts: a duodenal site (D1 to D3, "D2-3", "D2-D3",
+# the 1st to 3rd portion).
+SITE_NUMBER_RE = re.compile(r"\bd\s?[123](\s?-\s?d?[123])?\b|\b[123](st|nd|rd)\b", re.I)
 
 
 def squash(text: str) -> str:
@@ -685,25 +689,47 @@ def _excerpt(text: str, limit: int = 80) -> str:
 
 
 def _numbers_in(text: str) -> list[int]:
-    """Every count-sized number in text, written as digits or as a word ("Six biopsies")."""
+    """
+    Every count-sized number in text, written as digits or as a word ("Six biopsies"); the
+    number of a duodenal site ("D2", "the 2nd portion") is not one.
+    """
+    text = SITE_NUMBER_RE.sub(" ", text)
     numbers = [int(digits) for digits in re.findall(r"\d+", text)]
     numbers += [NUMBER_WORDS[w] for w in re.findall(r"[a-z]+", text.lower()) if w in NUMBER_WORDS]
     return [n for n in numbers if 1 <= n <= MAX_PLAUSIBLE_BIOPSIES]
 
 
+def _additive(quote: str, numbers: list[int]) -> bool:
+    """
+    Whether the quote counts biopsies from two or more duodenal sites that add up ("4 biopsies
+    of the duodenum and 2 from the bulb", "4 for histopathology and 4 for disaccharidases"):
+    two or more numbers, none part of another (NO_SUM_RE) and no other organ counted
+    (OTHER_SITE_RE).
+    """
+    return len(numbers) >= 2 and not NO_SUM_RE.search(quote) and not OTHER_SITE_RE.search(quote)
+
+
+def summed_count_quote(quote: str) -> bool:
+    """
+    Whether a biopsy quote is additive (_additive): it counts biopsies from two or more parts
+    of the duodenum, and the duodenal total it supports is their sum. The consensus flags a
+    count that rests on such a sentence, so the researcher can confirm that reading.
+    """
+    return _additive(quote, _numbers_in(quote))
+
+
 def supported_counts(quote: str) -> set[int]:
     """
-    The duodenal biopsy counts a quoted sentence can support: each number it states, plus
-    the sum of its numbers when they are all duodenal sites to add up ("4 from the second
-    portion and 2 from the bulb" is 6). There is no sum when one number is part of another
-    ("6 biopsies ... including 2 from the bulb" is 6, not 8) or when the quote also counts
-    another organ.
+    The duodenal biopsy counts a quoted sentence can support. An additive sentence supports
+    only the sum of its numbers: "4 biopsies were taken of the duodenum and 3 additional from
+    the bulb" is 7, not 4 or 3, since the bulb is the duodenum. Any other sentence supports
+    each number it states: "6 biopsies ... including 2 from the bulb" is 6 (and never 8), and
+    a sentence that also counts another organ is not added up.
     """
     numbers = _numbers_in(quote)
-    counts = set(numbers)
-    if len(numbers) >= 2 and not NO_SUM_RE.search(quote) and not OTHER_SITE_RE.search(quote):
-        counts.add(sum(numbers))
-    return counts
+    if _additive(quote, numbers):
+        return {sum(numbers)}
+    return set(numbers)
 
 
 def _scope_in_note(scope: str, squashed_note: str) -> bool:
@@ -878,9 +904,17 @@ def verify_against_note(result: dict, note: str):
             f"number of biopsies the note states for the duodenum, or null when it states none."
         )
     if count:
-        supported = supported_counts(result["DuodenalBiopsiesInformation"])
+        quote = result["DuodenalBiopsiesInformation"]
+        supported = supported_counts(quote)
         if count not in supported:
-            stated = ", ".join(str(n) for n in sorted(supported)) or "no number"
+            numbers = _numbers_in(quote)
+            if _additive(quote, numbers):
+                stated = (
+                    f"{' and '.join(str(n) for n in numbers)} from different parts of the duodenum, "
+                    f"{sum(numbers)} in all, and the duodenal total is their sum"
+                )
+            else:
+                stated = ", ".join(str(n) for n in sorted(supported)) or "no number"
             raise RetryableLLMError(
                 f"NumberOfDuodenalBiopsies is {count} but DuodenalBiopsiesInformation states "
                 f"{stated}. Use the number the note states for the duodenum (bulb included, "

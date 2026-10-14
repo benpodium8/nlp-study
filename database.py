@@ -59,7 +59,7 @@ RESULTS_COLUMNS = RESULT_FIELDS + REVIEW_FIELDS + DEBUG_FIELDS
 # fields, the review columns, and three columns that say how the consensus was reached.
 CONSENSUS_LABEL = "consensus"
 CONSENSUS_FIELDS = (
-    ("Outcome", "TEXT"),    # unanimous, majority, partial or none (consensus.OUTCOMES)
+    ("Outcome", "TEXT"),    # unanimous, agreed, majority, partial or none (consensus.OUTCOMES)
     ("Models", "TEXT"),     # the model labels consulted, "; "-separated, each marked (failed) or (not analysed) when it gave no answer
     ("Agreement", "TEXT"),  # how many models answered and how they voted on each field they did not agree on
 )
@@ -558,12 +558,15 @@ def _write_block(conn: sqlite3.Connection, id: int, label: str, columns, values)
     conn.execute(f"UPDATE results SET {assignments} WHERE id = ?;", (*values, id))
 
 
-def model_answers(conn: sqlite3.Connection, labels) -> list[tuple[int, list[tuple]]]:
+def model_answers(conn: sqlite3.Connection, labels) -> list[tuple[int, str, str, list[tuple]]]:
     """
     Every note's answers from the models with the given labels, for the consensus: a list of
-    (note id, [(label, LLM_Failed, LLM_Error, fields), ...]) in id and label order, where
-    fields is the dict of RESULT_FIELDS values. LLM_Failed is None (and the fields null) for
-    a model that has not analysed the note, or whose block the table lacks.
+    (note id, note_type, note text, [(label, LLM_Failed, LLM_Error, fields), ...]) in id and
+    label order, where fields is the dict of RESULT_FIELDS values. LLM_Failed is None (and the
+    fields null) for a model that has not analysed the note, or whose block the table lacks.
+    The note's type and text are there for the consensus to judge whether a note without a
+    consensus could hold a study value, and to check the agreed FellowPresent against the
+    note's attestation (consensus.consensus).
     """
     existing = {name for name, _ in _table_columns(conn, "results")}
     wanted = [(label, field) for label in labels for field in ("LLM_Failed", "LLM_Error", *(f for f, _ in RESULT_FIELDS))]
@@ -572,7 +575,8 @@ def model_answers(conn: sqlite3.Connection, labels) -> list[tuple[int, list[tupl
         for label, field in wanted
     )
     rows = conn.execute(
-        f"SELECT notes.id, {select} FROM notes LEFT JOIN results ON notes.id = results.id ORDER BY notes.id;"
+        f"SELECT notes.id, notes.note_type, notes.note, {select} "
+        f"FROM notes LEFT JOIN results ON notes.id = results.id ORDER BY notes.id;"
     ).fetchall()
 
     width = 2 + len(RESULT_FIELDS)
@@ -580,10 +584,10 @@ def model_answers(conn: sqlite3.Connection, labels) -> list[tuple[int, list[tupl
     for row in rows:
         per_model = []
         for index, label in enumerate(labels):
-            llm_failed, error, *values = row[1 + index * width : 1 + (index + 1) * width]
+            llm_failed, error, *values = row[3 + index * width : 3 + (index + 1) * width]
             fields = dict(zip((f for f, _ in RESULT_FIELDS), values))
             per_model.append((label, llm_failed, error, fields))
-        answers.append((row[0], per_model))
+        answers.append((row[0], row[1], row[2], per_model))
     return answers
 
 

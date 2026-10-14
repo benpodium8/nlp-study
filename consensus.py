@@ -5,23 +5,32 @@ under the label "consensus" ("ScopeType (consensus)" and so on; database.CONSENS
 The consensus is cautious, the way the study wants it: a wrong value is worse than an empty
 one. A field gets a value only when at least two models gave an answer the note supports and
 they agree on it. A strict majority (2 of 3) settles a disagreement, and the note is then
-flagged for manual review; a field with no majority is left empty. The note is also flagged
-when a model failed or has not run, when only one model answered (one answer is not a
-consensus), and when the agreed answer leaves a study field open (an upper endoscopy without
-a scope name, biopsies taken without a count). The flag never changes a value; it says where
-a human should look. Every row records which models were consulted and how they voted
-(Models, Agreement, Outcome), so the consensus can be audited against the per-model columns.
+flagged for manual review; a field with no majority is left empty. The flag never changes a
+value; it says where a human should look, and it is raised only where a human can improve
+the row: the models disagree on a field; the agreed answer leaves a study field open (an
+upper endoscopy without a scope name); the note's own attestation contradicts the agreed
+FellowPresent; the agreed duodenal count is the sum of two counts in one sentence, a
+reading the researcher has not yet confirmed; or a note that could hold a study value (a
+procedure note type, upper endoscopy wording in the text, or a model's accepted answer that
+a procedure was performed) got no consensus because fewer than two models answered. A model
+that failed is an abstention, not a dissent: when the models that answered agree, the row is
+not flagged, and the failure stays on record in Models, Agreement and Outcome. A note of
+another type with no consensus, where no model found a procedure, is not flagged either,
+since there is no study value to recover, and Agreement says so. Every row records which
+models were consulted and how they voted (Models, Agreement, Outcome), so the consensus can
+be audited against the per-model columns.
 
 A model's own ManualReviewRequired flag (review.py) does not carry over: it describes how
 that model reached its answer; the consensus is judged on whether the models agree.
 """
 
+import re
 import time
 from collections import Counter
 from typing import NamedTuple, Sequence
 
 from database import CONSENSUS_COLUMNS, RESULT_FIELDS, model_answers, store_consensus
-from llm_analysis import EVIDENCE_FOR_FLAG, MODELS, ModelSpec, TOO_LONG_PREFIX, squash
+from llm_analysis import EVIDENCE_FOR_FLAG, MODELS, ModelSpec, TOO_LONG_PREFIX, squash, summed_count_quote, supported_counts
 
 
 class ModelAnswer(NamedTuple):
@@ -45,13 +54,42 @@ VOTED_FIELDS = (
 # What the Outcome column records.
 OUTCOMES = {
     "unanimous": "every model answered and they agree on every field",
-    "majority": "every field has a value, but a field was settled by a strict majority or a model gave no answer",
+    "agreed": "every model that answered agrees on every field, but a model failed: the consensus rests on the others",
+    "majority": "every field has a value, but a field was settled by a strict majority",
     "partial": "a field was left empty because the models could not agree on it",
     "none": "no consensus: fewer than two models answered, or a model has not run",
 }
 
 # A scope name shorter than this cannot be taken for a form of a longer one.
 MIN_SCOPE_KEY_CHARS = 3
+
+# The note's own attestation of who performed the procedure, checked against the agreed
+# FellowPresent and never used to set it. The teaching-physician wording means a trainee
+# performed under supervision (FellowPresent 1, prompt rule 7); a Staff Only or "Fellow:
+# None" line means no trainee took part (0). "Was present for the entire procedure" needs a
+# first-person subject ("I was present", "I, Dr X, was present"): the same words describe the
+# sedation monitor in some notes.
+TEACHING_ATTESTATION_RE = re.compile(
+    r"teaching (physician )?statement|was present and actively participated"
+    r"|\bi\b[^\n]{0,60}?\bwas present for the entire procedure",
+    re.I,
+)
+NO_TRAINEE_LINE_RE = re.compile(r"staff only|(resident/)?fellows?\s*:?\s*none\b", re.I)
+
+# What marks a note that could hold a study value, so that a missing consensus is worth a
+# human's time: a procedure note type (Procedures, the Upper Endoscopy / PED Endoscopy / PEG
+# Placement family, Brief Op Note, OR PostOp, OR Nursing), or upper endoscopy wording in the
+# text (the scope passed or the esophagus intubated, an upper endoscope's brand or model).
+# In the 5,000-note corpus that wording occurs in 353 of the 609 Procedures notes and in
+# about twenty notes of other types; every note too long for the window is of another type.
+PROCEDURE_NOTE_TYPE_RE = re.compile(
+    r"procedure|endoscop|colonoscop|peg placement|brief op note|\bor (postop|nursing)\b", re.I
+)
+EGD_LANGUAGE_RE = re.compile(
+    r"o?esophagus (was )?intubated|(endoscope|gastroscope) (was )?(advanced|passed)"
+    r"|intubated with (an? )?(olympus|gif)|olympus|pentax|fuji|\bgif[- ]|\bh190|\bq180|\bxp190|esophagoscop",
+    re.I,
+)
 
 
 class _Cluster(NamedTuple):
@@ -161,7 +199,50 @@ def _evidence(flag: str, info: str, answered: Sequence[ModelAnswer], values: dic
     return max(quotes.values(), key=lambda q: q[1])[0] if quotes else None
 
 
-def consensus(answers: Sequence[ModelAnswer], votes: dict | None = None) -> dict:
+def study_candidate(note_type: str | None, note: str | None) -> bool:
+    """
+    Whether a note could hold a study value, so that a missing consensus on it is worth a
+    human's time: its type is a procedure type, or its text has upper endoscopy wording
+    (PROCEDURE_NOTE_TYPE_RE, EGD_LANGUAGE_RE). True when neither is known, to stay cautious.
+    """
+    if note_type is None and note is None:
+        return True
+    return bool(PROCEDURE_NOTE_TYPE_RE.search(note_type or "")) or bool(EGD_LANGUAGE_RE.search(note or ""))
+
+
+def found_procedure(answer: ModelAnswer) -> bool:
+    """
+    Whether a model's accepted answer says a procedure was performed (any flag 1, or a scope
+    name). One such answer is not a consensus, but a row holding one is worth a human's time
+    whatever the note's type, so it is never released unflagged.
+    """
+    return answer.answered and (
+        any(answer.fields[flag] == 1 for flag in EVIDENCE_FOR_FLAG) or answer.fields["ScopeType"] is not None
+    )
+
+
+def attestation_conflicts(note: str, fellow) -> list[str]:
+    """
+    The review reasons where the note's own attestation contradicts the agreed FellowPresent
+    (0, 1, or None when the field was left empty): a teaching attestation with FellowPresent
+    not 1, a Staff Only or no-trainee line with FellowPresent not 0. A note carrying both
+    wordings gets the reason for whichever the consensus contradicts (both when it is empty).
+    The check only reads the note; it never sets the value. It is for a note whose consensus
+    has a procedure: a teaching statement in a progress note is about the visit, not a
+    procedure, and FellowPresent is rightly 0 there.
+    """
+    shown = "empty" if fellow is None else str(fellow)
+    reasons = []
+    if fellow != 1 and TEACHING_ATTESTATION_RE.search(note):
+        reasons.append(f"note carries a teaching attestation but FellowPresent is {shown}")
+    if fellow != 0 and NO_TRAINEE_LINE_RE.search(note):
+        reasons.append(f"note carries a Staff Only or no-trainee line but FellowPresent is {shown}")
+    return reasons
+
+
+def consensus(
+    answers: Sequence[ModelAnswer], votes: dict | None = None, note_type: str | None = None, note: str | None = None,
+) -> dict:
     """
     The consensus block for one note from the models' answers (one ModelAnswer per model
     consulted, in run order): the ten fields, ManualReviewRequired ("true"/"false") with
@@ -171,6 +252,11 @@ def consensus(answers: Sequence[ModelAnswer], votes: dict | None = None) -> dict
     votes, when a dict is given, receives how each voted field went when at least two models
     answered: field -> (decided, unanimous, labels of the answering models, labels of those
     that gave the winning value), for the run's agreement tally.
+    note_type and note, when given, decide whether a note without a consensus is flagged
+    (study_candidate, unless a model's answer found a procedure: found_procedure) and let the
+    agreed FellowPresent be checked against the note's own attestation
+    (attestation_conflicts). Without them every note without a consensus is flagged and the
+    attestation is not checked.
     """
     values = {field: None for field, _ in RESULT_FIELDS}
     answered = [a for a in answers if a.answered]
@@ -192,27 +278,30 @@ def consensus(answers: Sequence[ModelAnswer], votes: dict | None = None) -> dict
     if pending:
         reasons.append(f"{_names(pending)} has not analysed this note; run --analyze again")
         agreement = f"{header}; no consensus until every model has run"
-    elif not answered:
-        if failed and all(a.error and a.error.startswith(TOO_LONG_PREFIX) for a in failed):
-            reasons.append("note too long for the context window, not sent to any model; see LLM_Error")
+    elif len(answered) < 2:
+        if not answered:
+            if failed and all(a.error and a.error.startswith(TOO_LONG_PREFIX) for a in failed):
+                reasons.append("note too long for the context window, not sent to any model; see LLM_Error")
+            else:
+                reasons.append("no model gave an answer the note supports; see each model's LLM_Error")
+            agreement = f"{header}; no consensus"
         else:
-            reasons.append("no model gave an answer the note supports; see each model's LLM_Error")
-        agreement = f"{header}; no consensus"
-    elif len(answered) == 1:
-        if failed:
-            reasons.append(f"{_names(failed)} failed on this note; see LLM_Error")
-        reasons.append(
-            f"only {answered[0].label} gave an answer the note supports, which is not a consensus; "
-            f"its own columns hold that answer"
-        )
-        agreement = f"{header}; no consensus from one model"
-    else:
-        if failed:
+            if failed:
+                reasons.append(f"{_names(failed)} failed on this note; see LLM_Error")
             reasons.append(
-                f"{_names(failed)} failed on this note; the consensus rests on the other "
-                f"{len(answered)} models; see LLM_Error"
+                f"only {answered[0].label} gave an answer the note supports, which is not a consensus; "
+                f"its own columns hold that answer"
             )
-
+            agreement = f"{header}; no consensus from one model"
+        if not study_candidate(note_type, note) and not any(found_procedure(a) for a in answered):
+            # An empty row for a note that cannot hold a study value loses the study nothing,
+            # so no human is sent to it; the explanation stays here for the audit.
+            agreement += (
+                "; not flagged: not a procedure note type, no upper endoscopy wording in the note "
+                "and no model found a procedure, so there is no study value to recover"
+            )
+            reasons = []
+    else:
         lines, empty, by_majority = [], [], []
         for field in VOTED_FIELDS:
             vote = _vote(field, answered)
@@ -248,18 +337,51 @@ def consensus(answers: Sequence[ModelAnswer], votes: dict | None = None) -> dict
         reasons.extend(conflicts)
         if values["Endoscopy"] == 1 and values["ScopeType"] is None and "ScopeType" not in empty:
             reasons.append("upper endoscopy documented but no scope name found")
-        if (values["DuodenalBiopsiesTaken"] == 1 and values["NumberOfDuodenalBiopsies"] is None
-                and "NumberOfDuodenalBiopsies" not in empty):
-            reasons.append("duodenal biopsies taken but no count stated")
+        # A null count the models agree on is "taken, count not stated", which the study
+        # accepts (whether duodenal biopsies were taken is the minimum it needs), so it is
+        # not a reason for review.
+        if note is not None and (values["Endoscopy"] == 1 or values["Colonoscopy"] == 1):
+            reasons.extend(attestation_conflicts(note, values["FellowPresent"]))
 
         for flag, info in EVIDENCE_FOR_FLAG.items():
             values[info] = _evidence(flag, info, answered, values)
 
+        # The verifier reads "4 biopsies of the duodenum and 2 from the bulb" as 6, the sum,
+        # since the bulb is the duodenum (prompt rule 5). The researcher's examples confirm
+        # only the part-of form ("6 including 2 from the bulb" is 6), so a count that rests on
+        # a summed sentence is raised until that reading is confirmed; the value stays.
+        count = values["NumberOfDuodenalBiopsies"]
+        quote = values["DuodenalBiopsiesInformation"]
+        if count and quote and summed_count_quote(quote):
+            total = sum(supported_counts(quote))  # an additive quote supports its sum alone
+            if count == total:
+                reasons.append(
+                    f"NumberOfDuodenalBiopsies {count} is the sum of the counts the quoted sentence gives for "
+                    f"different parts of the duodenum; confirm the study counts them together"
+                )
+            else:
+                reasons.append(
+                    f"NumberOfDuodenalBiopsies {count} is one of the counts the quoted sentence gives for "
+                    f"different parts of the duodenum, which add up to {total}; the verifier now accepts "
+                    f"only the sum on a new run"
+                )
+        if failed and reasons:
+            # A failed model is an abstention, not a dissent: its failure is worth saying only
+            # when the row needs a look anyway, so the reviewer knows how many models the
+            # consensus rests on.
+            reasons.insert(
+                0,
+                f"{_names(failed)} failed on this note; the consensus rests on the other "
+                f"{len(answered)} models; see LLM_Error",
+            )
+
         agreement = f"{header}; " + ("; ".join(lines) if lines else "they agree on every field")
         if empty or conflicts:
             outcome = "partial"
-        elif failed or by_majority:
+        elif by_majority:
             outcome = "majority"
+        elif failed:
+            outcome = "agreed"
         else:
             outcome = "unanimous"
 
@@ -297,7 +419,9 @@ REASON_KEYS = (
     ("models disagree", "the models disagree on a field"),
     ("left empty:", "fields in conflict, left empty"),
     ("no scope name found", "upper endoscopy but no scope name"),
-    ("no count stated", "duodenal biopsies but no count"),
+    ("teaching attestation", "teaching attestation but FellowPresent not 1"),
+    ("no-trainee line", "Staff Only or no-trainee line but FellowPresent not 0"),
+    ("different parts of the duodenum", "duodenal count from a sentence that counts parts of the duodenum"),
 )
 
 
@@ -306,6 +430,7 @@ class ConsensusSummary(NamedTuple):
     notes: int
     outcomes: Counter          # Outcome -> notes
     flagged: int               # notes with ManualReviewRequired (consensus) true
+    unflagged_none: int        # notes without consensus not flagged: not a procedure note, no upper endoscopy wording, no model found a procedure
     disputed: Counter          # field -> notes where the answering models did not all agree on it
     agreement: dict            # label -> (votes agreeing with the decided consensus value, votes cast)
     reasons: Counter           # review reason category -> notes
@@ -328,12 +453,14 @@ def consolidate(conn, models: Sequence[ModelSpec] = MODELS, report=print, progre
     reasons = Counter()
     agreement = {label: [0, 0] for label in labels}
     flagged = 0
-    for done, (note_id, per_model) in enumerate(answers, start=1):
+    unflagged_none = 0
+    for done, (note_id, note_type, note, per_model) in enumerate(answers, start=1):
         votes = {}
-        row = consensus([ModelAnswer(*answer) for answer in per_model], votes)
+        row = consensus([ModelAnswer(*answer) for answer in per_model], votes, note_type, note)
         rows[note_id] = row
         outcomes[row["Outcome"]] += 1
         flagged += row["ManualReviewRequired"] == "true"
+        unflagged_none += row["Outcome"] == "none" and row["ManualReviewRequired"] == "false"
         for field, (decided, unanimous, voters, agreeing) in votes.items():
             if not unanimous:
                 disputed[field] += 1
@@ -353,10 +480,15 @@ def consolidate(conn, models: Sequence[ModelSpec] = MODELS, report=print, progre
 
     report(
         f"Consensus of {len(labels)} model(s) built for {len(rows)} note(s) in {seconds:.1f}s: "
-        f"{outcomes['unanimous']} unanimous, {outcomes['majority']} by majority, "
-        f"{outcomes['partial']} partial, {outcomes['none']} without consensus; "
+        f"{outcomes['unanimous']} unanimous, {outcomes['agreed']} agreed with a model failed, "
+        f"{outcomes['majority']} by majority, {outcomes['partial']} partial, {outcomes['none']} without consensus; "
         f"{flagged} flagged for manual review."
     )
+    if unflagged_none:
+        report(
+            f"Not flagged although without consensus: {unflagged_none} note(s) of other types with no upper "
+            f"endoscopy wording where no model found a procedure, so an empty row is no loss to the study (see Agreement)."
+        )
     if disputed:
         report("Fields the models did not all agree on: " + ", ".join(f"{field} {n}" for field, n in disputed.most_common()) + " note(s).")
     if any(total for _, total in agreement.values()):
@@ -367,5 +499,6 @@ def consolidate(conn, models: Sequence[ModelSpec] = MODELS, report=print, progre
     if reasons:
         report("Review reasons: " + ", ".join(f"{key} {n}" for key, n in reasons.most_common()) + ".")
     return ConsensusSummary(
-        len(rows), outcomes, flagged, disputed, {label: tuple(pair) for label, pair in agreement.items()}, reasons, seconds,
+        len(rows), outcomes, flagged, unflagged_none, disputed,
+        {label: tuple(pair) for label, pair in agreement.items()}, reasons, seconds,
     )

@@ -91,10 +91,16 @@ Output
                        value needs at least two models that answered and agree, a strict
                        majority settles a disagreement (and flags the note), and a field
                        with no majority stays empty. ManualReviewRequired ("true"/"false")
-                       with ManualReviewReason flags every note where a model failed or
-                       disagreed, or the agreed answer leaves a study field open; Outcome
-                       (unanimous, majority, partial, none), Models and Agreement say how
-                       the consensus was reached. A model's block holds the ten extracted
+                       with ManualReviewReason flags the rows a human can improve: the
+                       models disagreed, the agreed answer leaves a study field open,
+                       contradicts the note's own attestation of a trainee or sums two
+                       biopsy counts from one sentence, or a note that could hold a
+                       study value (a procedure note, upper endoscopy wording, or a
+                       model's answer that a procedure was performed) got fewer than two
+                       answers. A model's failure alone does not flag a row the others
+                       agree on. Outcome (unanimous, agreed,
+                       majority, partial, none), Models and Agreement say how the
+                       consensus was reached. A model's block holds the ten extracted
                        fields, its own ManualReviewRequired with ManualReviewReason, and
                        the debugging columns (LLM_Failed, LLM_Attempts, LLM_Seconds,
                        LLM_Error, LLM_Rejections, RawResponse). A note whose answers the
