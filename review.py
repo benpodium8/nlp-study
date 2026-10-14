@@ -7,19 +7,31 @@ answer the model only reached after rejected attempts, an answer that leaves a s
 open, and a note the model may not have seen in full.
 """
 
-from llm_analysis import CONTEXT_LENGTH, TOO_LONG_PREFIX, estimated_prompt_tokens, note_fits_context
+from llm_analysis import (
+    CONTEXT_LENGTH, TOO_LONG_PREFIX, estimated_prompt_tokens, is_loop_rejection, note_fits_context,
+)
 
 
 def manual_review(
-    note: str, result: dict | None, llm_failed: int, attempts: int, error: str | None
+    note: str,
+    result: dict | None,
+    llm_failed: int,
+    attempts: int,
+    error: str | None,
+    rejections: str | None = None,
 ) -> tuple[bool, str | None]:
     """
     Returns (required, reason) for one note's result. The reason lists every trigger,
     separated by "; ", and is None when no review is needed. Reasons hold no note text.
+    rejections is the LLM_Rejections text (one rejected attempt per line), used to tell
+    rejections of the answer from repetition loops.
 
     Triggers:
       - the note failed (no answer the note supports, or the model call failed)
-      - the answer was accepted only after one or more rejected attempts
+      - the answer was accepted only after an attempt was rejected for its content (a
+        quote not in the note, a scope name the note does not state, a count the quote
+        does not support, and so on). A retry after a repetition loop is not counted: the
+        model repeating itself says nothing about the answer it then gave
       - an upper endoscopy is documented but no scope name was found
       - duodenal biopsies were taken but the note states no count
       - the note was too long for the context window and was not sent to the model
@@ -37,9 +49,18 @@ def manual_review(
         else:
             reasons.append("no answer the note supports; see LLM_Error")
     elif attempts > 1:
-        reasons.append(
-            f"accepted on attempt {attempts} after {attempts - 1} rejected answer(s); see LLM_Rejections"
-        )
+        if rejections is None:
+            reasons.append(
+                f"accepted on attempt {attempts} after {attempts - 1} rejected answer(s) "
+                f"(reasons not recorded)"
+            )
+        else:
+            content = [line for line in rejections.split("\n") if line and not is_loop_rejection(line)]
+            if content:
+                reasons.append(
+                    f"accepted on attempt {attempts} after {len(content)} rejected answer(s), "
+                    f"repetition loops not counted; see LLM_Rejections"
+                )
 
     if result:
         if result.get("Endoscopy") == 1 and result.get("ScopeType") is None:

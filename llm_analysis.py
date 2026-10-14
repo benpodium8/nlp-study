@@ -120,6 +120,19 @@ INTEGER_RE = re.compile(r"-?\d+")
 # schema cut off, and the attempt is retried.
 MAX_TEXT_CHARS = 1000
 
+# Rejections that are a repetition loop (the model repeating itself until the text cap or
+# Ollama's repeat limit stopped it) rather than a wrong or unsupported answer. A retry after
+# one says nothing about the answer, so review.py does not count it. The wording matches the
+# two messages raised in _parse_and_check and llm_analysis, old databases included.
+LOOP_REJECTION_RE = re.compile(
+    r"repeated text until it reached the \d+-character limit|repeated itself until Ollama stopped it"
+)
+
+
+def is_loop_rejection(message: str) -> bool:
+    """Whether a rejection message (or an LLM_Rejections line) records a repetition loop."""
+    return bool(LOOP_REJECTION_RE.search(message))
+
 # Passed to Ollama as format=, which constrains decoding to this schema: the reply is
 # always a bare JSON object with exactly these keys, 0/1 flags and bounded strings.
 # It mirrors EXPECTED_FIELDS ("id" is added by the program, not the model).

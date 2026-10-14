@@ -131,8 +131,9 @@ def data_worker(conn, model: str = LOCAL_MODEL):
             note_started = time.perf_counter()
             analysis = analyze_note(note_id, note, model, console)
             seconds = round(time.perf_counter() - note_started, 2)
+            rejections = "\n".join(analysis.rejections) or None
             review_required, review_reason = manual_review(
-                note, analysis.result, analysis.llm_failed, analysis.attempts, analysis.error
+                note, analysis.result, analysis.llm_failed, analysis.attempts, analysis.error, rejections
             )
             review_count += review_required
 
@@ -145,7 +146,7 @@ def data_worker(conn, model: str = LOCAL_MODEL):
                 analysis.attempts,
                 seconds,
                 analysis.error,
-                "\n".join(analysis.rejections) or None,
+                rejections,
                 review_required,
                 review_reason,
             )

@@ -151,16 +151,16 @@ def _backfill_manual_review(conn: sqlite3.Connection):
     rows = conn.execute(
         f"""
         SELECT results.id, notes.note, {", ".join(f"results.{name}" for name, _ in RESULT_FIELDS)},
-               results.LLM_Failed, results.LLM_Attempts, results.LLM_Error
+               results.LLM_Failed, results.LLM_Attempts, results.LLM_Error, results.LLM_Rejections
         FROM results JOIN notes ON notes.id = results.id;
         """
     ).fetchall()
     for row in rows:
         note_id, note = row[0], row[1]
         extracted = dict(zip((name for name, _ in RESULT_FIELDS), row[2:2 + len(RESULT_FIELDS)]))
-        llm_failed, attempts, error = row[2 + len(RESULT_FIELDS):]
+        llm_failed, attempts, error, rejections = row[2 + len(RESULT_FIELDS):]
         required, reason = manual_review(
-            note, None if llm_failed else extracted, llm_failed or 0, attempts or 1, error
+            note, None if llm_failed else extracted, llm_failed or 0, attempts or 1, error, rejections
         )
         conn.execute(
             "UPDATE results SET ManualReviewRequired = ?, ManualReviewReason = ? WHERE id = ?;",

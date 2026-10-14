@@ -356,7 +356,7 @@ HIPAA:
 `manual_review` sets `ManualReviewRequired` to `true`, with every trigger listed in `ManualReviewReason`, when:
 
 - the note failed (no answer the note supports, or the model call failed)
-- the answer was accepted only after one or more rejected attempts
+- the answer was accepted only after an attempt was rejected for its content (a quote not in the note, an invented scope name, an unsupported count). A retry after a repetition loop is not counted: the model repeating itself says nothing about the answer it then gave
 - an upper endoscopy is documented but no scope name was found
 - duodenal biopsies were taken but the note states no count
 - the note was too long for the context window and was not sent to the model (see below)
