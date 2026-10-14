@@ -19,12 +19,14 @@ def manual_review(
     attempts: int,
     error: str | None,
     rejections: str | None = None,
+    context_length: int = CONTEXT_LENGTH,
 ) -> tuple[bool, str | None]:
     """
     Returns (required, reason) for one note's result. The reason lists every trigger,
     separated by "; ", and is None when no review is needed. Reasons hold no note text.
     rejections is the LLM_Rejections text (one rejected attempt per line), used to tell
-    rejections of the answer from repetition loops.
+    rejections of the answer from repetition loops. context_length is the window the model
+    was called with (ModelSpec.num_ctx).
 
     Triggers:
       - the note failed (no answer the note supports, or the model call failed)
@@ -68,10 +70,10 @@ def manual_review(
         if result.get("DuodenalBiopsiesTaken") == 1 and result.get("NumberOfDuodenalBiopsies") is None:
             reasons.append("duodenal biopsies taken but no count stated")
 
-    if not too_long and not note_fits_context(note):
+    if not too_long and not note_fits_context(note, context_length):
         reasons.append(
             f"note is about {estimated_prompt_tokens(note)} prompt tokens, more than the "
-            f"{CONTEXT_LENGTH}-token context window allows; the model may not have seen all of it"
+            f"{context_length}-token context window allows; the model may not have seen all of it"
         )
 
     return (bool(reasons), "; ".join(reasons) or None)

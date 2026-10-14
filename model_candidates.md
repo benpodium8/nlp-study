@@ -4,12 +4,17 @@ Date of evaluation: 2026-10-13. Scope: which local LLM the pipeline should call
 through Ollama, given the hardware and software constraints of the University of
 Iowa Argon cluster recorded in `ARGON_RUNBOOK.md`.
 
-**Outcome (2026-10-13, commit `9ad3a13`): the pipeline adopted `medgemma:27b`**, not
-the recommendation in section 4. `LOCAL_MODEL` in `llm_analysis.py` is the authority;
-`README.md` and `ARGON_RUNBOOK.md` section 5.4 describe the current setup. The call
-passes `think=False`, `format=` the JSON schema and `options={"temperature": 0,
-"seed": 0, "num_ctx": 8192, "num_predict": 2048}`; the context stays at 8192 because
-that is the window at which medgemma:27b and its KV cache fit the A10 (section 1).
+**Outcome: the pipeline runs three of these models.** `medgemma:27b` was adopted first
+(2026-10-13, commit `9ad3a13`); on 2026-10-14 `gemma4:26b-a4b-it-q4_K_M` (the
+recommendation in section 4) and `gpt-oss:20b` (the fallback) were added as the second and
+third models, so every note is answered by all three and each model's answers go to their
+own labelled columns for a comparison. `MODELS` in `llm_analysis.py` is the authority;
+`README.md` and `ARGON_RUNBOOK.md` section 5.4 describe the current setup. Every call
+passes `format=` the JSON schema and `options={"temperature": 0, "seed": 0,
+"num_ctx": 8192, "num_predict": 2048}`, with `think=False` for the two Gemma models and
+`think="low"` for gpt-oss (section 3). The context stays at 8192 for all three, so they
+see the same notes, and because medgemma:27b fits the A10 only at that window (section 1).
+The models run one after another (`OLLAMA_MAX_LOADED_MODELS=1`): each fits the A10 alone.
 Sections 3 to 6 are kept as the record of the evaluation.
 
 ## 1. Constraints that decide the answer
@@ -70,9 +75,9 @@ field matched the expected answer.
 | Model tag | Loads on v0.24.0 | Repo call | Schema call | CPU decode tok/s | Est. VRAM at 8K ctx | Fits A10 24 GB |
 | --- | --- | --- | --- | --- | --- | --- |
 | `gemma4:26b` (default tag) | **no** | fails | fails | n/a | n/a | n/a |
-| `gemma4:26b-a4b-it-q4_K_M` | yes (Go engine) | 6/6 | 6/6, schema enforced | 17.6 | ~20 GB | yes |
-| `gpt-oss:20b` | yes (Go engine) | 6/6 | works with `think` unset or `low`; empty content with boolean `think=False` | n/a | ~15 GB | yes |
-| `medgemma:27b` (current since 2026-10-13) | yes (Go engine) | 6/6 | 6/6, schema enforced | 3.2 | ~20 GB | yes |
+| `gemma4:26b-a4b-it-q4_K_M` (current, second) | yes (Go engine) | 6/6 | 6/6, schema enforced | 17.6 | ~20 GB | yes |
+| `gpt-oss:20b` (current, third) | yes (Go engine; its config says `requires` 0.30.0, which v0.24.0 ignores) | 6/6 | works with `think` unset or `low`; empty content with boolean `think=False` | n/a | ~15 GB | yes |
+| `medgemma:27b` (current, first) | yes (Go engine) | 6/6 | 6/6, schema enforced | 3.2 | ~20 GB | yes |
 | `gemma3:12b` (previous) | yes (llama.cpp fallback) | 6/6 | 6/6, schema enforced | 7.2 | ~10.5 GB | yes |
 | `qwen3.6:27b` (default tag) | **no** (same cause as gemma4:26b) | not run | not run | n/a | n/a | n/a |
 | `qwen3.6:27b-q4_K_M` | yes (Go engine) | 6/6, but 20 min on CPU with thinking on | schema **not enforced** (model-chosen keys; only follows the schema when it is pasted into the prompt) | 2.4 | ~19 GB | yes |
@@ -122,8 +127,9 @@ budget); `llama3.3:70b` (over budget on one card).
 1. `LOCAL_MODEL = "gemma4:26b-a4b-it-q4_K_M"` in `llm_analysis.py`. The model
    blob digest is `sha256:7121486771cb...` (17.99 GB); record it, because the
    library has already re-pointed the `gemma4:26b` tag once. Blobs already on
-   scratch are never re-fetched by setup.sh. **Not adopted:** `LOCAL_MODEL` is
-   `medgemma:27b` (blob `sha256:4b97da6b21a8...`, 17.4 GB).
+   scratch are never re-fetched by setup.sh. **Adopted 2026-10-14 as the second
+   model**, after `medgemma:27b` (`LOCAL_MODEL`, blob `sha256:4b97da6b21a8...`, 17.4 GB)
+   and before `gpt-oss:20b`; the names are listed in the `MODELS` block.
 2. `NLP_OLLAMA_IMAGE=docker://ollama/ollama:0.24.0`, then `./setup.sh --force sif`
    on a login node. Consider making this tag the setup.sh default (backlog B25).
    **Done:** `setup.sh` defaults to `0.24.0`.
@@ -132,9 +138,10 @@ budget); `llama3.3:70b` (over budget on one card).
    (backlog B9/F7). Without `think=False` the repo call took 98 s on CPU because
    Gemma 4 reasons first; with it, 16 s. Gemma 4's 256K window makes a 16K
    context cheap (about 0.75 GB of KV cache) and covers the longest notes.
-   **Done for `medgemma:27b`**, with `num_predict` 2048 rather than 512 (the
+   **Done for all three models**, with `num_predict` 2048 rather than 512 (the
    1000-character schema cap and the retries stop a looping model) and the context
-   kept at 8192: medgemma:27b's dense KV cache does not fit the A10 at 16K.
+   kept at 8192 for every model, so they see the same notes: medgemma:27b's dense KV
+   cache does not fit the A10 at 16K. gpt-oss is called with `think="low"`.
 4. Pin the card type to the A10 or newer with a `#$ -l <complex>` line. The P100
    has 16 GB and the V100 line had kernel problems on this Ollama version. **Open.**
 5. Confirm with the tier 1 preflight that placement reads 100% on GPU. **Open:**

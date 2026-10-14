@@ -1,14 +1,14 @@
 import time
 from datetime import timedelta
-from typing import NamedTuple
+from typing import NamedTuple, Sequence
 
 from rich.console import Console
 from rich.markup import escape
 from rich.progress import Progress, BarColumn, TimeElapsedColumn, TimeRemainingColumn
 
-from database import COUNT_NOTES_SQL, SELECT_PENDING_NOTES_SQL, insert_result
+from database import COUNT_NOTES_SQL, insert_result, pending_notes
 from llm_analysis import (
-    LOCAL_MODEL, llm_analysis, LLMAnalysisError, RetryableLLMError, note_fits_context, too_long_error,
+    MODELS, ModelSpec, llm_analysis, LLMAnalysisError, RetryableLLMError, note_fits_context, too_long_error,
 )
 from review import manual_review
 
@@ -31,7 +31,7 @@ class Analysis(NamedTuple):
     brief_error: str | None = None  # error without the rejected value, safe to log (no note text)
 
 
-def analyze_note(note_id: int, note: str, model: str, console: Console) -> Analysis:
+def analyze_note(note_id: int, note: str, model: ModelSpec, console: Console) -> Analysis:
     """
     Runs the LLM analysis on one note with the given model.
     Retries when the model's answer is rejected (RetryableLLMError: unusable output, or an
@@ -39,11 +39,11 @@ def analyze_note(note_id: int, note: str, model: str, console: Console) -> Analy
     model why its previous answer was rejected; any other failure is recorded immediately.
     Every rejection is kept, so the export shows why an accepted answer needed retries and
     why a failed note failed on each attempt.
-    A note too long for the context window is not sent at all (Ollama would silently drop
-    the instructions and the start of the note); it is recorded as failed with 0 attempts.
+    A note too long for the model's context window is not sent at all (Ollama would silently
+    drop the instructions and the start of the note); it is recorded as failed with 0 attempts.
     """
-    if not note_fits_context(note):
-        error = too_long_error(note)
+    if not note_fits_context(note, model.num_ctx):
+        error = too_long_error(note, model.num_ctx)
         return Analysis(None, None, 1, 0, error, [], error)
 
     rejected = None
@@ -90,23 +90,30 @@ def _log_progress(console: Console, done: int, pending: int, failed: int, elapse
     )
 
 
-def data_worker(conn, model: str = LOCAL_MODEL):
+def data_worker(conn, models: Sequence[ModelSpec] = MODELS):
     """
-    Runs the LLM analysis (with model) on every note that has no result yet and stores each
-    result, with its debugging columns, in the database. Logs one line per note,
-    a running summary every SUMMARY_EVERY notes, and a final summary.
-    Only the structured fields are logged, never note text or model output.
+    Runs the LLM analysis on every note that has no result yet for each model in models,
+    one model at a time so Ollama holds a single model loaded, and stores each result with
+    its debugging columns in the database under the model's label.
+    Logs one line per note, a running summary every SUMMARY_EVERY notes, and a summary per
+    model. Only the structured fields are logged, never note text or model output.
     """
     console = Console()
-
     total_notes = conn.execute(COUNT_NOTES_SQL).fetchone()[0]
-    rows = conn.execute(SELECT_PENDING_NOTES_SQL).fetchall()
+
+    for index, model in enumerate(models, start=1):
+        _log(console, f"Model: {model.label} ({index} of {len(models)})")
+        _run_model(conn, model, total_notes, console)
+
+
+def _run_model(conn, model: ModelSpec, total_notes: int, console: Console):
+    """Analyses every note that has no result under model's label yet, and stores each one."""
+    rows = pending_notes(conn, model.label)
     pending = len(rows)
 
-    _log(console, f"Model: {model}")
     _log(console, 
-        f"{total_notes} note(s) in the database, {total_notes - pending} already analysed, "
-        f"{pending} to process."
+        f"{total_notes} note(s) in the database, {total_notes - pending} already analysed with "
+        f"{model.label}, {pending} to process."
     )
     if pending == 0:
         console.print("[bold yellow]No notes to process.[/bold yellow]")
@@ -125,7 +132,7 @@ def data_worker(conn, model: str = LOCAL_MODEL):
         console=console,
     ) as progress:
 
-        task = progress.add_task("Analysing notes", total=pending)
+        task = progress.add_task(f"Analysing notes with {model.name}", total=pending)
 
         for done, (note_id, note) in enumerate(rows, start=1):
             note_started = time.perf_counter()
@@ -133,13 +140,15 @@ def data_worker(conn, model: str = LOCAL_MODEL):
             seconds = round(time.perf_counter() - note_started, 2)
             rejections = "\n".join(analysis.rejections) or None
             review_required, review_reason = manual_review(
-                note, analysis.result, analysis.llm_failed, analysis.attempts, analysis.error, rejections
+                note, analysis.result, analysis.llm_failed, analysis.attempts, analysis.error,
+                rejections, model.num_ctx,
             )
             review_count += review_required
 
             insert_result(
                 conn,
                 note_id,
+                model.label,
                 analysis.result,
                 analysis.raw_response,
                 analysis.llm_failed,
@@ -179,7 +188,7 @@ def data_worker(conn, model: str = LOCAL_MODEL):
 
     elapsed = time.perf_counter() - started
     _log(console, 
-        f"[bold green]Finished[/bold green] {pending} note(s) in {_duration(elapsed)}: "
+        f"[bold green]Finished[/bold green] {pending} note(s) with {model.label} in {_duration(elapsed)}: "
         f"{pending - len(failed_ids)} ok, {len(failed_ids)} failed, {review_count} flagged for "
         f"manual review, {elapsed / pending:.1f}s per note."
     )

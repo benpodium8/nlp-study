@@ -4,7 +4,7 @@
 
 This project is a **local, offline-first clinical note analysis pipeline** that extracts structured data from endoscopy procedure notes with a **local Large Language Model (LLM via Ollama)**.
 
-Notes are loaded from a CSV into a local SQLite database, each note is sent once to the model, the model's answer is stored next to the note, and the results are exported to CSV for downstream analysis.
+Notes are loaded from a CSV into a local SQLite database, each note is sent once to each of the three default models (`medgemma:27b`, `gemma4:26b-a4b-it-q4_K_M` and `gpt-oss:20b`, one model at a time), every model's answers are stored next to the note in columns labelled with the model name and context window (`medgemma:27b@8192` and so on), and the results are exported to CSV for a comparison across the models.
 
 > **Key design goals**
 >
@@ -139,16 +139,24 @@ Install Ollama on Linux or Mac:
 curl -fsSL https://ollama.com/install.sh | sh
 ```
 
-Pull the required model:
+Pull the three models (about 49 GB in all):
 
 ```powershell
 ollama pull medgemma:27b
+ollama pull gemma4:26b-a4b-it-q4_K_M
+ollama pull gpt-oss:20b
 ```
 
-This is MedGemma 27B (Gemma 3 based, Q4_K_M, about 17.4 GB). It is called with thinking
-off (`think=False`). Unlike the current `gemma3` and `gemma4` tags, this build runs on
-Ollama 0.24.0, the last release that can use the GPUs on the Argon cluster (NVIDIA
-driver 535). To match Argon exactly, install Ollama 0.24.0:
+Every note goes through all three, one model at a time, and each model's answers land in
+their own columns so the three can be compared:
+
+- `medgemma:27b`: MedGemma 27B (Gemma 3 based, Q4_K_M, about 17.4 GB), called with thinking off (`think=False`).
+- `gemma4:26b-a4b-it-q4_K_M`: Gemma 4 26B mixture of experts (3.8B active, Q4_K_M, about 18.0 GB), thinking off. This exact tag matters: the default `gemma4:26b` tag does not load on Ollama 0.24.0.
+- `gpt-oss:20b`: OpenAI gpt-oss 20B mixture of experts (3.6B active, MXFP4, about 13.8 GB), a reasoning model called with `think="low"` (a boolean `think=False` makes it return nothing).
+
+All three builds run on Ollama 0.24.0, the last release that can use the GPUs on the Argon
+cluster (NVIDIA driver 535), and each fits a 24 GB card on its own at the 8192-token window.
+To match Argon exactly, install Ollama 0.24.0:
 `curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=0.24.0 sh`.
 
 Ollama runs locally and does **not** require internet access after model download.
@@ -168,7 +176,7 @@ With no options it prints what the program needs (the packages, Ollama and the m
 | Option         | Effect                                                                                   |
 | -------------- | ---------------------------------------------------------------------------------------- |
 | `--csv FILE`   | Ingest the notes in `FILE` into `data.db` (duplicates skipped); reports how many were added |
-| `--analyze`    | Run the LLM on every note that has no result yet, then write `output/results.csv`          |
+| `--analyze`    | Run each model on every note that has no result for it yet, then write `output/results.csv` |
 | `--clean`      | Delete `data.db` (and any SQLite journal files) and `output/results.csv` from earlier runs, before anything else. Discards every stored result |
 
 ---
@@ -215,13 +223,13 @@ This will:
 3. Store each result, with the raw model response and per-note debugging columns, in the database
 4. Export `output/results.csv`
 
-Running `python app.py --analyze` again resumes: notes that already have a result are skipped.
+Running `python app.py --analyze` again resumes: notes that already have a result for a model are skipped for that model.
 
 While it runs, the program reports what it is doing:
 
 ```
-[15:48:30] Model: medgemma:27b
-[15:48:30] 330 note(s) in the database, 0 already analysed, 330 to process.
+[15:48:30] Model: medgemma:27b@8192 (1 of 3)
+[15:48:30] 330 note(s) in the database, 0 already analysed with medgemma:27b@8192, 330 to process.
 [15:49:26] ok     note 1 (1/330) 56.2s, attempt 1: scope='Olympus H190' egd=1 colonoscopy=0 duodenal_biopsies=4 taken=1 fellow=1
 [15:50:40] retry  note 2: attempt 1/5 did not return valid JSON
 [15:51:55] ok     note 2 (2/330) 149.1s, attempt 2: scope=None egd=0 colonoscopy=0 duodenal_biopsies=0 taken=0 fellow=0
@@ -229,8 +237,11 @@ While it runs, the program reports what it is doing:
 [16:02:10] FAILED note 7 (7/330) after 5 attempt(s), 301.4s: the output was not valid JSON (Expecting value: line 1 column 1 (char 0)).
 [16:08:33] progress 10/330 done, 1 failed, 68.1s per note, 0:11:21 elapsed, about 6:03:12 remaining
 ...
-[21:51:02] Finished 330 note(s) in 6:02:32: 326 ok, 4 failed, 65.9s per note.
+[21:51:02] Finished 330 note(s) with medgemma:27b@8192 in 6:02:32: 326 ok, 4 failed, 31 flagged for manual review, 65.9s per note.
 [21:51:02] Failed note id(s): 7, 118, 240, 301
+[21:51:02] Model: gemma4:26b-a4b-it-q4_K_M@8192 (2 of 3)
+[21:51:02] 330 note(s) in the database, 0 already analysed with gemma4:26b-a4b-it-q4_K_M@8192, 330 to process.
+...
 ```
 
 Only the structured fields are logged, never note text or the model's prose; the evidence sentences and raw responses are in the database and the export.
@@ -239,10 +250,10 @@ Only the structured fields are logged, never note text or the model's prose; the
 
 ### Inspecting the Data
 
-The program never prints note text to the terminal. Use `output/results.csv`, or query `data.db` directly, for example:
+The program never prints note text to the terminal. Use `output/results.csv`, or query `data.db` directly. The result columns carry the model label (`LLM_Failed (medgemma:27b@8192)`), so they must be double-quoted in SQL, for example:
 
 ```bash
-sqlite3 data.db "select count(*) notes, (select count(*) from results) done, (select count(*) from results where LLM_Failed=1) failed from notes;"
+sqlite3 data.db 'select count(*) notes, (select count(*) from results where "LLM_Failed (medgemma:27b@8192)" is not null) done, (select count(*) from results where "LLM_Failed (medgemma:27b@8192)"=1) failed from notes;'
 ```
 
 ---
@@ -305,9 +316,9 @@ HIPAA:
 Tables:
 
 - `notes` – raw clinical notes
-- `results` – one row per note: the LLM's ten extracted fields, the review columns `ManualReviewRequired` and `ManualReviewReason`, and the debugging columns `LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `LLM_Rejections` and `RawResponse`
+- `results` – one row per note, with one block of columns per model, each column named `<field> (<model>@<context>)`, for example `ScopeType (medgemma:27b@8192)`: the ten extracted fields, the review columns `ManualReviewRequired` and `ManualReviewReason`, and the debugging columns `LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `LLM_Rejections` and `RawResponse`. The label is the model's full name and the context window it was called with, so two models, or one model at two window sizes, never share a column
 
-If an older `data.db` lacks one of the `results` columns, it is added on startup (existing rows get an empty value, except the review columns, which are computed for them).
+A `data.db` from before the columns were labelled is converted on startup: its unlabelled columns become the first model's block, since those answers came from that model. A column a block lacks is added on startup (existing rows get an empty value, except the review columns, which are computed for them), and a model that has not yet run on the database gets a whole new block.
 
 Safeguards:
 
@@ -328,11 +339,11 @@ HIPAA Compliance:
 
 **Purpose:** Core processing engine
 
-Workflow per note:
+Workflow, one model at a time (so Ollama holds a single model loaded), per note:
 
-1. Skip if already processed
+1. Skip if this model already has a result for it
 2. Run LLM analysis (with retries)
-3. Store the result atomically
+3. Store the result atomically under the model's label
 
 Features:
 
@@ -417,7 +428,7 @@ Key Safeguards:
 
 Model:
 
-- `medgemma:27b` (MedGemma 27B, thinking off; set by `LOCAL_MODEL` in `llm_analysis.py`). For local testing only, `--model` overrides it for one run, e.g. `python app.py --analyze --model gemma3:4b`; study runs omit it
+- `MODELS` in `llm_analysis.py` lists the models every note is sent to, in run order, each with its context window and `think` setting: `medgemma:27b` (`LOCAL_MODEL`, MedGemma 27B, thinking off), `gemma4:26b-a4b-it-q4_K_M` (Gemma 4 26B A4B, thinking off) and `gpt-oss:20b` (reasoning at `"low"`). All three use the 8192-token window, so they see the same notes, and their columns are labelled `medgemma:27b@8192`, `gemma4:26b-a4b-it-q4_K_M@8192` and `gpt-oss:20b@8192`. To change the list, edit that block (one `ModelSpec` per line, the name as a quoted literal: `setup.sh` reads it) and pull the models. For local testing only, `--model` replaces the list with one model for a run, e.g. `python app.py --analyze --model gemma3:4b`, stored under its own label (`gemma3:4b@8192`); study runs omit it
 
 HIPAA:
 
@@ -452,7 +463,9 @@ Generated in `/output`:
 
 - `results.csv` – one row per note
 
-Columns, in order: the note identifiers (`id`, `mrn`, `encounter`, `note_csn_id`, `note_date`, `note_type`); the ten extracted fields (`ScopeType`, `Colonoscopy`, `ColonoscopyInformation`, `Endoscopy`, `EndoscopyInformation`, `NumberOfDuodenalBiopsies`, `DuodenalBiopsiesTaken`, `DuodenalBiopsiesInformation`, `FellowPresent`, `FellowInformation`); the review columns (`ManualReviewRequired`, `ManualReviewReason`); the debugging columns (`LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `LLM_Rejections`, `RawResponse`); and the note text last.
+Columns, in order: the note identifiers (`id`, `mrn`, `encounter`, `note_csn_id`, `note_date`, `note_type`); then one block per model, every column of it named `<field> (<model>@<context>)`, for example `ScopeType (medgemma:27b@8192)`: the ten extracted fields (`ScopeType`, `Colonoscopy`, `ColonoscopyInformation`, `Endoscopy`, `EndoscopyInformation`, `NumberOfDuodenalBiopsies`, `DuodenalBiopsiesTaken`, `DuodenalBiopsiesInformation`, `FellowPresent`, `FellowInformation`), the review columns (`ManualReviewRequired`, `ManualReviewReason`) and the debugging columns (`LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `LLM_Rejections`, `RawResponse`); and the note text last. The label is the model's full name and the context window it was called with, so answers from different models (or the same model at another window size) are never mixed.
+
+Within each model's block:
 
 - `ManualReviewRequired` is `true` when a human should look at the row before the study uses it, else `false`; `ManualReviewReason` lists why (see `review.py` above). Filter the export on this column to get the review queue.
 

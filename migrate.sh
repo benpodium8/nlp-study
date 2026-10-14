@@ -63,6 +63,7 @@ DRY_RUN="" ASSUME_YES="" BRANCH="" RESET="" KEEP_DATA="" KEEP_MODELS=""
 PROJECT_ROOT="" ASSET_ROOT="" REPO_DIR="" VENV_DIR="" PREFLIGHT_PY="" PRESERVE_DIR=""
 SIF_PATH="" SIF_PARTIAL="" SIF_IMAGE_STAMP="" MODELS_DIR="" APPT_CACHE="" APPT_TMP=""
 LOCK_DIR="" HAVE_NET=0 MODEL="" MODEL_SOURCE=""
+MODELS=()
 GIT_ACTION="none" GIT_TARGET="" GIT_REMOTE_REF="" GIT_TARGET_SHA="" target_setup=""
 KILL_PIDS="" MANIFEST_WANTED_PRESENT=""
 
@@ -170,21 +171,26 @@ classify_untracked() {   # prints phi | junk | self | other
     echo other
 }
 
-# The model the program will call: LOCAL_MODEL in llm_analysis.py (same sed as setup.sh),
-# read from the commit the checkout will be at after the git step.
+# The models the program will call: LOCAL_MODEL in llm_analysis.py plus the other names in
+# its MODELS block (same seds as setup.sh), read from the commit the checkout will be at
+# after the git step. MODELS holds them all; MODEL is the one model_manifest_rel acts on.
 detect_model() {
-    local src="" found=""
+    local src="" found="" others=""
     if [[ -n "$GIT_REMOTE_REF" ]] && src="$(git_in "$REPO_DIR" show "${GIT_REMOTE_REF}:llm_analysis.py" 2>/dev/null)"; then :
     else src="$(cat "${REPO_DIR}/llm_analysis.py" 2>/dev/null || true)"; fi
     found="$(printf '%s\n' "$src" | sed -n "s/^LOCAL_MODEL *= *[\"']\([^\"']*\)[\"'].*/\1/p" | head -1 || true)"
+    others="$(printf '%s\n' "$src" | sed -n '/^MODELS = (/,/^)/p' | sed -n 's/^ *ModelSpec("\([^"]*\)".*/\1/p' | tr '\n' ' ' || true)"
+    MODELS=()
     if [[ -n "$MODEL_OVERRIDE" ]]; then
-        MODEL="$MODEL_OVERRIDE"; MODEL_SOURCE="MODEL env override"
-        [[ -z "$found" || "$found" == "$MODEL" ]] || warn "MODEL=${MODEL} given, but llm_analysis.py asks for ${found}; the program will call ${found}."
+        read -r -a MODELS <<< "$MODEL_OVERRIDE"; MODEL_SOURCE="MODEL env override"
+        [[ -z "$found" || "${found} ${others}" == "${MODELS[*]} " ]] \
+            || warn "MODEL='${MODELS[*]}' given, but llm_analysis.py asks for ${found} ${others}; the program will call what the repo says."
     elif [[ -n "$found" ]]; then
-        MODEL="$found"; MODEL_SOURCE="llm_analysis.py"
+        read -r -a MODELS <<< "${found} ${others}"; MODEL_SOURCE="llm_analysis.py"
     else
-        MODEL=""; MODEL_SOURCE="unknown"
+        MODEL_SOURCE="unknown"
     fi
+    MODEL="${MODELS[0]:-}"
 }
 # MODEL is [host/][ns/]name[:tag], parsed exactly as setup.sh's model_parts does:
 # three or more path components mean the first is a registry host (hf.co/...).
@@ -207,6 +213,12 @@ manifest_display_name() {   # host/ns/name/tag -> the name Ollama shows for it
     if [[ "$host" != "registry.ollama.ai" ]]; then printf '%s/%s/%s:%s' "$host" "$ns" "$name" "$tag"
     elif [[ -z "$ns" || "$ns" == "library" ]]; then printf '%s:%s' "$name" "$tag"
     else printf '%s/%s:%s' "$ns" "$name" "$tag"; fi
+}
+wanted_rels=()           # the manifest paths (relative to manifests/) of every model the code asks for
+wanted_manifest() {      # wanted_manifest REL: whether REL is one of them
+    local w
+    for w in ${wanted_rels[@]+"${wanted_rels[@]}"}; do [[ "$1" != "$w" ]] || return 0; done
+    return 1
 }
 
 # ============================================================================= main
@@ -356,29 +368,36 @@ printf '  %smodel%s    %s\n' "$C_BOLD" "$C_RESET" "$MODELS_DIR"
 if [[ -n "$KEEP_MODELS" ]]; then
     item keep "model store untouched (--keep-models)"
 elif [[ ! -d "$MODELS_DIR" ]]; then
-    item absent "no model store yet; setup.sh downloads ${MODEL:-the model}"
+    item absent "no model store yet; setup.sh downloads ${MODELS[*]:-the models}"
 elif [[ -z "$MODEL" ]]; then
     warn "[model] LOCAL_MODEL not found in llm_analysis.py and MODEL not set; the model store is left alone"
 else
-    wanted_rel="$(model_manifest_rel)"
-    item wanted "${MODEL} (${MODEL_SOURCE}) -> manifests/${wanted_rel}"
-    kept_manifests=()
+    for MODEL in "${MODELS[@]}"; do
+        wanted_rels+=("$(model_manifest_rel)")
+        item wanted "${MODEL} (${MODEL_SOURCE}) -> manifests/$(model_manifest_rel)"
+    done
+    MODEL="${MODELS[0]}"
+    kept_manifests=(); present_n=0
     while IFS= read -r -d '' m; do
         rel="${m#"${MODELS_DIR}"/manifests/}"
-        if [[ "$rel" == "$wanted_rel" ]]; then
-            kept_manifests+=("$m"); MANIFEST_WANTED_PRESENT=1
+        if wanted_manifest "$rel"; then
+            kept_manifests+=("$m"); present_n=$((present_n + 1))
             item keep "manifest $(manifest_display_name "$rel")"
-        elif [[ "$rel" == "${wanted_rel}.partial" ]]; then
-            plan_delete "$m" "manifest ${MODEL} (partial)" "interrupted fetch; setup.sh refetches it"
+        elif [[ "$rel" == *.partial ]] && wanted_manifest "${rel%.partial}"; then
+            plan_delete "$m" "manifest $(manifest_display_name "${rel%.partial}") (partial)" "interrupted fetch; setup.sh refetches it"
         else
-            plan_delete "$m" "manifest $(manifest_display_name "$rel")" "not the model the code asks for"
+            plan_delete "$m" "manifest $(manifest_display_name "$rel")" "not a model the code asks for"
         fi
     done < <(find "${MODELS_DIR}/manifests" -type f -print0 2>/dev/null)
-    [[ -n "$MANIFEST_WANTED_PRESENT" ]] || item absent "${MODEL} is not in the store: setup.sh downloads it on the next online run (several GB, resumable)"
+    if [[ "$present_n" -eq ${#wanted_rels[@]} ]]; then
+        MANIFEST_WANTED_PRESENT=1
+    else
+        item absent "$((${#wanted_rels[@]} - present_n)) of ${#wanted_rels[@]} model(s) not in the store: setup.sh downloads them on the next online run (several GB, resumable)"
+    fi
     referenced=""
     [[ ${#kept_manifests[@]} -eq 0 ]] || referenced="$(cat "${kept_manifests[@]}" | grep -oE 'sha256:[0-9a-f]{64}' | tr ':' '-' | sort -u || true)"
     if [[ ${#kept_manifests[@]} -gt 0 && -z "$referenced" ]]; then
-        warn "[model] the ${MODEL} manifest lists no blobs (unreadable?); blobs are left alone, setup.sh will sort it out"
+        warn "[model] the kept manifest(s) list no blobs (unreadable?); blobs are left alone, setup.sh will sort it out"
     else
         # Without a kept manifest every blob is an orphan, except in-progress .partial downloads
         # of the wanted model, which setup.sh resumes. Ollama's own "-partial" leftovers go.
@@ -391,7 +410,7 @@ else
             fi
         done < <(find "${MODELS_DIR}/blobs" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
         [[ "$orphan_n" -eq 0 ]] || item delete "${orphan_n} blob(s) no remaining manifest references  (${C_DIM}$(hsize "$orphan_bytes")${C_RESET})"
-        [[ "$partial_kept" -eq 0 ]] || item keep "${partial_kept} resumable .partial blob(s) of ${MODEL}"
+        [[ "$partial_kept" -eq 0 ]] || item keep "${partial_kept} resumable .partial blob(s) of the model(s) still to fetch"
     fi
 fi
 
@@ -559,7 +578,7 @@ cat <<EOF
     1. cd ${REPO_DIR} && ./setup.sh
        It will: verify the venv and write its dependency stamp (pip against the pinned requirements),
        replace the September image with the one setup.sh pins (apptainer pull, mksquashfs capped),
-       download ${MODEL:-the model} if it is not in the store, regenerate ~/nlp-study.job and
+       download ${MODELS[*]:-the models} if they are not in the store, regenerate ~/nlp-study.job and
        ~/nlp-study-env.sh, and run the static (tier 0) preflight.
 EOF
 if [[ ${#PRESERVE_REL[@]} -gt 0 && -z "$KEEP_DATA" ]]; then

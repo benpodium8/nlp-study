@@ -33,11 +33,13 @@
 #  Sequence:  [login] ./setup.sh  ->  [qlogin] ./setup.sh  ->  [login] qsub ~/nlp-study.job --analyze --csv ./notes.csv
 #
 #  Optional environment overrides:
-#     MODEL=[host/][ns/]name:tag     model to fetch (default: LOCAL_MODEL in llm_analysis.py; hf.co/... works)
+#     MODEL="name:tag [name:tag ...]"  models to fetch, space-separated (default: the MODELS block in llm_analysis.py; hf.co/... works)
 #     NLP_REPO_URL=...               clone a fork or branch mirror instead of the GitHub repo
 #     NLP_PYTHON=/path/to/python     skip interpreter detection
 #     NLP_FAST_ROOT, NLP_BULK_ROOT   scratch dirs for repo+venv and image+model
 #     NLP_OLLAMA_IMAGE=docker://ollama/ollama:<tag>    container image (default 0.24.0: last to use driver 535 GPUs)
+#     NLP_REQUIRES_VERIFIED="name:tag ..."   models fetched although their config "requires" a newer Ollama than
+#                                    the image, because they are known to load on it (default: gpt-oss:20b)
 #     PIP_INSTALL_ARGS="..."         default: --only-binary=:all:
 #     NLP_JOB_QUEUE=UI NLP_JOB_SLOTS=8 NLP_JOB_HRT=24:00:00 NLP_JOB_GPU=1
 #     NLP_CONTEXT_LENGTH=8192        Ollama context window used by the job (8192 fits medgemma:27b on the A10; larger spills to CPU)
@@ -55,6 +57,10 @@ readonly REPO_URL="${NLP_REPO_URL:-https://github.com/benpodium8/nlp-study.git}"
 # need driver 550+ and crash or fall back to CPU. Move up only after the driver is upgraded.
 readonly OLLAMA_DRIVER535_MAX="0.24.0"
 readonly OLLAMA_IMAGE="${NLP_OLLAMA_IMAGE:-docker://ollama/ollama:${OLLAMA_DRIVER535_MAX}}"
+# Models whose registry config declares a newer "requires" than the image but are known to load on
+# it: 0.24.0 ignores the field, and its Go engine runs gpt-oss (load-tested 2026-10-13, see
+# model_candidates.md). The requires check (model_fits_ollama) only logs for these. Space-separated.
+readonly REQUIRES_VERIFIED="${NLP_REQUIRES_VERIFIED-gpt-oss:20b}"
 readonly JOB_SCRIPT="${HOME}/nlp-study.job"
 readonly ENV_SCRIPT="${HOME}/nlp-study-env.sh"
 readonly LOG_DIR="${HOME}/nlp-study-logs"
@@ -69,6 +75,7 @@ export GIT_TERMINAL_PROMPT=0                       # never block on a credential
 readonly CURL_NET=(--connect-timeout 30 --speed-limit 1024 --speed-time 60)
 
 MODEL="" MODEL_SOURCE="" SIF_OLLAMA="" M_REQUIRES=""
+MODELS=()   # every model the program calls, in run order; MODEL is the one the model_* functions act on
 PROJECT_ROOT="" ASSET_ROOT="" REPO_DIR="" VENV_DIR="" SIF_PATH="" SIF_PARTIAL="" SIF_IMAGE_STAMP="" MODELS_DIR=""
 APPT_CACHE="" APPT_TMP="" PREFLIGHT_PY="" PYTHON_BIN="" PYTHON_VER=""
 MODE="setup" FORCE_LIST="" ASSUME_YES=""
@@ -206,20 +213,26 @@ restore_user_data() {   # after a successful re-clone: put this run's stash back
     PRESERVED_DIR=""
 }
 
-# The model the program will actually call is LOCAL_MODEL in llm_analysis.py.
-detect_repo_model() {
-    local found=""
-    if [[ -r "${REPO_DIR}/llm_analysis.py" ]]; then
-        found="$(sed -n "s/^LOCAL_MODEL *= *[\"']\([^\"']*\)[\"'].*/\1/p" "${REPO_DIR}/llm_analysis.py" | head -1)"
+# The models the program will actually call: LOCAL_MODEL in llm_analysis.py (the first) plus
+# the other names in its MODELS block, one ModelSpec per line with the name as a double-quoted
+# literal (the first line uses LOCAL_MODEL itself and is covered by the first sed).
+detect_repo_models() {
+    local src="${REPO_DIR}/llm_analysis.py" found="" others=""
+    if [[ -r "$src" ]]; then
+        found="$(sed -n "s/^LOCAL_MODEL *= *[\"']\([^\"']*\)[\"'].*/\1/p" "$src" | head -1)"
+        others="$(sed -n '/^MODELS = (/,/^)/p' "$src" | sed -n 's/^ *ModelSpec("\([^"]*\)".*/\1/p' | tr '\n' ' ')"
     fi
+    MODELS=()
     if [[ -n "$MODEL_OVERRIDE" ]]; then
-        MODEL="$MODEL_OVERRIDE"; MODEL_SOURCE="MODEL env override"
-        [[ -z "$found" || "$found" == "$MODEL" ]] || warn "MODEL=${MODEL} given, but llm_analysis.py asks for ${found}; the program will call ${found}."
+        read -r -a MODELS <<< "$MODEL_OVERRIDE"; MODEL_SOURCE="MODEL env override"
+        [[ -z "$found" || "${found} ${others}" == "${MODELS[*]} " ]] \
+            || warn "MODEL='${MODELS[*]}' given, but llm_analysis.py asks for ${found} ${others}; the program will call what the repo says."
     elif [[ -n "$found" ]]; then
-        MODEL="$found"; MODEL_SOURCE="llm_analysis.py"
+        read -r -a MODELS <<< "${found} ${others}"; MODEL_SOURCE="llm_analysis.py"
     else
-        MODEL=""; MODEL_SOURCE="unknown"
+        MODEL_SOURCE="unknown"
     fi
+    MODEL="${MODELS[0]:-}"
 }
 
 # --- repo --------------------------------------------------------------------
@@ -350,9 +363,22 @@ config_requires() {   # config_requires CONFIG_BLOB: prints the "requires" versi
     py="$(command -v "${VENV_DIR}/bin/python" || command -v python3)" || return 0
     "$py" -I -c 'import json, sys; print(json.load(open(sys.argv[1])).get("requires", ""))' "$1" 2>/dev/null || true
 }
-model_fits_ollama() {   # false only when the config requires a newer Ollama than the image; sets M_REQUIRES
+requires_verified() {   # requires_verified NAME: NAME is listed in REQUIRES_VERIFIED
+    local m
+    for m in $REQUIRES_VERIFIED; do [[ "$m" != "$1" ]] || return 0; done
+    return 1
+}
+model_fits_ollama() {   # model_fits_ollama CONFIG_BLOB [NAME]: false only when the config requires a newer
+    local name="${2-$MODEL}"   # Ollama than the image and NAME (default MODEL) is not known to load anyway; sets M_REQUIRES
     M_REQUIRES="$(config_requires "$1")"
-    [[ -z "$SIF_OLLAMA" || -z "$M_REQUIRES" ]] || ! version_gt "$M_REQUIRES" "$SIF_OLLAMA"
+    if [[ -n "$SIF_OLLAMA" && -n "$M_REQUIRES" ]] && version_gt "$M_REQUIRES" "$SIF_OLLAMA"; then
+        if [[ -n "$name" ]] && requires_verified "$name"; then
+            log "[model] ${name}: its config says it requires Ollama ${M_REQUIRES}, but it is known to load on ${SIF_OLLAMA} (NLP_REQUIRES_VERIFIED)"
+            return 0
+        fi
+        return 1
+    fi
+    return 0
 }
 manifest_blobs() {   # prints "<digest> <size>" per blob (config first); prints nothing for a bad manifest
     local py
@@ -383,11 +409,23 @@ verify_model() {
     fi
     V_STATE="healthy"
 }
+verify_models() {   # every model in MODELS; V_STATE is the worst state found and V_REASON names the model
+    local m state="healthy" reason=""
+    [[ ${#MODELS[@]} -gt 0 ]] || { V_STATE="absent"; V_REASON="model names unknown until the repo exists"; return 0; }
+    for m in "${MODELS[@]}"; do
+        MODEL="$m"; V_STATE="absent"; V_REASON=""; verify_model
+        case "$V_STATE" in
+            broken) state="broken"; reason="${m}: ${V_REASON}"; break ;;
+            absent) if [[ "$state" == "healthy" ]]; then state="absent"; reason="${m} is not in the store"; fi ;;
+        esac
+    done
+    MODEL="${MODELS[0]}"; V_STATE="$state"; V_REASON="$reason"
+}
 destroy_model() {
     model_parts
     rm -f "$MANIFEST" "${MANIFEST}.partial"
-    # Blobs are kept unless forced: create_model only fetches what is missing or short.
-    if force_requested model; then run rm -rf "${MODELS_DIR:?}/blobs"; fi
+    # Blobs are kept: create_model only fetches what is missing or short. --force model wipes
+    # them once, before the models are fetched (section 5), since the models share the store.
 }
 create_model() {
     [[ -n "$MODEL" ]] || die "Cannot tell which model to fetch: LOCAL_MODEL not found in llm_analysis.py. Set MODEL=name:tag."
@@ -404,7 +442,7 @@ create_model() {
     fetch_blob "${base}/blobs/${d}" "${MODELS_DIR}/blobs/${d/:/-}" "$s" "${d#sha256:}"
     if ! model_fits_ollama "${MODELS_DIR}/blobs/${d/:/-}"; then
         rm -f "$tmp"
-        die "${MODEL} requires Ollama ${M_REQUIRES}, but the image has ${SIF_OLLAMA} (the last release that uses Argon's driver-535 GPUs is ${OLLAMA_DRIVER535_MAX}). Set LOCAL_MODEL in llm_analysis.py to a build without that requirement, e.g. a GGUF from hf.co."
+        die "${MODEL} requires Ollama ${M_REQUIRES}, but the image has ${SIF_OLLAMA} (the last release that uses Argon's driver-535 GPUs is ${OLLAMA_DRIVER535_MAX}). Pick a build without that requirement in llm_analysis.py (LOCAL_MODEL or the MODELS block), e.g. a GGUF from hf.co; if it is known to load on the image anyway, list it in NLP_REQUIRES_VERIFIED."
     fi
     log "[model] ${MODEL}: ${count} blobs, $((total / 1048576)) MB, into ${MODELS_DIR}"
     while read -r d s; do
@@ -444,14 +482,18 @@ fetch_blob() {   # fetch_blob URL DEST SIZE SHA256: single-threaded curl, resuma
 # Any stored model, not only the repo's, that needs a newer Ollama than the image
 # loses its manifest here; prune_model_store then drops the blobs nothing else uses.
 remove_incompatible_models() {
-    local mf d s
+    local mf d s m
+    local -a own=()
     if [[ -z "$SIF_OLLAMA" ]]; then
         log "[model] the image's Ollama version is unknown (no version tag); stored models not checked against it"; return 0
     fi
+    for m in ${MODELS[@]+"${MODELS[@]}"}; do MODEL="$m"; model_parts; own+=("$MANIFEST"); done   # the repo's models: verify_model judges them
+    MODEL="${MODELS[0]:-}"
     while IFS= read -r mf; do
+        for m in ${own[@]+"${own[@]}"}; do [[ "$mf" != "$m" && "$mf" != "${m}.partial" ]] || continue 2; done
         d=""; read -r d s < <(manifest_blobs "$mf") || true
-        [[ -n "$d" && -f "${MODELS_DIR}/blobs/${d/:/-}" ]] || continue   # unreadable or incomplete: verify_model handles the one in use
-        if ! model_fits_ollama "${MODELS_DIR}/blobs/${d/:/-}"; then
+        [[ -n "$d" && -f "${MODELS_DIR}/blobs/${d/:/-}" ]] || continue   # unreadable or incomplete: verify_model handles the ones in use
+        if ! model_fits_ollama "${MODELS_DIR}/blobs/${d/:/-}" ""; then
             warn "[model] removing ${mf#"${MODELS_DIR}/manifests/"}: requires Ollama ${M_REQUIRES}, the image has ${SIF_OLLAMA}"
             run rm -f "$mf"
         fi
@@ -480,10 +522,11 @@ data_worker.py catches every LLM exception per note, records llm_failed=1 and
 keeps going, so a dead endpoint or a wrong model never crashes a run; it just
 makes the run worthless. This script fails loudly up front instead.
 
-  --tier 0   static checks only: imports, model name, model blobs on disk,
-             writable dirs. No inference, no Ollama process. Safe anywhere.
-  --tier 1   tier 0 plus live calls through llm_analysis() against the server
-             at OLLAMA_HOST, with schema and extraction checks. Compute nodes.
+  --tier 0   static checks only: imports, model names, every model's blobs on
+             disk, writable dirs. No inference, no Ollama process. Safe anywhere.
+  --tier 1   tier 0 plus live calls through llm_analysis() for every model,
+             against the server at OLLAMA_HOST, with schema and extraction
+             checks. Compute nodes.
 """
 import argparse
 import csv
@@ -580,7 +623,7 @@ def count_notes(repo, fits=None):
     return total, too_long
 
 
-def tier0(repo, model, models_dir):
+def tier0(repo, models, models_dir):
     head("Imports")
     sys.path.insert(0, str(repo))
     mods = {}
@@ -599,29 +642,37 @@ def tier0(repo, model, models_dir):
         except Exception as exc:
             fail(f"import {name}: {exc}")
 
-    head("Model")
-    local = getattr(mods["llm_analysis"], "LOCAL_MODEL", None)
-    if local == model:
-        ok(f"llm_analysis.LOCAL_MODEL == {model!r}")
+    head("Models")
+    llm = mods["llm_analysis"]
+    local = getattr(llm, "LOCAL_MODEL", None)
+    repo_models = [spec.name for spec in getattr(llm, "MODELS", ())] or [local]
+    if local == models[0]:
+        ok(f"llm_analysis.LOCAL_MODEL == {models[0]!r}")
     else:
-        fail(f"llm_analysis.LOCAL_MODEL is {local!r} but setup fetched {model!r}",
+        fail(f"llm_analysis.LOCAL_MODEL is {local!r} but setup fetched {models[0]!r}",
              "Re-run setup.sh: it reads LOCAL_MODEL and fetches whatever the repo asks for.")
-    host, ns, name, tag = split_model(model)
-    manifest = models_dir / "manifests" / host / ns / name / tag
-    try:
-        data = json.loads(manifest.read_text())
-        blobs = [data["config"]] + data["layers"]
-        bad = []
-        for blob in blobs:
-            path = models_dir / "blobs" / blob["digest"].replace(":", "-")
-            if not path.is_file() or path.stat().st_size != blob["size"]:
-                bad.append(blob["digest"][7:19])
-        if bad:
-            fail(f"model blobs missing or truncated: {bad}", "Re-run setup.sh; it resumes the download.")
-        else:
-            ok(f"model store complete: {len(blobs)} blobs under {models_dir}")
-    except Exception as exc:
-        fail(f"no usable manifest at {manifest}: {exc}", "Re-run setup.sh to fetch the model.")
+    if repo_models == list(models):
+        ok(f"llm_analysis.MODELS names {len(models)} model(s): {', '.join(models)}")
+    else:
+        fail(f"llm_analysis.MODELS names {repo_models} but setup fetched {list(models)}",
+             "Re-run setup.sh: it reads the MODELS block and fetches every model the repo asks for.")
+    for model in models:
+        host, ns, name, tag = split_model(model)
+        manifest = models_dir / "manifests" / host / ns / name / tag
+        try:
+            data = json.loads(manifest.read_text())
+            blobs = [data["config"]] + data["layers"]
+            bad = []
+            for blob in blobs:
+                path = models_dir / "blobs" / blob["digest"].replace(":", "-")
+                if not path.is_file() or path.stat().st_size != blob["size"]:
+                    bad.append(blob["digest"][7:19])
+            if bad:
+                fail(f"{model}: model blobs missing or truncated: {bad}", "Re-run setup.sh; it resumes the download.")
+            else:
+                ok(f"{model}: model store complete, {len(blobs)} blobs under {models_dir}")
+        except Exception as exc:
+            fail(f"{model}: no usable manifest at {manifest}: {exc}", "Re-run setup.sh to fetch the model.")
 
     head("Filesystem")
     for path, what in ((repo, "data.db"), (repo / "output", "csv exports")):
@@ -688,7 +739,7 @@ def placement(base, want_ctx=None):
                  "Check the Ollama version and OLLAMA_CONTEXT_LENGTH.")
 
 
-def tier1(mods, model, reps, budget, notes):
+def tier1(mods, models, reps, budget, notes):
     head("Ollama endpoint")
     host = os.environ.get("OLLAMA_HOST", "")
     if not host:
@@ -701,12 +752,12 @@ def tier1(mods, model, reps, budget, notes):
         fail(f"cannot reach {base}/api/tags: {exc}", "In a job this means every note records llm_failed=1.")
         return
     ok(f"{base}/api/tags responded")
-    if model in served:
-        ok(f"{model!r} is served")
-    else:
-        fail(f"{model!r} is not served (server has: {served or 'nothing'})",
+    missing = [m for m in models if m not in served and f"{m}:latest" not in served]
+    if missing:
+        fail(f"{missing} not served (server has: {served or 'nothing'})",
              "OLLAMA_MODELS inside the container does not point at the fetched blobs.")
         return
+    ok(f"served: {', '.join(models)}")
     try:
         import ollama
         url = str(ollama._client._client.base_url).rstrip("/")
@@ -718,80 +769,90 @@ def tier1(mods, model, reps, budget, notes):
     except Exception as exc:
         warn(f"could not introspect the ollama client ({exc}); relying on /api/tags")
 
-    head(f"Live extraction: {reps} call(s) through llm_analysis(), {budget}s budget each")
     llm = mods["llm_analysis"]
+    specs = {spec.name: spec for spec in getattr(llm, "MODELS", ())}
 
     def on_alarm(*_):
         raise Timeout()
 
     signal.signal(signal.SIGALRM, on_alarm)
-    times, parsed, raw = [], None, None
-    for i in range(1, reps + 1):
-        start = time.time()
-        signal.alarm(budget)
-        try:
-            parsed, raw = llm.llm_analysis(-1, NOTE)
-        except Timeout:
-            fail(f"call {i}: no response within {budget}s",
-                 "Model on CPU instead of GPU, or a very long output. See placement below.")
-            break
-        except llm.LLMAnalysisError as exc:
-            fail(f"call {i}: {exc}", "Exactly what data_worker.py swallows per note as llm_failed=1.")
-            break
-        except Exception as exc:
-            fail(f"call {i}: unexpected {type(exc).__name__}: {exc}")
-            break
-        finally:
-            signal.alarm(0)
-        times.append(time.time() - start)
-        ok(f"call {i}: schema-valid JSON in {times[-1]:.1f}s")
-    placement(base, getattr(mods["llm_analysis"], "CONTEXT_LENGTH", None))
-    if len(times) < reps:
-        return
+    per_note = {}
+    for model in models:
+        spec = specs.get(model, model)   # the ModelSpec carries the model's window and think setting
+        head(f"Live extraction with {model}: {reps} call(s) through llm_analysis(), {budget}s budget each")
+        times, parsed, raw = [], None, None
+        for i in range(1, reps + 1):
+            start = time.time()
+            signal.alarm(budget)
+            try:
+                parsed, raw = llm.llm_analysis(-1, NOTE, spec)
+            except Timeout:
+                fail(f"{model} call {i}: no response within {budget}s",
+                     "Model on CPU instead of GPU, or a very long output. See placement below.")
+                break
+            except llm.LLMAnalysisError as exc:
+                fail(f"{model} call {i}: {exc}", "Exactly what data_worker.py swallows per note as llm_failed=1.")
+                break
+            except Exception as exc:
+                fail(f"{model} call {i}: unexpected {type(exc).__name__}: {exc}")
+                break
+            finally:
+                signal.alarm(0)
+            times.append(time.time() - start)
+            ok(f"{model} call {i}: schema-valid JSON in {times[-1]:.1f}s")
+        placement(base, getattr(spec, "num_ctx", None) or getattr(llm, "CONTEXT_LENGTH", None))
+        if len(times) < reps:
+            continue
 
-    head("Extraction quality on the synthetic note")
-    for field, want in HARD.items():
-        if parsed.get(field) == want:
-            ok(f"{field} == {want}")
-        else:
-            fail(f"{field} == {parsed.get(field)!r}, expected {want}",
-                 "Unambiguous in the note text; a model that misses it will misclassify the corpus.")
-    for field, want in SOFT.items():
-        if parsed.get(field) == want:
-            ok(f"{field} == {want}")
-        else:
-            warn(f"{field} == {parsed.get(field)!r}, expected {want} (phrasing-sensitive; review before trusting the run)")
-    scope = parsed.get("ScopeType")
-    report = ok if scope and "H190" in str(scope) else warn
-    report(f"ScopeType == {scope!r} (expected something like 'Olympus H190')")
+        head(f"Extraction quality on the synthetic note ({model})")
+        for field, want in HARD.items():
+            if parsed.get(field) == want:
+                ok(f"{field} == {want}")
+            else:
+                fail(f"{model}: {field} == {parsed.get(field)!r}, expected {want}",
+                     "Unambiguous in the note text; a model that misses it will misclassify the corpus.")
+        for field, want in SOFT.items():
+            if parsed.get(field) == want:
+                ok(f"{field} == {want}")
+            else:
+                warn(f"{model}: {field} == {parsed.get(field)!r}, expected {want} (phrasing-sensitive; review before trusting the run)")
+        scope = parsed.get("ScopeType")
+        report = ok if scope and "H190" in str(scope) else warn
+        report(f"ScopeType == {scope!r} (expected something like 'Olympus H190')")
+        if not raw.strip().startswith("{"):
+            warn(f"{model}: output is not bare JSON, so the repair layer is doing work; data_worker retries up to 5x per note on invalid or unusable output")
+        per_note[model] = sum(times) / len(times)
+        print(f"        {per_note[model]:.1f}s per note (range {min(times):.1f}-{max(times):.1f}s)")
 
-    head("Throughput")
-    if not raw.strip().startswith("{"):
-        warn("output is not bare JSON, so the repair layer is doing work; data_worker retries up to 5x per note on invalid or unusable output")
-    avg = sum(times) / len(times)
-    print(f"        {avg:.1f}s per note (range {min(times):.1f}-{max(times):.1f}s)")
-    for n in (100, 1000, notes):
-        if n > 0:
-            print(f"        {n:>6} notes  ~{avg * n / 3600:6.1f} h  (single-threaded, no retries)")
-    if avg > 60:
-        warn("over a minute per note: use a GPU queue (NLP_JOB_QUEUE=UI-GPU NLP_JOB_GPU=1) or a longer NLP_JOB_HRT")
-
+    if per_note:
+        head("Throughput")
+        total = sum(per_note.values())
+        for model, avg in per_note.items():
+            print(f"        {avg:6.1f}s per note  {model}")
+        if len(per_note) > 1:
+            print(f"        {total:6.1f}s per note over all {len(per_note)} models")
+        for n in (100, 1000, notes):
+            if n > 0:
+                print(f"        {n:>6} notes  ~{total * n / 3600:6.1f} h  (single-threaded, no retries, every model)")
+        if total > 60:
+            warn("over a minute per note across the models: use a GPU queue (NLP_JOB_QUEUE=UI-GPU NLP_JOB_GPU=1) or a longer NLP_JOB_HRT")
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo", required=True, type=Path)
-    ap.add_argument("--model", required=True)
+    ap.add_argument("--model", action="append", dest="models", required=True, metavar="NAME",
+                    help="a model the program calls; repeat for each, in run order")
     ap.add_argument("--models-dir", required=True, type=Path)
     ap.add_argument("--tier", type=int, default=1, choices=(0, 1))
     ap.add_argument("--reps", type=int, default=int(os.environ.get("NLP_PREFLIGHT_REPS", "3")))
     ap.add_argument("--budget", type=int, default=int(os.environ.get("NLP_PREFLIGHT_BUDGET", "600")))
     ap.add_argument("--notes", type=int, default=0, help="rows in notes.csv, for the projection (default: counted)")
     args = ap.parse_args()
-    print(paint("1", f"nlp-study preflight, tier {args.tier}: repo={args.repo} model={args.model}"))
+    print(paint("1", f"nlp-study preflight, tier {args.tier}: repo={args.repo} models={' '.join(args.models)}"))
 
-    mods = tier0(args.repo, args.model, args.models_dir)
+    mods = tier0(args.repo, args.models, args.models_dir)
     if args.tier >= 1 and mods and not FAILS:
-        tier1(mods, args.model, args.reps, args.budget, args.notes or count_notes(args.repo)[0])
+        tier1(mods, args.models, args.reps, args.budget, args.notes or count_notes(args.repo)[0])
 
     print()
     if FAILS:
@@ -836,6 +897,7 @@ export NLP_VENV_DIR="${VENV_DIR}"
 export NLP_SIF="${SIF_PATH}"
 export NLP_MODELS_DIR="${MODELS_DIR}"
 export NLP_MODEL="${MODEL}"
+export NLP_MODELS="${MODELS[*]:-}"
 export NLP_PREFLIGHT="${PREFLIGHT_PY}"
 export NLP_LOG_DIR="${LOG_DIR}"
 export APPTAINER_CACHEDIR="${APPT_CACHE}" APPTAINER_TMPDIR="${APPT_TMP}"
@@ -865,7 +927,8 @@ nlp_start_ollama() {
     mkdir -p "$NLP_LOG_DIR"
     apptainer exec ${nv:+--nv} --bind "${NLP_MODELS_DIR}:/models" \
         --env OLLAMA_MODELS=/models --env OLLAMA_HOST="$OLLAMA_HOST" \
-        --env OLLAMA_KEEP_ALIVE=-1 --env OLLAMA_CONTEXT_LENGTH="${NLP_CONTEXT_LENGTH:-8192}" \
+        --env OLLAMA_KEEP_ALIVE=-1 --env OLLAMA_MAX_LOADED_MODELS=1 \
+        --env OLLAMA_CONTEXT_LENGTH="${NLP_CONTEXT_LENGTH:-8192}" \
         "$NLP_SIF" ollama serve >"$NLP_OLLAMA_LOG" 2>&1 &
     NLP_OLLAMA_PID=$!
     echo "Ollama starting on ${OLLAMA_HOST} (pid ${NLP_OLLAMA_PID}, gpu: ${nv:-none}, context ${NLP_CONTEXT_LENGTH:-8192}, log ${NLP_OLLAMA_LOG})"
@@ -889,14 +952,16 @@ nlp_stop_ollama() {
     unset NLP_OLLAMA_PID
 }
 
-# nlp_preflight [0|1]: tier 1 (default) needs nlp_start_ollama first.
+# nlp_preflight [0|1]: tier 1 (default) needs nlp_start_ollama first. Checks every model in NLP_MODELS.
 nlp_preflight() {
-    python "$NLP_PREFLIGHT" --repo "$NLP_REPO_DIR" --model "$NLP_MODEL" --models-dir "$NLP_MODELS_DIR" --tier "${1:-1}"
+    local m; local -a args=()
+    for m in $NLP_MODELS; do args+=(--model "$m"); done
+    python "$NLP_PREFLIGHT" --repo "$NLP_REPO_DIR" ${args[@]+"${args[@]}"} --models-dir "$NLP_MODELS_DIR" --tier "${1:-1}"
 }
 
 cd "$NLP_REPO_DIR" && . "${NLP_VENV_DIR}/bin/activate"
 if [ -z "${NLP_QUIET:-}" ]; then
-    echo "nlp-study ready: repo ${NLP_REPO_DIR}, model ${NLP_MODEL}"
+    echo "nlp-study ready: repo ${NLP_REPO_DIR}, models ${NLP_MODELS}"
     echo "  nlp_start_ollama   then   nlp_preflight   then   python app.py --analyze --csv ./notes.csv"
 fi
 EOF
@@ -923,7 +988,7 @@ export NLP_QUIET=1
 EOF
         cat <<'EOF'
 set -u
-echo "nlp-study job ${JOB_ID:-?} on $(hostname), $(date); slots ${NSLOTS:-?}; model ${NLP_MODEL}; args: $*"
+echo "nlp-study job ${JOB_ID:-?} on $(hostname), $(date); slots ${NSLOTS:-?}; models ${NLP_MODELS}; args: $*"
 nlp_start_ollama
 trap nlp_stop_ollama EXIT
 if [ -z "${NLP_SKIP_PREFLIGHT:-}" ]; then
@@ -1040,15 +1105,15 @@ if is_login_node; then
         kill $orphans 2>/dev/null || true
     fi
 fi
-detect_repo_model
-log "Model: ${MODEL:-<unknown until the repo is cloned>} (${MODEL_SOURCE})"
+detect_repo_models
+log "Models: ${MODELS[*]:-<unknown until the repo is cloned>} (${MODEL_SOURCE})"
 
 # ----------------------------------------------------------------------------- --status
 if [[ "$MODE" == "status" ]]; then
     section "Status"
     refresh_sif_ollama
     for r in repo venv sif model; do
-        V_STATE="absent"; V_REASON=""; "verify_$r"
+        V_STATE="absent"; V_REASON=""; if [[ "$r" == model ]]; then verify_models; else "verify_$r"; fi
         case "$r" in repo) p="$REPO_DIR" ;; venv) p="$VENV_DIR" ;; sif) p="$SIF_PATH" ;; model) p="$MODELS_DIR" ;; esac
         case "$V_STATE" in healthy) col="$C_GREEN" ;; broken) col="$C_RED" ;; *) col="$C_YELLOW" ;; esac
         printf '  %-6s %s%-8s%s %s%s\n' "$r" "$col" "$V_STATE" "$C_RESET" "$p" "${V_REASON:+  ($V_REASON)}"
@@ -1082,7 +1147,7 @@ fi
 if [[ "$MODE" == "preflight" ]]; then
     section "Preflight on the existing install"
     for r in repo venv sif model; do
-        V_STATE="absent"; V_REASON=""; "verify_$r"
+        V_STATE="absent"; V_REASON=""; if [[ "$r" == model ]]; then verify_models; else "verify_$r"; fi
         [[ "$V_STATE" == "healthy" ]] || die "[${r}] is ${V_STATE}${V_REASON:+ (${V_REASON})}. Repair it from a login node: ${SELF}"
         ok "[${r}] healthy"
     done
@@ -1103,9 +1168,9 @@ fi
 [[ -z "$(ls -A "${PROJECT_ROOT}/preserved" 2>/dev/null)" ]] \
     || warn "Earlier runs left user data under ${PROJECT_ROOT}/preserved/ (from --clean or an interrupted rebuild); review it."
 log "HEAD: $(git_in "$REPO_DIR" log -1 --format='%h %ad %s' --date=short)"
-detect_repo_model
+detect_repo_models
 [[ -n "$MODEL" ]] || die "LOCAL_MODEL not found in llm_analysis.py; set MODEL=name:tag and re-run."
-ok "Model requested by the repo: ${MODEL} (${MODEL_SOURCE})"
+ok "Models requested by the repo: ${MODELS[*]} (${MODEL_SOURCE})"
 
 # ============================================================================= 2. python
 section "Python interpreter"
@@ -1201,10 +1266,15 @@ elif version_gt "$SIF_OLLAMA" "$OLLAMA_DRIVER535_MAX"; then
 fi
 
 # ============================================================================= 5. model
-section "Model: ${MODEL}"
+section "Models: ${MODELS[*]}"
 remove_incompatible_models
 prune_model_store
-ensure_resource model
+if force_requested model; then run rm -rf "${MODELS_DIR:?}/blobs"; fi   # once, not per model: they share the blob store
+for MODEL in "${MODELS[@]}"; do
+    log "[model] ${MODEL}"
+    ensure_resource model
+done
+MODEL="${MODELS[0]}"
 prune_model_store
 log "[model] store size: $(du -sh "$MODELS_DIR" | cut -f1)"
 
@@ -1228,7 +1298,7 @@ cat <<EOF
   repo        ${REPO_DIR}
   venv        ${VENV_DIR}
   image       ${SIF_PATH}
-  model       ${MODEL}  in ${MODELS_DIR}
+  models      ${MODELS[*]}  in ${MODELS_DIR}
   job script  ${JOB_SCRIPT}
   env script  ${ENV_SCRIPT}
   logs        ${LOG_DIR}/

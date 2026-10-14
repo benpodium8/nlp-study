@@ -21,6 +21,55 @@ DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 # note_fits_context); raise NLP_CONTEXT_LENGTH only on a GPU with room for the larger cache.
 CONTEXT_LENGTH = int(os.environ.get("NLP_CONTEXT_LENGTH", "8192"))
 
+
+class ModelSpec(NamedTuple):
+    """
+    One model the program sends every note to: the Ollama model name, the context window
+    (num_ctx) it is called with, and the chat call's think setting. Its label,
+    "<name>@<num_ctx>" such as "medgemma:27b@8192", names the result columns that hold its
+    answers (database.column_name), so two models, or one model called with two window
+    sizes, never share a column.
+
+    think goes to Ollama as it is. False turns reasoning off for a model that would otherwise
+    think before answering (Gemma 4) and is accepted for one that cannot think at all
+    (MedGemma; Ollama 0.24.0 rejects think only when it is true for such a model). A level
+    ("low", "medium" or "high") is for a reasoning model that returns empty content when
+    given a boolean False (gpt-oss on 0.24.0). None leaves the model's own default.
+    """
+    name: str
+    num_ctx: int
+    think: bool | str | None = False
+
+    @property
+    def label(self) -> str:
+        return f"{self.name}@{self.num_ctx}"
+
+
+# The models every note is sent to, in run order, all with the same context window so that
+# every model sees the same notes (a note that does not fit the window is failed for each
+# model alike). Each one's extracted fields, review flags and debugging columns are stored
+# and exported under its own label, for a comparison across models. They run one after
+# another: each fits Argon's A10 (24 GB) on its own with its KV cache, not together.
+#
+# setup.sh and migrate.sh read the names of this block with sed: keep one ModelSpec per line,
+# the first with LOCAL_MODEL and every other with its name as a double-quoted literal first
+# argument (ARGON_RUNBOOK.md 15.2). --model replaces the list with one model for a local test.
+#
+#   gemma4:26b-a4b-it-q4_K_M  Gemma 4 26B mixture of experts (3.8B active), Q4_K_M, 18.0 GB,
+#       Apache 2.0. Vision is merged into its GGUF and its config requires only Ollama 0.20,
+#       so it loads on 0.24.0 (the default gemma4:26b tag does not). Blob digest as of
+#       2026-10-13: sha256:7121486771cb... think=False: it would otherwise reason before
+#       answering, six times slower.
+#   gpt-oss:20b  OpenAI gpt-oss 20B mixture of experts (3.6B active), MXFP4, 13.8 GB,
+#       Apache 2.0. A reasoning model: think must be a level, not False. Its registry config
+#       says it requires Ollama 0.30.0, which 0.24.0 ignores: it was load-tested there on
+#       2026-10-13 (model_candidates.md), so setup.sh lists it in NLP_REQUIRES_VERIFIED.
+MODELS = (
+    ModelSpec(LOCAL_MODEL, CONTEXT_LENGTH),
+    ModelSpec("gemma4:26b-a4b-it-q4_K_M", CONTEXT_LENGTH),
+    ModelSpec("gpt-oss:20b", CONTEXT_LENGTH, think="low"),
+)
+
 # How much of the context window a note may take. Measured with the Gemma 3 tokenizer, which
 # medgemma:27b and gemma3 share: the system prompt and user template take 1,664 tokens, and
 # this clinical text runs 3.2 to 3.8 characters per token. Ollama does not refuse a prompt
@@ -40,16 +89,16 @@ def estimated_prompt_tokens(note: str) -> int:
     return PROMPT_OVERHEAD_TOKENS + int(len(note) / NOTE_CHARS_PER_TOKEN)
 
 
-def note_fits_context(note: str) -> bool:
-    """Whether the prompt for note, plus a normal answer, fits the context window."""
-    return estimated_prompt_tokens(note) + ANSWER_RESERVE_TOKENS <= CONTEXT_LENGTH
+def note_fits_context(note: str, context_length: int = CONTEXT_LENGTH) -> bool:
+    """Whether the prompt for note, plus a normal answer, fits a context window of context_length."""
+    return estimated_prompt_tokens(note) + ANSWER_RESERVE_TOKENS <= context_length
 
 
-def too_long_error(note: str) -> str:
+def too_long_error(note: str, context_length: int = CONTEXT_LENGTH) -> str:
     """The LLM_Error text for a note that was not sent because it does not fit the context."""
     return (
         f"{TOO_LONG_PREFIX}: about {estimated_prompt_tokens(note)} prompt tokens "
-        f"({len(note)} characters), more than the {CONTEXT_LENGTH}-token context window allows "
+        f"({len(note)} characters), more than the {context_length}-token context window allows "
         f"(NLP_CONTEXT_LENGTH); no model call was made."
     )
 
@@ -68,15 +117,16 @@ RETRY_TEMPERATURE = 0.8
 RETRY_REPEAT_PENALTY = 1.1
 
 
-def generation_options(attempt: int) -> dict:
+def generation_options(attempt: int, num_ctx: int = CONTEXT_LENGTH) -> dict:
     """
-    Returns the Ollama options for the given attempt (1-based): greedy on the first
-    attempt, seeded sampling with a repeat penalty on retries.
+    Returns the Ollama options for the given attempt (1-based) and context window: greedy
+    on the first attempt, seeded sampling with a repeat penalty on retries.
     """
     if attempt == 1:
-        return GENERATION_OPTIONS
+        return {**GENERATION_OPTIONS, "num_ctx": num_ctx}
     return {
         **GENERATION_OPTIONS,
+        "num_ctx": num_ctx,
         "temperature": RETRY_TEMPERATURE,
         "seed": attempt,
         "repeat_penalty": RETRY_REPEAT_PENALTY,
@@ -266,10 +316,16 @@ class RetryableLLMError(LLMAnalysisError):
 
 
 class OllamaStatus(NamedTuple):
-    host: str              # the server address the client uses
-    reachable: bool        # the server answered /api/tags
-    model_available: bool  # the requested model is among the models it serves
-    detail: str            # the error when unreachable, else the served model names
+    host: str                   # the server address the client uses
+    reachable: bool             # the server answered /api/tags
+    model_available: bool       # the requested model is among the models it serves
+    detail: str                 # the error when unreachable, else the served model names
+    served: tuple[str, ...] = ()  # the served model names, for checking further models
+
+
+def model_served(model: str, served: tuple[str, ...]) -> bool:
+    """Whether model is among the served names (Ollama lists "name" as "name:latest" too)."""
+    return model in served or f"{model}:latest" in served
 
 
 def ollama_status(model: str = LOCAL_MODEL, timeout: float = 3.0) -> OllamaStatus:
@@ -282,9 +338,8 @@ def ollama_status(model: str = LOCAL_MODEL, timeout: float = 3.0) -> OllamaStatu
         models = ollama.Client(timeout=timeout).list().models
     except Exception as e:
         return OllamaStatus(host, False, False, f"{type(e).__name__}: {e}")
-    names = [m.model for m in models if m.model]
-    available = model in names or f"{model}:latest" in names
-    return OllamaStatus(host, True, available, ", ".join(names) or "no models pulled")
+    names = tuple(m.model for m in models if m.model)
+    return OllamaStatus(host, True, model_served(model, names), ", ".join(names) or "no models pulled", names)
 
 
 def _strip_markdown_fences(text: str) -> str:
@@ -737,10 +792,11 @@ def verify_against_note(result: dict, note: str):
 
 
 def llm_analysis(
-    id: int, note: str, model: str = LOCAL_MODEL, attempt: int = 1, rejected: str | None = None
+    id: int, note: str, model: ModelSpec | str = LOCAL_MODEL, attempt: int = 1, rejected: str | None = None
 ) -> Tuple[dict, str]:
     """
-    Analyzes a clinical note using an LLM (the Ollama model named by model) to extract the study fields.
+    Analyzes a clinical note using an LLM (the Ollama model given by model, a ModelSpec or a
+    bare model name called with the default context window) to extract the study fields.
     attempt (1-based) selects the generation options; see generation_options. rejected is the
     reason the previous attempt failed (a RetryableLLMError message); it is added to the prompt.
 
@@ -752,6 +808,7 @@ def llm_analysis(
     Returns:
         (result, raw): the validated field dictionary (with the note id) and the verbatim model text.
     """
+    spec = model if isinstance(model, ModelSpec) else ModelSpec(str(model), CONTEXT_LENGTH)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": USER_PROMPT.format(note=note)},
@@ -763,8 +820,8 @@ def llm_analysis(
     # is closed when the call returns instead of being held open between notes.
     try:
         with ollama.Client() as client:
-            response = client.chat(model=model, messages=messages, think=False, format=RESPONSE_SCHEMA,
-                                   options=generation_options(attempt))
+            response = client.chat(model=spec.name, messages=messages, think=spec.think,
+                                   format=RESPONSE_SCHEMA, options=generation_options(attempt, spec.num_ctx))
     except Exception as e:
         # Ollama stops a model that keeps repeating itself ("prediction aborted, token repeat
         # limit reached", a 500). That is the repetition loop the retries exist for.

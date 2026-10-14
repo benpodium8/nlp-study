@@ -133,7 +133,7 @@ notes.csv ──> SQLite notes table
 | --- | --- |
 | `python app.py` | Prints what the program needs, typical use, and a status check of the current directory (Ollama reachable, model pulled, notes in `data.db` and how many are pending, export present), then exits 0. On a login node the Ollama line says NOT reachable, which is expected there; the probe is a 3 s client request and starts nothing |
 | `python app.py --csv FILE` | Ingests the CSV (duplicates skipped) and reports rows read, notes added and duplicates skipped |
-| `python app.py --analyze --csv FILE` | Ingests, runs the LLM on every note without a result, writes `output/results.csv` |
+| `python app.py --analyze --csv FILE` | Ingests, runs each of the three models on every note that lacks its result, writes `output/results.csv` |
 | `python app.py --analyze` | Same, without ingesting. Resumes an interrupted run |
 | `python app.py --clean` | Deletes `data.db` (with any `-journal`/`-wal`/`-shm` file) and `output/results.csv`, and `output/` if that leaves it empty. No prompt. Combined with `--csv`/`--analyze` it runs first, giving a fresh run; a missing `--csv` file aborts before anything is deleted |
 
@@ -162,13 +162,13 @@ What the researcher actually needs from these fields is in [15.5](#155-study-req
 
 - `RetryableLLMError` (invalid JSON, a text field that reached the 1000-character cap, a missing field, wrong type, unexpected field, flag not 0/1, negative count): retried, up to 5 attempts total. Each retry is a complete generation with the rejection reason appended to the prompt (the rejected answer is not sent back), sampled at temperature 0.8 with `repeat_penalty` 1.1 and `seed` = attempt number.
 - `LLMAnalysisError` from the call itself (`LLM call failed: ...`, e.g. the server is down) or any other exception: stored immediately with `LLM_Failed = 1`, no retry.
-- Every note gets a `results` row with `LLM_Attempts`, `LLM_Seconds` and, on failure, `LLM_Error`. The log carries one timestamped line per note (`ok` or `FAILED`, with the time taken, the attempt count and the structured fields, never note text), a `retry` line with the reason for every retry, a `progress` line every 10 notes with the projected time remaining, and a final summary that lists the failed ids.
+- Every note gets a `results` row, and every model its own block of columns in it (`<field> (<model>@<context>)`, Appendix D) with `LLM_Attempts`, `LLM_Seconds` and, on failure, `LLM_Error`. The log carries one timestamped line per note (`ok` or `FAILED`, with the time taken, the attempt count and the structured fields, never note text), a `retry` line with the reason for every retry, a `progress` line every 10 notes with the projected time remaining, and a final summary that lists the failed ids.
 - The loop never raises. The process exits 0 even when every note failed. This is why the preflight exists (section 6).
 
 ### 2.4 Idempotency
 
 - Ingest skips a row only if all six fields match an existing row exactly.
-- `data_worker` skips any note id that already has a `results` row.
+- `data_worker` runs one model at a time and skips any note that already has a result under that model's label (its `LLM_Failed` column is not null).
 - The export is skipped if `output/results.csv` already exists.
 
 ---
@@ -329,9 +329,11 @@ September version: the model step started a temporary Ollama server on the login
 
 ### 5.4 Model name resolution
 
-`setup.sh` does not hardcode the model. `detect_repo_model()` reads the first line matching `^LOCAL_MODEL *= *"..."` in `llm_analysis.py` (no leading whitespace allowed). `MODEL=name:tag ./setup.sh` overrides but warns if it disagrees with the repo, because the program will call whatever the repo says. If neither source yields a name the script dies. There is no `gemma4:e2b` fallback any more. Names parse as Ollama does: `medgemma:27b` is `registry.ollama.ai/library/medgemma:27b`, and `hf.co/<user>/<repo>:<quant>` is fetched from Hugging Face, which serves the same registry protocol.
+`setup.sh` does not hardcode the models. `detect_repo_models()` reads the first line matching `^LOCAL_MODEL *= *"..."` in `llm_analysis.py` (no leading whitespace allowed) and then the `MODELS = (` ... `)` block, taking the double-quoted name from every `ModelSpec("..."` line in it (the block's first line names `LOCAL_MODEL` itself); the result is the list the program calls, `LOCAL_MODEL` first. `MODEL="name:tag [name:tag ...]" ./setup.sh` overrides the list but warns if it disagrees with the repo, because the program will call whatever the repo says. If neither source yields a name the script dies. Every model in the list is fetched, verified and pruned around in turn (`MODEL` is the one the model functions act on). There is no `gemma4:e2b` fallback any more. Names parse as Ollama does: `medgemma:27b` is `registry.ollama.ai/library/medgemma:27b`, and `hf.co/<user>/<repo>:<quant>` is fetched from Hugging Face, which serves the same registry protocol.
 
 Since 2026-10-13 the model is `medgemma:27b` (MedGemma 27B, Gemma 3 based, Q4_K_M, 17.4 GB, model blob `sha256:4b97da6b21a8...`), called with `think=False`. Its registry config declares no `requires` and it ships no separate projector layer, so it passes `setup.sh`'s check and loads on 0.24.0. Ollama 0.24.0 rejects `think` only when it is true for a model without thinking support, so `think=False` is safe. It replaced `hf.co/ggml-org/gemma-3-12b-it-GGUF:Q4_K_M` (Gemma 3 12B instruct, Q4_K_M, about 7.8 GB, published March 2025 by the llama.cpp maintainers). Every `gemma3` and `gemma4` tag on `registry.ollama.ai` now declares `requires` 0.30.0 or newer in its config. The image is pinned to Ollama 0.24.0 for the driver-535 GPUs. Ollama 0.24.0 does not check `requires` itself, the registry checks it on `ollama pull`, and curl skips that check, so `setup.sh` reads the field and checks it itself. The Hugging Face build declares no requirement.
+
+Since 2026-10-14 every note also goes to `gemma4:26b-a4b-it-q4_K_M` (Gemma 4 26B mixture of experts, 3.8B active, Q4_K_M, 18.0 GB, config requires Ollama 0.20.0, blob `sha256:7121486771cb...`, `think=False`; the default `gemma4:26b` tag does not load on 0.24.0) and `gpt-oss:20b` (gpt-oss 20B mixture of experts, MXFP4, 13.8 GB, config blob `sha256:e103573196b6...`; a reasoning model called with `think="low"`, because a boolean `think=False` returns empty content from it on 0.24.0; its config declares `requires` 0.30.0, which 0.24.0 ignores and which the load test of 2026-10-13 disproved, so `setup.sh` lists it in `NLP_REQUIRES_VERIFIED` and only logs the mismatch), in that order after `medgemma:27b`, each at the same 8192-token window so all three see the same notes, and each with its own block of result columns (Appendix D) for a comparison across the models. `setup.sh` fetches all three, the preflight checks and exercises each, and `nlp_start_ollama` sets `OLLAMA_MAX_LOADED_MODELS=1`: each model fits the A10 alone, no two together, and `data_worker` runs them one after another.
 
 ### 5.5 Installed package set (venv, 2026-09-14)
 
@@ -391,8 +393,8 @@ spacy 3.8.14, thinc 8.3.13, blis 1.3.3, numpy 2.2.6, ollama 0.6.2, httpx 0.28.1,
 
 | Tier | Where | What it checks |
 | --- | --- | --- |
-| 0 | anywhere, including login nodes; seconds; no Ollama process | Imports of `llm_analysis`, `data_worker`, `database`, `cli`, `ollama`, `rich`. `LOCAL_MODEL` equals the model setup fetched. The model manifest exists and every blob is present at the right size. Repo dir and `output/` are writable |
-| 1 | inside an SGE job, after `nlp_start_ollama` | Tier 0, then: `OLLAMA_HOST` set, `/api/tags` responds, the model is served, the module-level `ollama` client points at that host. Then real `llm_analysis()` calls on a synthetic PHI-free note under a `SIGALRM` budget. Model placement via `/api/ps` (percentage of the model in VRAM). Extraction spot checks. Latency and projection |
+| 0 | anywhere, including login nodes; seconds; no Ollama process | Imports of `llm_analysis`, `data_worker`, `database`, `cli`, `ollama`, `rich`. `LOCAL_MODEL` and the names in `MODELS` equal the models setup fetched. Every model's manifest exists and every blob is present at the right size. Repo dir and `output/` are writable |
+| 1 | inside an SGE job, after `nlp_start_ollama` | Tier 0, then: `OLLAMA_HOST` set, `/api/tags` responds, every model is served, the module-level `ollama` client points at that host. Then, for each model in turn: real `llm_analysis()` calls on a synthetic PHI-free note under a `SIGALRM` budget, model placement via `/api/ps` (percentage of the model in VRAM) and extraction spot checks. Latency per model and a projection for all three |
 
 Tier 1 expectations on the synthetic note:
 
@@ -414,7 +416,7 @@ September version: tier 0 also probed the endpoint (so it needed a running serve
 ### 6.4 Direct invocation
 
 ```bash
-python /nfsscratch/Users/apkane/nlp-study/nlp-preflight.py --repo /nfsscratch/Users/apkane/nlp-study/repo --model medgemma:27b --models-dir /nfsscratch/Users/apkane/nlp-study-assets/ollama-models --tier 1 --reps 3 --budget 600 --notes 5000
+python /nfsscratch/Users/apkane/nlp-study/nlp-preflight.py --repo /nfsscratch/Users/apkane/nlp-study/repo --model medgemma:27b --model gemma4:26b-a4b-it-q4_K_M --model gpt-oss:20b --models-dir /nfsscratch/Users/apkane/nlp-study-assets/ollama-models --tier 1 --reps 3 --budget 600 --notes 5000
 ```
 
 `--models-dir` is required in the rewrite. For tier 1, `OLLAMA_HOST` must already be exported and a server listening; `nlp_start_ollama` from `~/nlp-study-env.sh` does both. `NLP_COLOR=1` forces colour when stdout is not a TTY.
@@ -434,8 +436,8 @@ Everything after the script name is forwarded to `app.py` verbatim (`"$@"`). `./
 What the job does (full script in Appendix B):
 
 1. Sources `~/nlp-study-env.sh` quietly: exports the `NLP_*` paths, defines the helper functions, `cd`s into the repo, activates the venv.
-2. `nlp_start_ollama`: picks a free localhost port, exports `OLLAMA_HOST`, starts `ollama serve` in the container (with `--nv` only if `nvidia-smi -L` succeeds, `OLLAMA_CONTEXT_LENGTH` 8192 by default), logs to `~/nlp-study-logs/ollama-<JOB_ID>.log`, waits up to 180 s for `/api/tags`. Traps `nlp_stop_ollama` on exit (TERM, then KILL after 10 s).
-3. Runs the tier 1 preflight with 1 rep unless `NLP_SKIP_PREFLIGHT` is set. Non-zero exit aborts the job before `app.py`.
+2. `nlp_start_ollama`: picks a free localhost port, exports `OLLAMA_HOST`, starts `ollama serve` in the container (with `--nv` only if `nvidia-smi -L` succeeds, `OLLAMA_CONTEXT_LENGTH` 8192 by default, `OLLAMA_MAX_LOADED_MODELS=1` so one model is resident at a time), logs to `~/nlp-study-logs/ollama-<JOB_ID>.log`, waits up to 180 s for `/api/tags`. Traps `nlp_stop_ollama` on exit (TERM, then KILL after 10 s).
+3. Runs the tier 1 preflight with 1 rep per model unless `NLP_SKIP_PREFLIGHT` is set. Non-zero exit aborts the job before `app.py`.
 4. Runs `python app.py "$@"` and exits with its status, printing a reminder that 143 outside `all.q` usually means the memory limit.
 
 Resource request baked in: `-N nlp-study`, `-q UI`, `-pe smp 8`, `-l h_rt=24:00:00`, `-j y`, `-o /Users/apkane/nlp-study-logs/`, `-m ea`. No GPU. Change them with `NLP_JOB_QUEUE`, `NLP_JOB_SLOTS`, `NLP_JOB_HRT`, `NLP_JOB_GPU` and re-run `./setup.sh`, or override at submission time (command-line options supersede `#$` directives):
@@ -480,12 +482,12 @@ qdel <JOB_ID>
 After the job ends, `qacct -j <JOB_ID>` shows exit status, wallclock, and `maxvmem`. The job log (`tail -f` above) carries one line per note with the time taken and the extracted flags, a `progress` line every 10 notes with the projected time remaining, and a final summary with the failed ids. Checking progress in the database while a job is running is also safe for reads:
 
 ```bash
-sqlite3 /nfsscratch/Users/apkane/nlp-study/repo/data.db "select count(*) notes, (select count(*) from results) done, (select count(*) from results where LLM_Failed=1) llm_failed from notes;"
+sqlite3 /nfsscratch/Users/apkane/nlp-study/repo/data.db 'select count(*) notes, (select count(*) from results where "LLM_Failed (medgemma:27b@8192)" is not null) done, (select count(*) from results where "LLM_Failed (medgemma:27b@8192)"=1) llm_failed from notes;'
 ```
 
 ### 7.4 Resuming an interrupted run
 
-Submit again without `--csv`. Notes with a `results` row are skipped; the rest are processed.
+Submit again without `--csv`. Notes that already have a result for a model are skipped for that model; the rest are processed.
 
 ```bash
 qsub ~/nlp-study.job --analyze
@@ -706,7 +708,7 @@ Bug-level items are tracked in `BACKLOG.md` (B1 to B26) with proposed fixes; thi
    - `samples/sample_5000_deidentified.csv` starts with a UTF-8 byte-order mark (`EF BB BF`) and names the second column `EncounterID`. With `encoding="utf-8"` the first header parses as `\ufeffMRN`, and `EncounterID` is not `Encounter`. Two failures (BACKLOG B7).
    Fixes are in [Troubleshooting](#csv-must-contain-columns). `samples/` and `environment-notes/` are in `.gitignore` and must stay out of git (names and MRNs).
 
-7. **Runtime versus walltime.** 5000 notes at 24 h walltime allows about 17 s per note including retries. CPU inference on a 27 B model (medgemma:27b decodes at about 3 tokens per second on CPU) cannot meet that. Plan on multiple resubmissions (resume is automatic) or set `NLP_JOB_HRT` higher, and read the tier 1 projection, which counts the real rows in `notes.csv`. Most of the 5000-note corpus is not procedure notes, so a relevance gate before the LLM (BACKLOG F3) would cut the work by roughly ten times.
+7. **Runtime versus walltime.** 5000 notes at 24 h walltime allows about 17 s per note for all three models together, including retries; the tier 1 preflight prints each model's per-note time and their sum. CPU inference on a 27 B model (medgemma:27b decodes at about 3 tokens per second on CPU) cannot meet that on its own. Plan on multiple resubmissions (resume is automatic) or set `NLP_JOB_HRT` higher, and read the tier 1 projection, which counts the real rows in `notes.csv`. Most of the 5000-note corpus is not procedure notes, so a relevance gate before the LLM (BACKLOG F3) would cut the work by roughly ten times.
 
 8. **Container tag pinned to 0.24.0.** Before 2026-10-13 the default was `latest` (0.32.14 when pulled), which needs driver 550+. Do not move the default past 0.24.x until Argon's GPU nodes run driver 550 or newer (BACKLOG B25).
 
@@ -765,7 +767,7 @@ Yes: `python app.py --csv ./notes.csv` ingests and reports how many notes were a
 `data.db` (both tables, including raw LLM text) and `output/results.csv` in the repo directory. All are PHI. Copy them off scratch.
 
 **Q: Which notes did the LLM fail on?**
-The job log ends with `Failed note id(s): ...`, and every note has `LLM_Failed`, `LLM_Attempts` and `LLM_Error` in `results.csv` (or `sqlite3 data.db "select id, LLM_Error from results where LLM_Failed = 1;"`). Those rows keep every extracted field null and are not retried on resume; see 14, "Job finished quickly, exit 0, LLM columns all empty" for reprocessing them.
+The job log ends with `Failed note id(s): ...`, and every note has `LLM_Failed`, `LLM_Attempts` and `LLM_Error` in `results.csv` (or `sqlite3 data.db 'select id, "LLM_Error (medgemma:27b@8192)" from results where "LLM_Failed (medgemma:27b@8192)" = 1;'`; the result columns carry the model label and need double quotes in SQL). Those rows keep every extracted field null and are not retried on resume; see 14, "Job finished quickly, exit 0, LLM columns all empty" for reprocessing them.
 
 **Q: Where are the researcher's requirements written down?**
 As five review comments by Alexander P. Kane in `samples/Upper Gl endoscopy Scope details.docx` (also rendered in the margins of the PDF next to it). They are quoted in [15.5](#155-study-requirements-the-researchers-review-comments) and analysed in `BACKLOG.md` section 1. The README does not mention them.
@@ -997,7 +999,7 @@ The `name:tag` does not exist on the registry, or (on `hf.co`) the repository ne
 
 #### `<model> requires Ollama X, but the image has 0.24.0 ...`
 
-The model's config declares a minimum Ollama version newer than the pinned image. Every `gemma3`/`gemma4` tag on `registry.ollama.ai` does this now. Nothing large was downloaded. Use a build without that requirement in `LOCAL_MODEL` (the current `medgemma:27b` declares none; a GGUF from `hf.co` is the other option), or move the image up with `NLP_OLLAMA_IMAGE` and accept CPU inference on driver-535 nodes.
+The model's config declares a minimum Ollama version newer than the pinned image. Every `gemma3`/`gemma4` tag on `registry.ollama.ai` does this now. Nothing large was downloaded. Use a build without that requirement in `LOCAL_MODEL` or the `MODELS` block (`medgemma:27b` declares none; a GGUF from `hf.co` is the other option), or move the image up with `NLP_OLLAMA_IMAGE` and accept CPU inference on driver-535 nodes. The field is advisory: a model that is known to load on the image despite it (today `gpt-oss:20b`, whose config says 0.30.0) is listed in `NLP_REQUIRES_VERIFIED`, which turns this stop into the log line `[model] <name>: its config says it requires Ollama X, but it is known to load on 0.24.0`.
 
 #### `[model] removing <host>/<ns>/<name>/<tag>: requires Ollama X, the image has 0.24.0`
 
@@ -1124,13 +1126,13 @@ TERM did not stop it and SGE sent KILL. Same causes as 143.
 Something started failing after the preflight passed (for example the Ollama server died mid-run). The job log has a `FAILED` line per note with the error, the final summary lists the failed ids, and `LLM_Error` in `results` keeps the message. Count failures:
 
 ```bash
-sqlite3 data.db "select count(*) from results where LLM_Failed=1;"
+sqlite3 data.db 'select count(*) from results where "LLM_Failed (medgemma:27b@8192)"=1;'
 ```
 
-Those rows will not be redone on resume because a `results` row exists. Delete them to reprocess:
+Those notes will not be redone on resume because the model's `LLM_Failed` column is set. Clear it to reprocess them with that model (the next run overwrites the model's whole block for those notes):
 
 ```bash
-sqlite3 data.db "delete from results where LLM_Failed=1;"
+sqlite3 data.db 'update results set "LLM_Failed (medgemma:27b@8192)" = null where "LLM_Failed (medgemma:27b@8192)" = 1;'
 ```
 
 Then resubmit with `--analyze` and regenerate the export. (A `--reprocess-failed` flag is BACKLOG B21.)
@@ -1193,12 +1195,12 @@ Things to hold in mind while changing the code, grouped by the layer they affect
 
 ### 15.2 Model and Ollama
 
-12. **`LOCAL_MODEL` in `llm_analysis.py` is parsed by `sed`.** Keep it a single line of the form `LOCAL_MODEL = "name:tag"` at column 0. Any model change requires `./setup.sh` on a login node to fetch the weights (and it prunes the old ones), and the README should be updated in the same commit (BACKLOG B24).
-13. **Model size budget.** `medgemma:27b` is 17.4 GB of Q4_K_M weights and needs about 20 GB of VRAM once the 8192-token KV cache and compute buffers are allocated (`model_candidates.md` section 3), so it needs a 24 GB card: the A10 holds it, the P100 (16 GB) does not, and a larger `NLP_CONTEXT_LENGTH` spills it to the CPU. The September job script pinned `gpu_p100` for the 7 to 8 GB models of that time (`gemma4:e2b`, then Gemma 3 12B); the rewrite requests only `ngpus=1`, so pin the A10 or a larger card with `#$ -l <complex>`, or a smaller card will silently fall back to CPU. CPU inference needs about 20 GB of RAM plus headroom and decodes at roughly 3 tokens per second.
+12. **`LOCAL_MODEL` in `llm_analysis.py` is parsed by `sed`.** Keep it a single line of the form `LOCAL_MODEL = "name:tag"` at column 0. Any model change requires `./setup.sh` on a login node to fetch the weights (and it prunes the old ones), and the README should be updated in the same commit (BACKLOG B24). The models a run sends each note to are `MODELS` in `llm_analysis.py` (three: `medgemma:27b`, `gemma4:26b-a4b-it-q4_K_M`, `gpt-oss:20b`); each writes its own block of result columns labelled `<name>@<num_ctx>` (Appendix D), so adding a model adds a block without touching existing results. `setup.sh` and `migrate.sh` read the block with `sed` (`detect_repo_models`): keep one `ModelSpec` per line, the first with `LOCAL_MODEL` and every other with its name as a double-quoted literal first argument. The preflight checks and exercises every model.
+13. **Model size budget.** `medgemma:27b` is 17.4 GB of Q4_K_M weights and needs about 20 GB of VRAM once the 8192-token KV cache and compute buffers are allocated (`model_candidates.md` section 3), so it needs a 24 GB card: the A10 holds it, the P100 (16 GB) does not, and a larger `NLP_CONTEXT_LENGTH` spills it to the CPU. The September job script pinned `gpu_p100` for the 7 to 8 GB models of that time (`gemma4:e2b`, then Gemma 3 12B); the rewrite requests only `ngpus=1`, so pin the A10 or a larger card with `#$ -l <complex>`, or a smaller card will silently fall back to CPU. CPU inference needs about 20 GB of RAM plus headroom and decodes at roughly 3 tokens per second. The other two models: `gemma4:26b-a4b-it-q4_K_M` is 18.0 GB (about 20 GB loaded) and `gpt-oss:20b` 13.8 GB (about 15 GB loaded); each fits the A10 alone, no two together, hence `OLLAMA_MAX_LOADED_MODELS=1` and the model-by-model run order.
 14. **The module-level `ollama` client is wired by `OLLAMA_HOST` at import time.** Do not create `ollama.Client()` with a hard-coded host or port, and do not import `ollama` before the host is exported. The port is random per job to avoid collisions with other users on the node. If you add a client with a timeout (BACKLOG B15), keep it reading `OLLAMA_HOST`. `ollama_status()` in `llm_analysis.py` follows that rule: the no-argument `python app.py` builds a short-lived `ollama.Client(timeout=3)` that reads `OLLAMA_HOST` at call time and only lists models.
 15. **Decoding is greedy and schema-constrained.** `ollama.chat()` passes `format=RESPONSE_SCHEMA` (the JSON schema of the ten study fields: 0/1 enums, nullable strings with `maxLength` 1000) and `GENERATION_OPTIONS` (`temperature` 0, `seed` 0, `num_ctx` from `NLP_CONTEXT_LENGTH`, `num_predict` 2048), so the reply is always a bare JSON object and the same note gives the same answer on the same model build; Ollama's server default temperature would be 0.8. Greedy decoding can lock into a repetition loop (seen with gemma3:4b), which the schema cuts off at 1000 characters; a value that reaches the cap raises `RetryableLLMError`, as do invalid JSON and any validation failure, and the retry prompt says why the previous answer was rejected. A greedy retry would repeat the loop, so `generation_options()` makes attempts 2+ sample at temperature 0.8 with `repeat_penalty` 1.1 and `seed` = attempt number (still reproducible). Schema-constrained output needs Ollama 0.5 or newer; confirm the pinned 0.24.0 honours `maxLength` with the preflight. Re-run the preflight after any change here.
 16. **Context window.** The rewrite sets `OLLAMA_CONTEXT_LENGTH=8192` on the container (`NLP_CONTEXT_LENGTH`), and `llm_analysis.py` passes the same value as `num_ctx` on every call, so a workstation run uses the same window as a job. The September script and a workstation install without it get Ollama's default, 4096 on CPU. The prompt overhead is about 1,700 tokens; the 5000-note corpus has notes up to about 41,000 characters (roughly 13,000 tokens). Ollama truncates an over-long prompt server-side, keeping 5 leading tokens plus the tail so the system prompt is lost, and the client sees a normal response; that is why `data_worker.py` fails any note that `llm_analysis.note_fits_context` says would not fit, without calling the model (BACKLOG B10, fixed 2026-10-14). The default 8192 is what the A10 holds with medgemma:27b; a larger `NLP_CONTEXT_LENGTH` moves the cut up but pushes the model off the GPU, and the preflight prints both the cut and the placement.
-17. **`OLLAMA_KEEP_ALIVE=-1` keeps the model loaded for the whole job.** Keep it; reloading a 17 GB model per note would dominate runtime. `OLLAMA_NUM_PARALLEL=1` matches the single-threaded `data_worker`. Nothing limits llama.cpp's threads to the requested slots (BACKLOG B26).
+17. **`OLLAMA_KEEP_ALIVE=-1` keeps the model loaded for the whole job.** Keep it; reloading a 17 GB model per note would dominate runtime. `OLLAMA_MAX_LOADED_MODELS=1` keeps a single model resident: the three models run one after another and no two of them fit the A10 together. `OLLAMA_NUM_PARALLEL=1` matches the single-threaded `data_worker`. Nothing limits llama.cpp's threads to the requested slots (BACKLOG B26).
 18. **The container tag is pinned.** Now pinned to `0.24.0`, the last release that uses a driver-535 GPU; a newer tag needs driver 550+ (BACKLOG B25). The Python packages, including `ollama` 0.6.2, are pinned in `requirements.txt` to the Argon versions.
 19. **GPU use requires three things to line up:** a `*-GPU` queue, `#$ -l ngpus=1` (and a card-type complex if you need one), and a node driver the container's CUDA runtime accepts. `nlp_start_ollama` only passes `--nv` when `nvidia-smi -L` works. Verify with the preflight placement line every time.
 20. **The on-disk model store is Ollama's own layout.** The rewrite writes `manifests/<host>/<ns>/<name>/<tag>` and `blobs/sha256-<hex>` with curl, removes models whose config `requires` a newer Ollama than the image, and prunes unreferenced blobs. If Ollama changes that layout, `create_model`, `verify_model`, `prune_model_store` and the preflight's tier 0 model check all need updating together.
@@ -1276,6 +1278,7 @@ When changing the prompt or the model, check behaviour on all ten notes of `samp
 | `NLP_PYTHON` | auto-detect | Path to a Python 3.10+ interpreter; tried first |
 | `NLP_FAST_ROOT`, `NLP_BULK_ROOT` | `/scratch/Users/$USER` then `/nfsscratch/Users/$USER` | Force the roots for repo+venv and image+model |
 | `NLP_OLLAMA_IMAGE` | `docker://ollama/ollama:0.24.0` | Container image; 0.24.0 is the last that uses a driver-535 GPU |
+| `NLP_REQUIRES_VERIFIED` | `gpt-oss:20b` | Models fetched although their config `requires` a newer Ollama than the image, because they are known to load on it (space-separated) |
 | `PIP_INSTALL_ARGS` | `--only-binary=:all:` | Extra pip flags; empty string permits source builds |
 | `NLP_JOB_QUEUE` | `UI` | Queue baked into the job script |
 | `NLP_JOB_SLOTS` | `8` | `-pe smp` slots baked into the job script |
@@ -1302,11 +1305,11 @@ September-only variables, no longer read: `SKIP_SMOKE_TEST`, `FORCE_SMOKE_TEST`,
 
 ### Exported by `~/nlp-study-env.sh`
 
-`NLP_ENV_VERSION=2`, `NLP_REPO_DIR`, `NLP_VENV_DIR`, `NLP_SIF`, `NLP_MODELS_DIR`, `NLP_MODEL`, `NLP_PREFLIGHT`, `NLP_LOG_DIR`, `APPTAINER_CACHEDIR`, `APPTAINER_TMPDIR`; after `nlp_start_ollama`: `OLLAMA_HOST` (random port), `NLP_OLLAMA_PID`, `NLP_OLLAMA_LOG`. Functions: `nlp_has_gpu`, `nlp_start_ollama`, `nlp_stop_ollama`, `nlp_preflight [tier]`.
+`NLP_ENV_VERSION=2`, `NLP_REPO_DIR`, `NLP_VENV_DIR`, `NLP_SIF`, `NLP_MODELS_DIR`, `NLP_MODEL` (the first model), `NLP_MODELS` (all of them, space-separated), `NLP_PREFLIGHT`, `NLP_LOG_DIR`, `APPTAINER_CACHEDIR`, `APPTAINER_TMPDIR`; after `nlp_start_ollama`: `OLLAMA_HOST` (random port), `NLP_OLLAMA_PID`, `NLP_OLLAMA_LOG`. Functions: `nlp_has_gpu`, `nlp_start_ollama`, `nlp_stop_ollama`, `nlp_preflight [tier]`.
 
 ### Set inside the container
 
-`OLLAMA_MODELS=/models`, `OLLAMA_HOST=127.0.0.1:<port>`, `OLLAMA_KEEP_ALIVE=-1`, `OLLAMA_CONTEXT_LENGTH=<NLP_CONTEXT_LENGTH>`.
+`OLLAMA_MODELS=/models`, `OLLAMA_HOST=127.0.0.1:<port>`, `OLLAMA_KEEP_ALIVE=-1`, `OLLAMA_MAX_LOADED_MODELS=1`, `OLLAMA_CONTEXT_LENGTH=<NLP_CONTEXT_LENGTH>`.
 
 ### Set by SGE inside a job
 
@@ -1333,7 +1336,7 @@ set -eo pipefail
 export NLP_QUIET=1
 . /Users/apkane/nlp-study-env.sh       # paths, helpers, cd repo, activate venv
 set -u
-echo "nlp-study job ${JOB_ID:-?} on $(hostname), $(date); slots ${NSLOTS:-?}; model ${NLP_MODEL}; args: $*"
+echo "nlp-study job ${JOB_ID:-?} on $(hostname), $(date); slots ${NSLOTS:-?}; models ${NLP_MODELS}; args: $*"
 nlp_start_ollama                       # random port, --nv if a GPU is visible, context 8192, log in ~/nlp-study-logs
 trap nlp_stop_ollama EXIT
 if [ -z "${NLP_SKIP_PREFLIGHT:-}" ]; then
@@ -1350,7 +1353,7 @@ Written atomically (temp file plus rename), so a job that sources the env script
 
 ```bash
 export NLP_ENV_VERSION=2                       # checked by setup.sh --preflight
-export NLP_REPO_DIR=... NLP_VENV_DIR=... NLP_SIF=... NLP_MODELS_DIR=... NLP_MODEL=... NLP_PREFLIGHT=... NLP_LOG_DIR=...
+export NLP_REPO_DIR=... NLP_VENV_DIR=... NLP_SIF=... NLP_MODELS_DIR=... NLP_MODEL=... NLP_MODELS="... ... ..." NLP_PREFLIGHT=... NLP_LOG_DIR=...
 export APPTAINER_CACHEDIR=... APPTAINER_TMPDIR=...
 
 nlp_start_ollama() {
@@ -1359,12 +1362,13 @@ nlp_start_ollama() {
     export OLLAMA_HOST="127.0.0.1:<free port>"
     apptainer exec [--nv] --bind "$NLP_MODELS_DIR:/models" \
         --env OLLAMA_MODELS=/models --env OLLAMA_HOST="$OLLAMA_HOST" \
-        --env OLLAMA_KEEP_ALIVE=-1 --env OLLAMA_CONTEXT_LENGTH="${NLP_CONTEXT_LENGTH:-8192}" \
+        --env OLLAMA_KEEP_ALIVE=-1 --env OLLAMA_MAX_LOADED_MODELS=1 \
+        --env OLLAMA_CONTEXT_LENGTH="${NLP_CONTEXT_LENGTH:-8192}" \
         "$NLP_SIF" ollama serve > "$NLP_LOG_DIR/ollama-${JOB_ID:-$$}.log" 2>&1 &
     # wait up to 90 x 2 s for /api/tags; on failure print the log and return 1
 }
 nlp_stop_ollama() { kill; wait up to 10 s; kill -9; }
-nlp_preflight()   { python "$NLP_PREFLIGHT" --repo "$NLP_REPO_DIR" --model "$NLP_MODEL" --models-dir "$NLP_MODELS_DIR" --tier "${1:-1}"; }
+nlp_preflight()   { python "$NLP_PREFLIGHT" --repo "$NLP_REPO_DIR" --model <each name in $NLP_MODELS> --models-dir "$NLP_MODELS_DIR" --tier "${1:-1}"; }
 
 cd "$NLP_REPO_DIR" && . "$NLP_VENV_DIR/bin/activate"
 ```
@@ -1404,7 +1408,7 @@ From the 19:22 and 19:33 server logs, Ollama 0.32.14 inside the container on a c
 
 **notes**: `id` (autoincrement), `mrn`, `encounter`, `note_csn_id`, `note_date`, `note_type`, `note`.
 
-**results** (one row per note id): the ten extracted fields (`ScopeType`, `Colonoscopy`, `ColonoscopyInformation`, `Endoscopy`, `EndoscopyInformation`, `NumberOfDuodenalBiopsies`, `DuodenalBiopsiesTaken`, `DuodenalBiopsiesInformation`, `FellowPresent`, `FellowInformation`) and five debugging columns: `LLM_Failed` (1 when the model call or its validation failed; the extracted fields are then null), `LLM_Attempts` (model calls made for the note), `LLM_Seconds` (wall-clock time over all attempts), `LLM_Error` (the final error message when it failed) and `RawResponse` (verbatim text of the accepted model response, for audit). It carries no `note_csn_id`, so selecting the EGD cohort by CSN needs a join with `notes` (BACKLOG B20); `results.csv` is that join. `create_db` adds any of these columns that an older `data.db` lacks.
+**results** (one row per note id, one block of columns per model): every column is named `<field> (<model>@<context>)`, the label being the model's full name and the context window it was called with (`llm_analysis.ModelSpec.label`, today `medgemma:27b@8192`), so two models, or one model at two window sizes, never share a column, and SQL must double-quote the names. A block holds the ten extracted fields (`ScopeType`, `Colonoscopy`, `ColonoscopyInformation`, `Endoscopy`, `EndoscopyInformation`, `NumberOfDuodenalBiopsies`, `DuodenalBiopsiesTaken`, `DuodenalBiopsiesInformation`, `FellowPresent`, `FellowInformation`), the review columns `ManualReviewRequired` and `ManualReviewReason`, and six debugging columns: `LLM_Failed` (1 when no attempt gave an answer the note supports, or the call failed; the extracted fields are then null; null means the model has not run on the note), `LLM_Attempts` (model calls made for the note), `LLM_Seconds` (wall-clock time over all attempts), `LLM_Error` (the final error message when it failed), `LLM_Rejections` (why each rejected attempt was rejected) and `RawResponse` (verbatim text of the accepted model response, for audit). It carries no `note_csn_id`, so selecting the EGD cohort by CSN needs a join with `notes` (BACKLOG B20); `results.csv` is that join. `create_db` converts a table from before the labels (bare field names) into the first model's block, adds any column a block lacks, and adds a whole block for a model that has not run on that `data.db`.
 
 Until 2026-10-13 the tables were `working_results` (NLP and LLM answers side by side) and `final_results` (the reconciled subset). A `data.db` from before then still holds those two tables and no `results` table: `CREATE TABLE IF NOT EXISTS` adds `results` beside them, every note is analysed again, and the old tables are ignored. Start from a fresh `data.db` unless you want that.
 
@@ -1412,6 +1416,6 @@ Until 2026-10-13 the tables were `working_results` (NLP and LLM answers side by 
 
 | File | Content |
 | --- | --- |
-| `results.csv` | One row per note: `id`, `mrn`, `encounter`, `note_csn_id`, `note_date`, `note_type`; the ten extracted fields; `LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `RawResponse`; then `note` last |
+| `results.csv` | One row per note: `id`, `mrn`, `encounter`, `note_csn_id`, `note_date`, `note_type`; then one block per model, each column named `<field> (<model>@<context>)`: the ten extracted fields, `ManualReviewRequired`, `ManualReviewReason`, `LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `LLM_Rejections`, `RawResponse`; then `note` last |
 
 It is written once and never overwritten. It contains PHI.
