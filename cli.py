@@ -1,4 +1,8 @@
 import argparse
+import os
+import re
+import signal
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -7,15 +11,64 @@ from rich.markup import escape
 
 from consensus import consolidate
 from database import (
-    COUNT_NOTES_SQL, REQUIRED_CSV_COLUMNS, create_db, database_status, ingest_csv, model_statistics, pending_notes,
+    COUNT_NOTES_SQL, REQUIRED_CSV_COLUMNS, DatabaseDamaged, backup_path, check_and_back_up, column_name, create_db,
+    database_status, ingest_csv, model_statistics, pending_notes, results_column_names,
 )
 from data_worker import SUMMARY_EVERY, WorkerOutcome, data_worker
-from export import EXPORT_NAME, REVIEW_EXPORT_NAME, export_results
+from export import EXPORT_NAME, PARTIAL_SUFFIX, REVIEW_EXPORT_NAME, export_results
 from llm_analysis import LOCATIONS, MODELS, ModelSpec, max_note_chars, model_served, note_fits_context, ollama_status
 from reporter import FIELD_TALLIES, HEARTBEAT_SECONDS, ModelPlan, Reporter, duration, plural
+from run_lock import LockHeld, RunLock, lock_path
+from run_lock import status as lock_status
 
 # A model's stored results give its own time per note for the run estimate once it has this many.
 STORED_RATE_MIN_NOTES = 5
+
+# Exit codes besides 0 (complete), 1 (bad input) and 2 (incomplete; --analyze resumes).
+EXIT_LOCKED = 3       # another run holds the database's run lock
+EXIT_NO_WORK = 4      # --work-left: nothing left for --analyze to do
+
+# How the analysis says why it stopped before the next note (run_summary words the next step by it).
+TIME_LIMIT_REASON = "the time limit"
+LOCK_LOST_REASON = "this run lost the run lock"
+
+# Signals a batch system sends to stop a job: TERM (SGE's eviction and qdel), HUP (a
+# dropped qlogin session), USR1 and USR2 (SGE's warnings before a suspend or a kill). Each
+# stops the run the way Ctrl-C does: stored results are kept, the note in progress is
+# dropped (and done again on resume), and the run lock is released.
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGUSR1, signal.SIGUSR2)
+
+
+class Stopped(KeyboardInterrupt):
+    """A stop signal, handled like Ctrl-C."""
+
+    def __init__(self, signum: int):
+        super().__init__(signal.Signals(signum).name)
+        self.signum = signum
+
+
+def _stop_on_signal(signum, frame):
+    for s in STOP_SIGNALS:
+        signal.signal(s, signal.SIG_IGN)   # one stop is enough; a repeat must not cut the cleanup short
+    raise Stopped(signum)
+
+
+_DURATION_RE = re.compile(r"^(?:(?P<d>\d+(?:\.\d+)?)d)?(?:(?P<h>\d+(?:\.\d+)?)h)?(?:(?P<m>\d+(?:\.\d+)?)m)?(?:(?P<s>\d+(?:\.\d+)?)s)?$")
+
+
+def parse_duration(text: str) -> float:
+    """Seconds in a duration such as 23h30m, 90m, 5400s or 1d; a bare number is hours."""
+    text = text.strip().lower()
+    try:
+        return float(text) * 3600
+    except ValueError:
+        pass
+    match = _DURATION_RE.match(text)
+    if not text or not match:
+        raise argparse.ArgumentTypeError(f"not a duration: {text!r} (use e.g. 23.5, 23h30m, 90m, 5400s)")
+    units = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+    return sum(float(value) * units[unit] for unit, value in match.groupdict().items() if value)
+
 
 DB_PATH = Path("data.db")
 EXPORT_PATH = Path("output") / EXPORT_NAME
@@ -82,8 +135,19 @@ While it runs
   every NLP_HEARTBEAT_SECONDS ({HEARTBEAT_SECONDS:.0f}) while a model call is in progress. The run stops early
   when Ollama is unreachable or three model calls in a row fail; a model that is not pulled
   is skipped; the export is skipped when the run is incomplete. Exit codes: 0 complete,
-  1 bad input, 2 incomplete, 130 interrupted (Ctrl-C keeps every stored result; --analyze
-  resumes).
+  1 bad input or a damaged database, 2 incomplete (--stop-after reached, a model skipped,
+  or stopped early), 3 another run holds the database, 4 nothing left (--work-left), 130
+  interrupted, 143 stopped by TERM. Ctrl-C or a stop signal keeps every stored result;
+  --analyze resumes.
+
+Long runs
+  A large corpus runs as many resumed runs (on Argon a chain of batch jobs; see
+  ARGON_RUNBOOK.md section 7.4). Each note is committed on its own, so a stop or a kill
+  loses at most the note in progress. --stop-after ends a run cleanly before a walltime.
+  One run at a time: a run holds {DB_PATH}.lock (refreshed every 30 s); another run waits
+  for it, takes it over once stale (its owner was killed), or is refused. Before changing
+  {DB_PATH} a run checks its integrity and copies it to {DB_PATH}.backup. The exports
+  are written under .partial names and renamed into place only when whole.
 
 Output
   {EXPORT_PATH}   one row per note, laid out for Google Sheets or Excel; {GUIDE_PATH}
@@ -179,8 +243,32 @@ def setup_parser():
         "--clean",
         action="store_true",
         help=(
-            f"Delete the files earlier runs generated ({DB_PATH} and its journal files, "
-            f"{EXPORT_PATH}, {REVIEW_EXPORT_PATH}) before doing anything else. This discards every stored result"
+            f"Delete the files earlier runs generated ({DB_PATH} with its journal files and its backup, "
+            f"{EXPORT_PATH}, {REVIEW_EXPORT_PATH}) before doing anything else. This discards every stored result. "
+            f"Refused while another run holds the database"
+        ),
+    )
+
+    parser.add_argument(
+        "--stop-after",
+        type=parse_duration,
+        metavar="DURATION",
+        default=os.environ.get("NLP_STOP_AFTER") or None,
+        help=(
+            "Stop starting new notes once this much time has passed since the run began (23.5, 23h30m, 90m, "
+            "5400s; a bare number is hours; default: NLP_STOP_AFTER, else no limit). The note in progress is "
+            "finished and stored, the consensus is rebuilt, and the run exits 2 so the next --analyze resumes. "
+            "Set it below the batch job's walltime so the job ends cleanly instead of being killed"
+        ),
+    )
+
+    parser.add_argument(
+        "--work-left",
+        action="store_true",
+        help=(
+            f"Say what --analyze still has to do (notes pending per model, exports not yet written), reading "
+            f"{DB_PATH} without changing it, and exit 0 when there is work, {EXIT_NO_WORK} when there is none. "
+            f"For a chain of batch jobs: a job with nothing left can end before starting Ollama"
         ),
     )
 
@@ -193,7 +281,10 @@ def clean():
     and the export. Removes the export folder too if that leaves it empty.
     """
     generated = [DB_PATH] + [DB_PATH.with_name(DB_PATH.name + s) for s in ("-journal", "-wal", "-shm")]
+    backup = backup_path(DB_PATH)
+    generated += [backup, backup.with_name(backup.name + ".partial")]
     generated += [EXPORT_PATH, REVIEW_EXPORT_PATH]
+    generated += [path.with_name(path.name + PARTIAL_SUFFIX) for path in (EXPORT_PATH, REVIEW_EXPORT_PATH)]
 
     removed = False
     for path in generated:
@@ -240,12 +331,48 @@ def print_status(models: tuple[ModelSpec, ...]):
     print(f"  Database   {DB_PATH}: {lines[0]}")
     for line in lines[1:]:
         print(f"             {line}")
+    held = lock_status(DB_PATH)
+    print(f"  Run lock   {lock_path(DB_PATH)}: {held}" if held else "  Run lock   free (no run is using the database)")
+    backup = backup_path(DB_PATH)
+    if backup.exists():
+        taken = time.strftime("%Y-%m-%d %H:%M", time.localtime(backup.stat().st_mtime))
+        print(f"  Backup     {backup}: taken {taken}, at the start of the last run (a checked copy of {DB_PATH})")
 
     for path in (EXPORT_PATH, REVIEW_EXPORT_PATH):
         if path.exists():
             print(f"  Export     {path} exists (write-once; move both exports aside to regenerate them)")
         else:
             print(f"  Export     {path} not written yet")
+
+
+def work_left(models: tuple[ModelSpec, ...]) -> int:
+    """
+    --work-left: prints what --analyze still has to do and returns the exit code, 0 when
+    there is work and EXIT_NO_WORK when every model has a result for every note and both
+    exports are written. Reads the database without creating or changing it.
+    """
+    if not DB_PATH.exists():
+        print(f"{DB_PATH} does not exist yet: everything is left to do.")
+        return 0
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    try:
+        notes = conn.execute(COUNT_NOTES_SQL).fetchone()[0]
+        names = results_column_names(conn)
+        work = False
+        for model in models:
+            pending = len(pending_notes(conn, model.label)) if column_name("LLM_Failed", model.label) in names else notes
+            print(f"{model.label}: {pending:,} of {plural(notes, 'note')} pending")
+            work = work or pending > 0
+    finally:
+        conn.close()
+    for path in (EXPORT_PATH, REVIEW_EXPORT_PATH):
+        if not path.exists():
+            print(f"{path} not written yet")
+            work = True
+    if notes == 0:
+        print(f"{DB_PATH} holds no notes: ingest them with --csv.")
+    print("Work left for --analyze." if work else "Nothing left for --analyze to do.")
+    return 0 if work else EXIT_NO_WORK
 
 
 def run_header(reporter: Reporter, conn, args, models: tuple[ModelSpec, ...], steps: list[str]):
@@ -349,7 +476,13 @@ def run_summary(reporter: Reporter, conn, models: tuple[ModelSpec, ...], outcome
     )
     resume = f"python app.py --analyze{'' if location == 'server' else f' --location {location}'}"
     items = [("elapsed", duration(elapsed))]
-    if outcome.stopped:
+    if outcome.stopped and outcome.stopped.startswith(TIME_LIMIT_REASON):
+        items.append(("outcome", f"[bold yellow]paused[/bold yellow]: {escape(outcome.stopped)}"))
+        items.append(("next", f"resume with: {resume} (or the next job in the chain picks it up)"))
+    elif outcome.stopped and outcome.stopped.startswith(LOCK_LOST_REASON):
+        items.append(("outcome", f"[bold red]stopped early[/bold red]: {escape(outcome.stopped)}"))
+        items.append(("next", "another run took over the database and carries on; check that only one job runs on it"))
+    elif outcome.stopped:
         items.append(("outcome", f"[bold red]stopped early[/bold red]: {escape(outcome.stopped)}"))
         items.append(("next", f"fix the server, then resume with: {resume}"))
     elif outcome.skipped:
@@ -369,36 +502,62 @@ def run_summary(reporter: Reporter, conn, models: tuple[ModelSpec, ...], outcome
 def main():
     """
     Main entry point: cleans up earlier runs if asked, ingests the CSV if one is given,
-    then runs the analysis if requested.
+    then runs the analysis if requested, holding the database's run lock throughout.
     With no options, prints the help text and the current status.
     """
     parser = setup_parser()
     args = parser.parse_args()
     models = LOCATIONS[args.location]
 
+    if args.work_left:
+        sys.exit(work_left(models))
+
     if args.csv and not args.csv.exists():
         print(f"Error: CSV file not found: {args.csv}", file=sys.stderr)
         sys.exit(1)
 
-    if args.clean:
-        clean()
-        if not args.csv and not args.analyze:
-            sys.exit(0)
-
-    if not args.csv and not args.analyze:
+    if not args.csv and not args.analyze and not args.clean:
         parser.print_help()
         print()
         print_status(models)
         sys.exit(0)
 
-    sys.exit(run(args, models))
+    lock = RunLock(DB_PATH)
+    try:
+        lock.acquire()
+    except LockHeld as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(EXIT_LOCKED)
+    try:
+        if args.clean:
+            clean()
+            if not args.csv and not args.analyze:
+                sys.exit(0)
+        sys.exit(run(args, models, lock))
+    finally:
+        lock.release()
 
 
-def run(args, models: tuple[ModelSpec, ...]) -> int:
-    """Runs the requested steps with a Reporter and returns the exit code: 0 done, 1 bad input, 2 incomplete, 130 interrupted."""
+def run(args, models: tuple[ModelSpec, ...], lock: RunLock | None = None) -> int:
+    """
+    Runs the requested steps with a Reporter and returns the exit code: 0 done, 1 bad input,
+    2 incomplete, 130 interrupted with Ctrl-C, 128 + the signal number when stopped by a
+    signal (143 for SGE's TERM). Checks and backs up an existing database before changing it.
+    """
     started = time.perf_counter()
-    conn = create_db(DB_PATH, [model.label for model in models], LEGACY_LABEL)
+    for s in STOP_SIGNALS:
+        signal.signal(s, _stop_on_signal)
     reporter = Reporter.create()
+    report = lambda message: reporter.log(escape(message))  # noqa: E731  (plain text from the modules, markup-safe)
+    deadline = started + args.stop_after if args.stop_after else None
+
+    def stop_check() -> str | None:
+        """Why the analysis must stop before its next note, or None."""
+        if deadline is not None and time.perf_counter() >= deadline:
+            return f"{TIME_LIMIT_REASON} (--stop-after {duration(args.stop_after)}) is reached"
+        lost = lock.check() if lock is not None else None
+        return f"{LOCK_LOST_REASON}: {lost}" if lost else None
+
     steps = []
     if args.csv:
         steps.append(f"ingest {args.csv}")
@@ -411,11 +570,27 @@ def run(args, models: tuple[ModelSpec, ...]) -> int:
         step += 1
         reporter.section(f"Step {step} of {len(steps)}: {title}")
 
-    report = lambda message: reporter.log(escape(message))  # noqa: E731  (plain text from the modules, markup-safe)
     exit_code = 0
+    conn = None
     try:
         with reporter:
+            if lock is not None:
+                reporter.log(f"[bold]lock[/bold]      holding {escape(str(lock.path))}; another run on this database waits or is refused")
+            try:
+                reporter.busy_progress(f"checking and backing up {DB_PATH}", 0, None)
+                check_and_back_up(DB_PATH, report)
+                reporter.busy_done()
+            except DatabaseDamaged as e:
+                reporter.error(escape(str(e)))
+                return 1
+            conn = create_db(DB_PATH, [model.label for model in models], LEGACY_LABEL)
             run_header(reporter, conn, args, models, steps)
+            if args.stop_after and args.analyze:
+                reporter.log(
+                    f"[bold]limit[/bold]     no new note is started after {duration(args.stop_after)} "
+                    f"(at {time.strftime('%Y-%m-%d %H:%M', time.localtime(time.time() + args.stop_after))}); "
+                    f"the rest stay pending for the next --analyze"
+                )
             if args.csv:
                 section(f"Ingest {args.csv}")
                 try:
@@ -427,7 +602,13 @@ def run(args, models: tuple[ModelSpec, ...]) -> int:
             if args.analyze:
                 section(f"Analyse with {plural(len(models), 'model')}")
                 work_plan(reporter, conn, models)
-                outcome = data_worker(conn, models, reporter)
+                outcome = data_worker(conn, models, reporter, stop_check)
+                if outcome.stopped and outcome.stopped.startswith(LOCK_LOST_REASON):
+                    # Another run owns the database now: write nothing more (the consensus
+                    # and the export are its to build), just say what this run did.
+                    reporter.warn("consensus and export skipped: this run no longer holds the database")
+                    run_summary(reporter, conn, models, outcome, None, time.perf_counter() - started, args.location)
+                    return 2
 
                 section("Build the consensus")
                 reporter.busy_progress("building the consensus", 0, None)
@@ -448,7 +629,7 @@ def run(args, models: tuple[ModelSpec, ...]) -> int:
                 exit_code = 0 if outcome.complete else 2
             else:
                 reporter.header([("elapsed", duration(time.perf_counter() - started))])
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as e:
         m = reporter.model
         where = ""
         if m is not None:
@@ -456,10 +637,12 @@ def run(args, models: tuple[ModelSpec, ...]) -> int:
             if m.call is not None:
                 where += f" note {m.call.note_id} was in progress and is not stored."
         resume = f"python app.py --analyze{'' if args.location == 'server' else f' --location {args.location}'}"
-        reporter.log(f"[bold red]Interrupted.[/bold red]{where} Every stored result is kept; resume with: {resume}")
-        exit_code = 130
+        how = f"Stopped by {e.args[0]}." if isinstance(e, Stopped) else "Interrupted."
+        reporter.log(f"[bold red]{how}[/bold red]{where} Every stored result is kept; resume with: {resume}")
+        exit_code = 128 + e.signum if isinstance(e, Stopped) else 130
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
     return exit_code
 
 

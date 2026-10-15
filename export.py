@@ -25,6 +25,7 @@ write-once together.
 """
 
 import csv
+import os
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -38,6 +39,7 @@ from llm_analysis import BOOL_FIELDS
 EXPORT_NAME = "results.csv"
 REVIEW_EXPORT_NAME = "results-review.csv"
 NOTE_LENGTH_TITLE = "Note length (characters)"
+PARTIAL_SUFFIX = ".partial"   # the name an export has while it is being written
 
 # The note identifiers that open every row (columns A to F), titled as the ingest CSV names
 # them (database.REQUIRED_CSV_COLUMNS), after the database id, which the run log and
@@ -229,10 +231,13 @@ def export_results(conn, output_folder="output", report=print) -> Path | None:
     lean = review_columns(columns)
     lean_indexes = [titles.index(column.title) for column in lean]
 
+    # Both files are written under temporary names and renamed into place only when whole: an
+    # export cut off by a stopped job leaves no truncated results.csv for write-once to keep.
+    partial_file, partial_review = (path.with_name(path.name + PARTIAL_SUFFIX) for path in (output_file, review_file))
     row_count = flagged = unbuilt = 0
     with (
-        output_file.open(mode="w", newline="", encoding="utf-8") as full,
-        review_file.open(mode="w", newline="", encoding="utf-8") as small,
+        partial_file.open(mode="w", newline="", encoding="utf-8") as full,
+        partial_review.open(mode="w", newline="", encoding="utf-8") as small,
     ):
         writer = csv.writer(full)
         lean_writer = csv.writer(small)
@@ -248,6 +253,12 @@ def export_results(conn, output_folder="output", report=print) -> Path | None:
                     flagged += 1
                 elif values[review] == "":
                     unbuilt += 1
+
+        for f in (full, small):
+            f.flush()
+            os.fsync(f.fileno())
+    os.replace(partial_review, review_file)
+    os.replace(partial_file, output_file)
 
     size = output_file.stat().st_size
     lean_size = review_file.stat().st_size

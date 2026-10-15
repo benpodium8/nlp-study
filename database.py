@@ -1,5 +1,6 @@
 import csv
 import hashlib
+import os
 import re
 import sqlite3
 import sys
@@ -205,6 +206,11 @@ def results_labels(conn: sqlite3.Connection) -> list[str]:
     return labels
 
 
+# How long a write waits for a reader to let go (a sqlite3 shell counting progress during a
+# run) before giving up; Python's default of 5 s would stop a run over a slow read.
+BUSY_TIMEOUT_SECONDS = 300
+
+
 def create_db(db_path: Path, labels=(), legacy_label: str | None = None):
     """
     Creates or connects to a SQLite database and initialises the notes and results tables,
@@ -226,7 +232,11 @@ def create_db(db_path: Path, labels=(), legacy_label: str | None = None):
         sqlite3.Connection: Database connection object.
     """
     legacy_label = legacy_label or (labels[0] if labels else None)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_SECONDS)
+    # The rollback journal, never WAL: WAL needs shared memory that a network filesystem
+    # (Argon's NFS scratch) does not provide, and the mode sticks to the file once set
+    # (by a sqlite3 shell, say), so it is put back here.
+    conn.execute("PRAGMA journal_mode=DELETE;")
     with conn:
         conn.execute(NOTES_TABLE_SCHEMA)
         # The ingest checks every row of a file against the stored notes; without the index
@@ -343,6 +353,55 @@ def _backfill_manual_review(conn: sqlite3.Connection, label: str):
         )
     if rows:
         print(f"Filled ManualReviewRequired for {len(rows)} existing result(s) of {label!r}.")
+
+
+class DatabaseDamaged(Exception):
+    """The database failed its integrity check."""
+
+
+def backup_path(db_path: Path) -> Path:
+    return db_path.with_name(db_path.name + ".backup")
+
+
+def check_and_back_up(db_path: Path, report=print) -> bool:
+    """
+    Before a run changes an existing database: checks its structure (PRAGMA quick_check) and,
+    when it passes, copies it to data.db.backup, so a run that damages the file (a node or
+    filesystem failure mid-write) costs at most the work since this run started. The copy is
+    written under a temporary name and renamed into place, so data.db.backup is always a
+    whole, checked database. Raises DatabaseDamaged, naming the backup to restore, when the
+    check fails. Returns False when there is no database yet (nothing to check).
+    """
+    if not db_path.exists() or db_path.stat().st_size == 0:
+        return False
+    backup = backup_path(db_path)
+    started = time.perf_counter()
+    conn = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_SECONDS)
+    try:
+        problems = [row[0] for row in conn.execute("PRAGMA quick_check;").fetchmany(5)]
+        if problems != ["ok"]:
+            restore = (
+                f"Restore the copy taken at the start of the previous run: mv {db_path} {db_path}.damaged && cp {backup} {db_path}"
+                if backup.exists() else "There is no backup to restore."
+            )
+            raise DatabaseDamaged(f"{db_path} failed its integrity check: {'; '.join(problems)}. {restore}")
+        checked = time.perf_counter() - started
+        partial = backup.with_name(backup.name + ".partial")
+        for leftover in (partial, partial.with_name(partial.name + "-journal")):
+            leftover.unlink(missing_ok=True)   # from a copy that was interrupted
+        target = sqlite3.connect(partial)
+        try:
+            conn.backup(target)
+        finally:
+            target.close()
+        os.replace(partial, backup)
+    finally:
+        conn.close()
+    report(
+        f"Checked {db_path} ({db_path.stat().st_size / 1e6:.1f} MB, integrity ok in {checked:.1f}s) and backed it up to "
+        f"{backup} in {time.perf_counter() - started - checked:.1f}s."
+    )
+    return True
 
 
 def label_context_length(label: str) -> int | None:

@@ -165,7 +165,7 @@ classify_untracked() {   # prints phi | junk | self | other
     # git cannot track an empty directory, so one is a leftover by definition.
     if [[ -d "${REPO_DIR}/${p}" && -z "$(ls -A "${REPO_DIR}/${p}" 2>/dev/null)" ]]; then echo junk; return 0; fi
     case "$b" in
-        *.csv|*.db|*.sqlite|*.sqlite3|*.db-journal|*.db-wal|*.db-shm|output) echo phi; return 0 ;;
+        *.csv|*.db|*.sqlite|*.sqlite3|*.db-journal|*.db-wal|*.db-shm|*.db.backup|*.db.backup.partial|*.csv.partial|output) echo phi; return 0 ;;
         *.pyc|*.pyo|ollama-*.log|.preflight-probe|.probe.*|.write-probe.*|*.tmp.*|nohup.out|.DS_Store|*~|*.swp|core|core.[0-9]*) echo junk; return 0 ;;
     esac
     echo other

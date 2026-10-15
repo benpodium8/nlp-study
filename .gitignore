@@ -8,3 +8,6 @@ samples
 sample-inputs
 environment-notes
 TODO.txt
+data.db.backup*
+data.db.lock*
+data.db-journal

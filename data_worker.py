@@ -1,5 +1,5 @@
 import time
-from typing import NamedTuple, Sequence
+from typing import Callable, NamedTuple, Sequence
 
 from database import COUNT_NOTES_SQL, insert_result, note_text, pending_notes
 from llm_analysis import (
@@ -102,7 +102,10 @@ def analyze_note(
             return Analysis(None, None, 1, attempt, error, rejections, error, tuple(briefs), note_id)
 
 
-def data_worker(conn, models: Sequence[ModelSpec] = MODELS, reporter: Reporter | None = None) -> WorkerOutcome:
+def data_worker(
+    conn, models: Sequence[ModelSpec] = MODELS, reporter: Reporter | None = None,
+    stop_check: Callable[[], str | None] | None = None,
+) -> WorkerOutcome:
     """
     Runs the LLM analysis on every note that has no result yet for each model in models,
     one model at a time so Ollama holds a single model loaded, and stores each result with
@@ -112,14 +115,22 @@ def data_worker(conn, models: Sequence[ModelSpec] = MODELS, reporter: Reporter |
     not pay for it silently. Everything it does goes through reporter: one line per note,
     a summary every SUMMARY_EVERY notes, a summary per model, and the live panel or
     heartbeat in between. Only the structured fields are logged, never note text or model
-    output. The pass stops after CALL_FAILURES_BEFORE_STOP consecutive call failures.
+    output. The pass stops after CALL_FAILURES_BEFORE_STOP consecutive call failures, and
+    when stop_check, asked before each model and each note, gives a reason (the run's time
+    limit is reached, or it no longer holds the run lock): the note in progress is finished
+    and stored first, and every note not started stays pending for the next --analyze.
     """
     reporter = reporter or Reporter.create()
+    stop_check = stop_check or (lambda: None)
     total_notes = conn.execute(COUNT_NOTES_SQL).fetchone()[0]
     processed = 0
     skipped = []
 
     for index, model in enumerate(models, start=1):
+        reason = stop_check()
+        if reason:
+            reporter.warn(f"not starting {model.label}: {reason}; its pending notes are picked up by the next --analyze")
+            return WorkerOutcome(processed, skipped, reason)
         status = ollama_status(model.name)
         if not status.reachable:
             reason = f"Ollama is not reachable at {status.host} ({status.detail}); start it (ollama serve) or set OLLAMA_HOST"
@@ -130,7 +141,7 @@ def data_worker(conn, models: Sequence[ModelSpec] = MODELS, reporter: Reporter |
             skipped.append(model.label)
             continue
         info = status.info(model.name)
-        run_processed, stopped = _run_model(conn, model, index, len(models), total_notes, reporter, info)
+        run_processed, stopped = _run_model(conn, model, index, len(models), total_notes, reporter, info, stop_check)
         processed += run_processed
         if stopped:
             return WorkerOutcome(processed, skipped, stopped)
@@ -138,7 +149,10 @@ def data_worker(conn, models: Sequence[ModelSpec] = MODELS, reporter: Reporter |
     return WorkerOutcome(processed, skipped, None)
 
 
-def _run_model(conn, model: ModelSpec, index: int, count: int, total_notes: int, reporter: Reporter, info) -> tuple[int, str | None]:
+def _run_model(
+    conn, model: ModelSpec, index: int, count: int, total_notes: int, reporter: Reporter, info,
+    stop_check: Callable[[], str | None],
+) -> tuple[int, str | None]:
     """
     Analyses every note that has no result under model's label yet, and stores each one.
     Returns (notes processed, why the pass stopped early or None).
@@ -173,6 +187,10 @@ def _run_model(conn, model: ModelSpec, index: int, count: int, total_notes: int,
             reporter.model_loaded(loaded.seconds, loaded.placement, loaded.context_length)
 
     for position, (note_id, length) in enumerate(rows, start=1):
+        reason = stop_check()
+        if reason:
+            reporter.model_stopped(reason)
+            return position - 1, reason
         note = note_text(conn, note_id)
         call = run.begin_note(note_id, position, estimated_prompt_tokens(length), MAX_ATTEMPTS)
         note_started = time.perf_counter()

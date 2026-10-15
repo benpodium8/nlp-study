@@ -141,7 +141,9 @@ notes.csv ──> SQLite notes table
 | `python app.py --analyze --csv FILE` | Ingests, runs each of the three models on every note that lacks its result, rebuilds the consensus block for every note, writes `output/results.csv` and `output/results-review.csv` |
 | `python app.py --analyze` | Same, without ingesting. Resumes an interrupted run |
 | `python app.py --analyze --location local` | The same run with three small stand-ins (`ministral-3:3b`, `gemma4:e2b`, `qwen3.5:4b`; `LOCAL_MODELS` in `llm_analysis.py`), each under its own labelled columns, for a workstation test. `--location server`, the default, is the study set |
-| `python app.py --clean` | Deletes `data.db` (with any `-journal`/`-wal`/`-shm` file) and both exports (`output/results.csv`, `output/results-review.csv`), and `output/` if that leaves it empty. No prompt. Combined with `--csv`/`--analyze` it runs first, giving a fresh run; a missing `--csv` file aborts before anything is deleted |
+| `python app.py --clean` | Deletes `data.db` (with any `-journal`/`-wal`/`-shm` file and its backup `data.db.backup`) and both exports (`output/results.csv`, `output/results-review.csv`), and `output/` if that leaves it empty. No prompt. Combined with `--csv`/`--analyze` it runs first, giving a fresh run; a missing `--csv` file aborts before anything is deleted. Refused (exit 3) while another run holds the database |
+| `python app.py --analyze --stop-after 23h` | Stops starting new notes after that long (`23.5`, `23h30m`, `90m`, `5400s`; a bare number is hours; default `NLP_STOP_AFTER`, else no limit), finishes and stores the note in progress, rebuilds the consensus and exits 2. The job script sets it from the walltime (7.4) |
+| `python app.py --work-left` | Read-only: prints each model's pending notes and whether the exports are written, exits 0 when `--analyze` has work and 4 when it has none. The job script uses it to end a surplus chained job before starting Ollama |
 
 `--clean` runs first if given, then `--csv` ingests; `--analyze` then runs if given. The database file is always `data.db` in the current working directory and `output/` is created there too, so run the program from the repository directory. There is no command that prints notes or results; use `output/results.csv` or `sqlite3` (7.3).
 
@@ -169,14 +171,17 @@ What the researcher actually needs from these fields is in [15.5](#155-study-req
 - `RetryableLLMError` (invalid JSON, a text field that reached the 1000-character cap, a missing field, wrong type, unexpected field, flag not 0/1, negative count, or an answer the note does not support: a quote not in the note, evidence about the wrong thing, a scope name the note does not state, a count the quoted sentence does not give; `verify_against_note`): retried, up to 5 attempts total. Each retry is a complete generation with the rejection reason appended to the prompt (the rejected answer is not sent back), sampled at temperature 0.8 with `repeat_penalty` 1.1 and `seed` = attempt number. A note that never gets a supported answer is stored with `LLM_Failed = 1` and the last rejection as `LLM_Error`.
 - `LLMAnalysisError` from the call itself (`LLM call failed: ...`: the server is down, or no byte came from it for `NLP_LLM_TIMEOUT` seconds) or any other exception: stored immediately with `LLM_Failed = 1`, no retry. Two more cases are stored without a retry and read as "too long" by the review and the consensus: a note that does not fit the context window is not sent at all (`LLM_Attempts` 0), and an answer whose prompt the server itself counted as larger than the window (the token counts arrive with the last chunk) is discarded (`PromptCutError`).
 - Every note gets a `results` row, and every model its own block of columns in it (`<field> (<model>@<context>)`, Appendix D) with `LLM_Attempts`, `LLM_Seconds` and, on failure, `LLM_Error`. The log (`reporter.py`) carries a run header (database, Ollama version, each model's size and quantization, the steps, the work left per model), a `load` line per model saying how long the load took and where the server put the model (`100% GPU` or a CPU share), one timestamped line per note (`ok` or `FAILED`, with the time taken, the attempt count, Ollama's prompt and answer token counts with the speed, and the structured fields, never note text), a `retry` line with the reason for every retry, a `progress` and a `fields` line every 10 notes with the projected time remaining for the model and for the rest of the run and the tally of the fields so far, a `...` heartbeat line every 60 s (`NLP_HEARTBEAT_SECONDS`) while a model call is in progress (the job log is not a terminal, so there is no live panel), a `Finished` summary per model that lists the failed ids and tallies the review and rejection reasons, the consensus summary with each model's agreement, and two closing tables.
-- Before each model the program checks that the server is reachable and the model is served; it stops a model's pass after 3 consecutive notes whose call failed (`LLM call failed`), after re-probing the server to say whether it died or the model is gone, and leaves the remaining notes pending. The export is skipped when the run is incomplete. Exit codes: 0 complete, 2 incomplete (a model skipped or the run stopped early), 130 on SIGINT (`qdel` sends SIGKILL after its grace period; the stored results are kept either way). A run where every note fails on content still exits 0, which is why the preflight exists (section 6).
+- Before each model the program checks that the server is reachable and the model is served; it stops a model's pass after 3 consecutive notes whose call failed (`LLM call failed`), after re-probing the server to say whether it died or the model is gone, and leaves the remaining notes pending. The export is skipped when the run is incomplete. Exit codes: 0 complete, 1 bad input or a damaged database, 2 incomplete (a model skipped, the `--stop-after` limit reached, or the run stopped early), 3 another run holds the database, 130 on SIGINT, 128 + the signal number on TERM, HUP, USR1 or USR2 (143 for SGE's TERM: the run stops as on Ctrl-C, logs where it stopped and releases its lock); SIGKILL (`h_rt`, `qdel` after its grace period) cannot be caught, and costs only the note in progress. The stored results are kept in every case. A run where every note fails on content still exits 0, which is why the preflight exists (section 6).
 
 ### 2.4 Idempotency
 
 - Ingest skips a row only if all six fields match a stored note, or an earlier row of the same file, exactly.
 - `data_worker` runs one model at a time and skips any note that already has a result under that model's label (its `LLM_Failed` column is not null).
 - The consensus block (`consensus.py`) is rebuilt for every note on every `--analyze`, from the stored answers of the run's models, so it never goes stale after a resume.
-- The export is skipped if `output/results.csv` or `output/results-review.csv` already exists; the two are written together.
+- The export is skipped if `output/results.csv` or `output/results-review.csv` already exists; the two are written together, under `.partial` names that are renamed into place only when both are whole, so a job killed mid-export leaves no truncated `results.csv` for write-once to keep.
+- Each note's result is committed on its own (SQLite rollback journal, never WAL, which needs shared memory NFS lacks), so a kill at any point loses at most the note in progress; a half-written transaction is rolled back on the next open.
+- One run per database: every run that writes takes `data.db.lock` first (7.4). A second run waits for it to go stale, then refuses.
+- Each run first checks `data.db` (`PRAGMA quick_check`) and copies it to `data.db.backup`; a damaged database is refused with the command that restores the backup.
 
 ---
 
@@ -444,8 +449,9 @@ What the job does (full script in Appendix B):
 
 1. Sources `~/nlp-study-env.sh` quietly: exports the `NLP_*` paths, defines the helper functions, `cd`s into the repo, activates the venv.
 2. `nlp_start_ollama`: picks a free localhost port, exports `OLLAMA_HOST`, starts `ollama serve` in the container (with `--nv` only if `nvidia-smi -L` succeeds, `OLLAMA_CONTEXT_LENGTH` 8192 by default, `OLLAMA_MAX_LOADED_MODELS=1` so one model is resident at a time), logs to `~/nlp-study-logs/ollama-<JOB_ID>.log`, waits up to 180 s for `/api/tags`. Traps `nlp_stop_ollama` on exit (TERM, then KILL after 10 s).
+   Before that, unless the arguments include `--csv` or `--clean` (or `NLP_ALWAYS_RUN=1`), it runs `python app.py --work-left`: a job with nothing left to do (a surplus job in a chain) ends there with exit 0, without starting Ollama.
 3. Runs the tier 1 preflight with 1 rep per model unless `NLP_SKIP_PREFLIGHT` is set. Non-zero exit aborts the job before `app.py`.
-4. Runs `python app.py "$@"` and exits with its status, printing a reminder that 143 outside `all.q` usually means the memory limit.
+4. Runs `python app.py --stop-after <left> "$@"`, where `<left>` is the job's walltime (its own `h_rt` from `qstat -j`, so a `qsub -l h_rt=` override counts; else the baked `NLP_JOB_HRT`) minus `NLP_STOP_MARGIN_MINUTES` (default 45) minus the time already spent starting Ollama and the preflight. An exported `NLP_STOP_AFTER`, or a `--stop-after` among the arguments, takes precedence. `app.py` runs in the background so a TERM reaching the script is passed on and the script waits for it to stop. The script exits with `app.py`'s status and a line saying what it means (0 complete, 2 work left, 3 database in use, 143 stopped by TERM or the memory limit).
 
 Resource request baked in: `-N nlp-study`, `-q UI`, `-pe smp 8`, `-l h_rt=24:00:00`, `-j y`, `-o /Users/apkane/nlp-study-logs/`, `-m ea`. No GPU. Change them with `NLP_JOB_QUEUE`, `NLP_JOB_SLOTS`, `NLP_JOB_HRT`, `NLP_JOB_GPU` and re-run `./setup.sh`, or override at submission time (command-line options supersede `#$` directives):
 
@@ -492,15 +498,49 @@ After the job ends, `qacct -j <JOB_ID>` shows exit status, wallclock, and `maxvm
 sqlite3 /nfsscratch/Users/apkane/nlp-study/repo/data.db 'select count(*) notes, (select count(*) from results where "LLM_Failed (medgemma:27b@8192)" is not null) done, (select count(*) from results where "LLM_Failed (medgemma:27b@8192)"=1) llm_failed from notes;'
 ```
 
-### 7.4 Resuming an interrupted run
+### 7.4 Resuming, and running the full corpus (about 100,000 notes)
 
-Submit again without `--csv`. Notes that already have a result for a model are skipped for that model; the rest are processed.
+**Resuming.** Submit again without `--csv`. Notes that already have a result for a model are skipped for that model; the rest are processed.
 
 ```bash
 qsub ~/nlp-study.job --analyze
 ```
 
 The exports are write-once and written only by a complete run: if `output/results.csv` or `output/results-review.csv` exists, both are skipped with a message, so after a resume the files on disk are from the first complete run. Move both aside to regenerate them from the complete database (BACKLOG B17).
+
+**How long the full corpus takes.** 100,000 notes are 300,000 model calls (three models). One job of the default 24 h walltime gives about 23 h of model time (Ollama start and the preflight take some minutes, the stop margin 45). The tier 1 preflight (section 6) prints each model's time per note and a projection for the real row count of `notes.csv`; divide that projection by 23 h for the number of jobs:
+
+| Time per note, three models together | Model time for 100,000 notes | 24 h jobs |
+| --- | --- | --- |
+| 12 s (3 to 5 s per call, the stand-ins' pace on a GPU) | about 14 days | about 15 |
+| 17 s (what fits 5,000 notes in one job) | about 20 days | about 21 |
+| 60 s (the preflight's warning threshold) | about 70 days | about 73 |
+
+At the CPU pace of a 27 B model (minutes per note) the corpus does not finish in any useful time: use the GPU queue (`NLP_JOB_QUEUE=UI-GPU NLP_JOB_GPU=1 ./setup.sh`) or a longer walltime, or cut the work with the relevance gate (BACKLOG F3). The models run one at a time over every note, so `medgemma:27b` finishes the whole corpus before `gemma4` starts, and the consensus is complete only after the last job.
+
+The program itself handles the size: ingest, analysis, consensus and export stream, and peak memory stays under 100 MB. Measured on 2026-10-15 with 100,000 synthetic notes of the real length distribution (mean 4.0 KB) and the model calls faked: ingest 6 s, the integrity check and backup of the 0.5 GB database under 1 s on a local disk, consensus 5.5 s, export 6 s (443 MB and 23 MB), peak 83 MB. The run was stopped five times along the way (TERM, KILL, two time limits, a lock taken over) and every note still ended with exactly one result per model. On `/nfsscratch` expect the check and backup to take a minute or two per job. Disk: about 0.8 GB for `data.db` and as much for `data.db.backup`, about 670 MB for `results.csv`.
+
+`start-resume-stop.md` in the repository is the step-by-step version of this section for the person running the jobs.
+
+**Submit the whole chain at once** from a login node. Each job waits for the one before it (`-hold_jid`, which releases on any exit status), resumes where it stopped, and stops starting notes 45 minutes before its walltime:
+
+```bash
+cd /nfsscratch/Users/apkane/nlp-study/repo
+prev=$(qsub -terse ~/nlp-study.job --analyze --csv ./notes.csv)
+for i in $(seq 2 27); do prev=$(qsub -terse -hold_jid "$prev" ~/nlp-study.job --analyze); done
+qstat -u apkane
+```
+
+Size the chain at the table's job count plus a quarter (27 for the 17 s row). Surplus jobs end within seconds (`Nothing left to do; the job ends without starting Ollama.`), so over-provisioning costs little; delete them anyway once a job log says `complete` (`qdel <JOB_ID> ...`). Each job mails at its end (`-m ea`); add `-m a` to the `qsub` lines for abort mail only. Check in between with `python app.py` (status, including the run lock and the last backup) or `python app.py --work-left`, both safe while a job runs. A job that fails its preflight or hits trouble ends and the next one in the chain tries again; read the job logs if several in a row end early.
+
+**What keeps a weeks-long run safe.**
+
+- *Clean stops.* With `--stop-after` set by the job script, a job finishes the note in progress, rebuilds the consensus and exits 2 before SGE's `h_rt` kill. TERM (eviction from `all.q`, `qdel`) stops it the same way at once (exit 143). The note in progress is not stored and is analysed again by the next job.
+- *Kills.* SIGKILL (`h_rt` reached anyway, the node lost) cannot be caught. Every note is committed on its own, so at most the note in progress is lost; SQLite rolls back a half-written transaction on the next open. The lock file stays behind and the next job takes it over (below).
+- *One run per database.* Every run that writes holds `data.db.lock`, which names its host, pid, SGE job and start time and is refreshed every 30 s. A second run (an overlapping job, an interactive run, `--clean`) waits for it and is refused with exit 3 if it is still fresh after 3.5 minutes. A lock not refreshed for 3 minutes, or whose owner is a dead process on the same host, is stale and taken over (`Taking over the run lock ...`), so a job chained after a killed one goes ahead. A run that loses its lock (suspended by SGE for over 3 minutes while another run took over) stops before its next note and writes nothing more. If you are sure no run is active and a lock still blocks you, delete `data.db.lock`.
+- *Integrity check and backup.* Each run first runs `PRAGMA quick_check` on `data.db` and, when it passes, copies it to `data.db.backup` (written under a temporary name, so the backup is always whole). A damaged database is refused (exit 1) with the commands to set it aside and restore the backup, which loses at most the previous job's work. Copy `data.db` (or the backup) to durable storage every few days: scratch is purged on a schedule.
+- *Exports.* Written under `.partial` names and renamed into place only when whole, so a kill mid-export never leaves a truncated `results.csv` behind.
+- *Call failures.* A note whose model call failed (Ollama died) is stored as failed and not retried on resume (2.3, 14). After a job that stopped with `STOPPED ... model calls in a row failed`, clear those notes' `LLM_Failed` to have the next job retry them.
 
 ### 7.5 Collecting results
 
@@ -655,8 +695,10 @@ Default names are `$JOB_NAME.o$JOB_ID` and `$JOB_NAME.e$JOB_ID`. Streams are app
 | --- | --- |
 | 0 to 127 | Exit status of the computation itself. `app.py` returns 0 even when every note's LLM step failed |
 | 128 + signal | Job did not complete normally |
-| 143 | 128 + TERM (15). Eviction from `all.q`, or the memory limit was hit. Outside `all.q` it almost always means memory. Confirm with `qacct -j <JOB_ID>` |
-| 137 | 128 + KILL (9). Follow-up kill after TERM was not enough |
+| 143 | 128 + TERM (15). Eviction from `all.q`, `qdel`, or the memory limit. `app.py` handles TERM: the job log then ends with `Stopped by SIGTERM.` and where it stopped. Without that line, outside `all.q`, it is almost always memory. Confirm with `qacct -j <JOB_ID>` |
+| 137 | 128 + KILL (9). `h_rt` reached (the job script's `--stop-after` normally ends the job before that), or a follow-up kill after TERM. At most the note in progress is lost |
+| 2 | `app.py` stopped with work left: the `--stop-after` limit (normal in a chain), a model not pulled, or the run stopped early. The next job resumes |
+| 3 | `app.py` did not start: another run holds `data.db.lock` |
 
 ---
 
@@ -718,7 +760,7 @@ Bug-level items are tracked in `BACKLOG.md` (B1 to B26) with proposed fixes; thi
 
 6. **Sample CSVs in the local `samples/` folder ingest as they are since 2026-10-15** (BACKLOG B7 fixed): the ingest skips a byte-order mark, matches header names in any case with spaces, underscores and dashes ignored, and accepts the usual other spellings (`EncounterID`, `note_csn_id`), logging which name it read as which column. Before that, `samples/notes.csv` (header `id,mrn,encounter,note_csn_id,note_date,note_type,note`) and `samples/sample_5000_deidentified.csv` (byte-order mark `EF BB BF`, second column `EncounterID`) were both refused; verified ingesting as-is on 2026-10-15 (5,000 rows in 0.3 s). `samples/notes.csv` still has a note-boundary error: note 9's CPT line sits at the head of note 10 (BACKLOG B8). `samples/` and `environment-notes/` are in `.gitignore` and must stay out of git (names and MRNs).
 
-7. **Runtime versus walltime.** 5000 notes at 24 h walltime allows about 17 s per note for all three models together, including retries; the tier 1 preflight prints each model's per-note time and their sum. CPU inference on a 27 B model (medgemma:27b decodes at about 3 tokens per second on CPU) cannot meet that on its own. Plan on multiple resubmissions (resume is automatic) or set `NLP_JOB_HRT` higher, and read the tier 1 projection, which counts the real rows in `notes.csv`. Most of the 5000-note corpus is not procedure notes, so a relevance gate before the LLM (BACKLOG F3) would cut the work by roughly ten times. At the full study corpus of about 100,000 notes the arithmetic is 300,000 model calls: at the local stand-ins' measured 3 to 5 s per call about 13 days of continuous model time, at the 17 s per note budget above about 20 days, so plan on that many 24 h resubmissions (resume is automatic and keeps every stored result) or on the gate. The program itself scales: the ingest, the analysis pass, the consensus and the export all stream, measured on 2026-10-15 at a flat 50 to 76 MB peak memory and seconds per phase from 20,000 to 100,000 synthetic notes (at 100,000: ingest 3.6 s, consensus 2.7 s, export 3.3 s; the real notes are about 2.4 times longer, which scales the seconds, not the memory; `tests/test_robustness.py` covers the streaming paths). What needs planning is the output: `results.csv` is about 6.7 KB per row (71% the note text, 19% the raw model responses and rejected attempts, 4% the identifiers and the consensus), so about 670 MB at 100,000 rows, beyond Google Sheets' 100 MB import limit and slow in Excel, while `results-review.csv` (the identifiers, the consensus block and the note length) is about 4% of that, some 30 MB, and is the file to open in Sheets; `data.db` about 0.8 GB; and the export is written only by a complete run, so nothing is visible until the last resubmission (BACKLOG B17).
+7. **Runtime versus walltime.** 5000 notes at 24 h walltime allows about 17 s per note for all three models together, including retries; the tier 1 preflight prints each model's per-note time and their sum. CPU inference on a 27 B model (medgemma:27b decodes at about 3 tokens per second on CPU) cannot meet that on its own. Plan on multiple resubmissions (resume is automatic) or set `NLP_JOB_HRT` higher, and read the tier 1 projection, which counts the real rows in `notes.csv`. Most of the 5000-note corpus is not procedure notes, so a relevance gate before the LLM (BACKLOG F3) would cut the work by roughly ten times. At the full study corpus of about 100,000 notes the arithmetic is 300,000 model calls: at the local stand-ins' measured 3 to 5 s per call about 13 days of continuous model time, at the 17 s per note budget above about 20 days, so plan on that many 24 h resubmissions (resume is automatic and keeps every stored result) or on the gate. The program itself scales: the ingest, the analysis pass, the consensus and the export all stream, measured on 2026-10-15 at a flat 50 to 76 MB peak memory and seconds per phase from 20,000 to 100,000 synthetic notes (at 100,000: ingest 3.6 s, consensus 2.7 s, export 3.3 s; the real notes are about 2.4 times longer, which scales the seconds, not the memory; `tests/test_robustness.py` covers the streaming paths). What needs planning is the output: `results.csv` is about 6.7 KB per row (71% the note text, 19% the raw model responses and rejected attempts, 4% the identifiers and the consensus), so about 670 MB at 100,000 rows, beyond Google Sheets' 100 MB import limit and slow in Excel, while `results-review.csv` (the identifiers, the consensus block and the note length) is about 4% of that, some 30 MB, and is the file to open in Sheets; `data.db` about 0.8 GB; and the export is written only by a complete run, so nothing is visible until the last resubmission (BACKLOG B17). Since 2026-10-15 a chain of jobs runs the whole corpus unattended, each stopping cleanly before its walltime; 7.4 has the commands and the safeguards.
 
 8. **Container tag pinned to 0.24.0.** Before 2026-10-13 the default was `latest` (0.32.14 when pulled), which needs driver 550+. Do not move the default past 0.24.x until Argon's GPU nodes run driver 550 or newer (BACKLOG B25).
 
@@ -1112,13 +1154,33 @@ Most likely GPU directives on a queue without GPU nodes (`NLP_JOB_GPU=1` with `-
 
 Intended fail-fast. The lines above it name the problem; see the Preflight section.
 
-#### `app.py exited 143 (143 outside all.q usually means the memory limit)`
+#### `app.py exited 143 ...`
 
-Outside `all.q`: memory limit. Check `qacct -j <JOB_ID>` for `maxvmem`, then add slots (`NLP_JOB_SLOTS=16` or `-pe smp 16`) or use `-q UI-HM`. On `all.q`: eviction; resubmit, the run resumes.
+If the log shows `Stopped by SIGTERM.`, the job was evicted (`all.q`) or deleted; resubmit, the run resumes. Otherwise, outside `all.q`: memory limit. Check `qacct -j <JOB_ID>` for `maxvmem`, then add slots (`NLP_JOB_SLOTS=16` or `-pe smp 16`) or use `-q UI-HM`.
 
-#### `app.py exited 137`
+#### `app.py exited 137 ...`
 
-TERM did not stop it and SGE sent KILL. Same causes as 143.
+SGE sent KILL: `h_rt` was reached before the `--stop-after` limit (a note that ran very long; raise `NLP_STOP_MARGIN_MINUTES`), or TERM did not stop it. At most the note in progress is lost; the next job resumes.
+
+#### `app.py stopped ... with work left`
+
+Normal for a job in a chain: the `--stop-after` limit was reached (`outcome   paused`). The next job, or `qsub ~/nlp-study.job --analyze`, resumes.
+
+#### `Error: another run is using this database (...)` / `app.py did not start: another run holds data.db`
+
+Another run holds `data.db.lock` and refreshed it within the last 3 minutes: an overlapping job (check `qstat -u apkane`) or an interactive run. Let it finish. If you are certain none is running (the host and pid in the message are gone), delete `data.db.lock` and resubmit.
+
+#### `Taking over the run lock data.db.lock: ...`
+
+Informational. The previous run was killed (or its host is gone) without releasing the lock.
+
+#### `STOPPED ... this run lost the run lock`
+
+The run was paused (SGE suspends with SIGSTOP) long enough for another run to take the database over; it stopped writing. Check that only one job runs on the database.
+
+#### `data.db failed its integrity check: ...`
+
+The database is damaged (a node or filesystem failure mid-write). The message gives the commands: move `data.db` aside and copy `data.db.backup` over it (the copy taken, after the same check, at the start of the previous run), then resubmit. The notes analysed since then are analysed again.
 
 #### Job finished quickly, exit 0, LLM columns all empty
 
@@ -1292,6 +1354,9 @@ When changing the prompt or the model, check behaviour on all ten notes of `samp
 | `NLP_JOB_SLOTS` | `8` | `-pe smp` slots baked into the job script |
 | `NLP_JOB_HRT` | `24:00:00` | `-l h_rt` baked into the job script |
 | `NLP_JOB_GPU` | unset | Bake `#$ -l ngpus=1` into the job script (no card type; add `#$ -l <complex>` by hand if needed) |
+| `NLP_STOP_MARGIN_MINUTES` | `45` | (job, at `qsub` time) how long before the walltime the job stops starting notes |
+| `NLP_STOP_AFTER` | unset | (`app.py`) default for `--stop-after`; when exported, the job script passes no limit of its own |
+| `NLP_ALWAYS_RUN` | unset | (job) skip the `--work-left` check, start Ollama even with nothing pending |
 | `NLP_SETUP_LIB_ONLY` | unset | Source the script for its functions only |
 | `USER` | set by the shell/SGE | HawkID for scratch paths; falls back to `id -un` |
 
@@ -1346,16 +1411,39 @@ September-only variables, no longer read: `SKIP_SMOKE_TEST`, `FORCE_SMOKE_TEST`,
 set -eo pipefail
 export NLP_QUIET=1
 . /Users/apkane/nlp-study-env.sh       # paths, helpers, cd repo, activate venv
+JOB_HRT_DEFAULT="24:00:00"             # NLP_JOB_HRT, the fallback when qstat cannot tell the job's h_rt
 set -u
+job_started=$(date +%s)
 echo "nlp-study job ${JOB_ID:-?} on $(hostname), $(date); slots ${NSLOTS:-?}; models ${NLP_MODELS}; args: $*"
+case " $* " in                         # a chained job with nothing left ends before starting Ollama
+    *" --csv"*|*" --clean "*) ;;
+    *)
+        if [ -z "${NLP_ALWAYS_RUN:-}" ]; then
+            left=0; python app.py "$@" --work-left || left=$?
+            if [ "$left" -eq 4 ]; then echo "Nothing left to do; the job ends without starting Ollama."; exit 0; fi
+        fi ;;
+esac
+nlp_hrt_seconds() { ... }              # h_rt from `qstat -j $JOB_ID`, else JOB_HRT_DEFAULT, in seconds
 nlp_start_ollama                       # random port, --nv if a GPU is visible, context 8192, log in ~/nlp-study-logs
 trap nlp_stop_ollama EXIT
 if [ -z "${NLP_SKIP_PREFLIGHT:-}" ]; then
     NLP_PREFLIGHT_REPS="${NLP_PREFLIGHT_REPS:-1}" nlp_preflight 1 \
         || { echo "Preflight failed; not starting app.py." >&2; exit 1; }
 fi
-python app.py "$@" || { rc=$?; echo "app.py exited ${rc} (143 outside all.q usually means the memory limit)" >&2; exit "$rc"; }
-echo "app.py finished at $(date)"
+stop_args=()                           # stop starting notes NLP_STOP_MARGIN_MINUTES before the walltime
+if [ -z "${NLP_STOP_AFTER:-}" ]; then
+    left_s=$(( $(nlp_hrt_seconds) - ${NLP_STOP_MARGIN_MINUTES:-45} * 60 - ($(date +%s) - job_started) ))
+    [ "$left_s" -gt 60 ] || left_s=60
+    stop_args=(--stop-after "${left_s}s")
+fi
+python app.py ${stop_args[@]+"${stop_args[@]}"} "$@" &     # in the background, so TERM is passed on
+app_pid=$!
+trap 'kill -TERM "$app_pid" 2>/dev/null || true' TERM HUP USR1 USR2
+rc=0; wait "$app_pid" || rc=$?
+while kill -0 "$app_pid" 2>/dev/null; do rc=0; wait "$app_pid" || rc=$?; done
+trap - TERM HUP USR1 USR2
+case "$rc" in ... esac                 # one line saying what the exit status means (0, 2, 3, other)
+exit "$rc"
 ```
 
 Written atomically (temp file plus rename), so a job that sources the env script mid-rewrite never sees a half-written file.
@@ -1432,4 +1520,12 @@ Until 2026-10-13 the tables were `working_results` (NLP and LLM answers side by 
 | `results.csv` | One row per note, under plain-words titles (`export.py`; `results-csv-guide.md` explains them): `Note id`, `MRN`, `Encounter`, `NoteCsnID`, `NoteDate`, `NoteType` (columns A to F); the consensus block, each column titled `<what> (consensus)` (columns G to X): `Needs human review` (TRUE/FALSE, the review queue), `Review reasons`, `Outcome`, `Models answered`, `Summary`, the ten fields (`Upper endoscopy performed`, `Scope type`, `Upper endoscopy evidence quote`, `Duodenal biopsies taken`, `Number of duodenal biopsies`, `Duodenal biopsies evidence quote`, `Colonoscopy performed`, `Colonoscopy evidence quote`, `Fellow present`, `Fellow evidence quote`), `Models consulted`, `Disputed fields`, `How the models voted`; then one block of 16 columns per model, each titled `<what> (<model>@<context>)`: `Failed`, the ten fields, `Needs review`, `Review reasons`, `Attempts`, `Seconds`, `Failure reason`; then every model's `Rejected attempts` and `Raw model response`; then `Note length (characters)` and `Note`. Yes/no values are TRUE or FALSE; a cell is empty where the database holds NULL |
 | `results-review.csv` | The same rows with only the identifiers (A to F), the consensus block (G to X) and `Note length (characters)` (Y), written from the same pass as `results.csv` and write-once together with it; about 4% of its size, for Google Sheets. |
 
-Both are written once, together, and never overwritten. Both contain PHI.
+Both are written once, together, and never overwritten. Both contain PHI. While being written they are named `results.csv.partial` and `results-review.csv.partial`; a leftover `.partial` is from an export that was cut short and is overwritten by the next one.
+
+### Files beside `data.db`
+
+| File | Content |
+| --- | --- |
+| `data.db.lock` | Present while a run uses the database: host, pid, SGE job id, start time and a token, refreshed every 30 s (7.4) |
+| `data.db.backup` | A copy of `data.db` taken after a passing integrity check at the start of the latest run (PHI). `--clean` deletes it |
+| `data.db-journal` | SQLite's rollback journal, present during a write, and after a kill until the next open rolls it back. Never delete it by hand |

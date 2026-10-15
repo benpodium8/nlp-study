@@ -358,5 +358,99 @@ class ConsensusTests(unittest.TestCase):
         self.assertEqual(row["Summary"], "No consensus: the note was too long for the context window")
 
 
+class ResumeSafetyTests(unittest.TestCase):
+    """A long corpus runs as a chain of jobs: one run per database, stops that lose nothing, exports never half written."""
+
+    def test_second_run_is_refused_and_a_stale_lock_is_taken_over(self):
+        import os
+        import run_lock
+        with tempfile.TemporaryDirectory() as folder:
+            db = Path(folder) / "data.db"
+            first = run_lock.RunLock(db, report=lambda line: None)
+            first.acquire()
+            with self.assertRaises(run_lock.LockHeld):
+                run_lock.RunLock(db, report=lambda line: None).acquire(wait_seconds=0)
+            old = run_lock.lock_path(db).stat().st_mtime - run_lock.STALE_SECONDS - 10
+            os.utime(run_lock.lock_path(db), (old, old))   # as if its owner had been killed
+            lines = []
+            second = run_lock.RunLock(db, report=lines.append)
+            second.acquire(wait_seconds=0)
+            self.assertIn("Taking over", lines[0])
+            self.assertIn("taken over", first.check())   # the first run must stop writing
+            self.assertIsNone(second.check())
+            first.release()                              # leaves the second run's lock alone
+            self.assertTrue(run_lock.lock_path(db).exists())
+            second.release()
+            self.assertFalse(run_lock.lock_path(db).exists())
+
+    def test_stop_check_ends_the_pass_between_notes(self):
+        import data_worker as W
+        with tempfile.TemporaryDirectory() as folder:
+            conn = D.create_db(Path(folder) / "t.db", ["fake@8192"])
+            path = Path(folder) / "notes.csv"
+            path.write_bytes(HEADER + b"".join(b"P,E%d,N%d,2020,T,note %d\n" % (i, i, i) for i in range(5)))
+            D.ingest_csv(path, conn, report=lambda line: None)
+            status = L.OllamaStatus("fake", True, True, "fake", ("fake",), "0", {})
+            calls = []
+            saved = W.ollama_status, W.load_model, W.llm_analysis
+            W.ollama_status = lambda model=None, timeout=3.0: status
+            W.load_model = lambda spec, timeout=None: L.LoadResult(0.0, None, None)
+            W.llm_analysis = lambda id, note, model, attempt, rejected, observer=None: (calls.append(id), (answer(id=id), "{}"))[1]
+            try:
+                outcome = W.data_worker(conn, [L.ModelSpec("fake", 8192)], stop_check=lambda: "time is up" if len(calls) >= 2 else None)
+            finally:
+                W.ollama_status, W.load_model, W.llm_analysis = saved
+            self.assertEqual(outcome.stopped, "time is up")
+            self.assertEqual(calls, [1, 2])
+            self.assertEqual([id for id, _ in D.pending_notes(conn, "fake@8192")], [3, 4, 5])
+            conn.close()
+
+    def test_an_export_cut_short_leaves_no_results_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            conn = ExportFilesTests().build(folder)
+            real = E.cell
+            E.cell = lambda field, value: (_ for _ in ()).throw(KeyboardInterrupt) if value == "P3" else real(field, value)
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    E.export_results(conn, str(folder / "output"), report=lambda line: None)
+            finally:
+                E.cell = real
+            self.assertFalse((folder / "output" / E.EXPORT_NAME).exists())
+            self.assertFalse((folder / "output" / E.REVIEW_EXPORT_NAME).exists())
+            self.assertIsNotNone(E.export_results(conn, str(folder / "output"), report=lambda line: None))
+            self.assertEqual(sorted(p.name for p in (folder / "output").iterdir()), [E.REVIEW_EXPORT_NAME, E.EXPORT_NAME])
+            conn.close()
+
+    def test_a_damaged_database_is_refused_and_a_sound_one_backed_up(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Path(folder) / "data.db"
+            conn = D.create_db(db, ["m@8192"])
+            path = Path(folder) / "notes.csv"
+            path.write_bytes(HEADER + b"".join(b"P,E%d,N%d,2020,T,%s\n" % (i, i, b"x" * 3000) for i in range(300)))
+            D.ingest_csv(path, conn, report=lambda line: None)
+            conn.close()
+            self.assertTrue(D.check_and_back_up(db, report=lambda line: None))
+            copy = __import__("sqlite3").connect(D.backup_path(db))
+            self.assertEqual(copy.execute("SELECT COUNT(*) FROM notes").fetchone()[0], 300)
+            copy.close()
+            data = bytearray(db.read_bytes())
+            data[4096 * 3 : 4096 * 3 + 200] = b"\xff" * 200   # scribble over a table page
+            db.write_bytes(bytes(data))
+            with self.assertRaises(D.DatabaseDamaged) as caught:
+                D.check_and_back_up(db, report=lambda line: None)
+            self.assertIn(str(D.backup_path(db)), str(caught.exception))
+
+    def test_durations(self):
+        from cli import parse_duration
+        self.assertEqual(parse_duration("23.5"), 23.5 * 3600)
+        self.assertEqual(parse_duration("23h30m"), 23.5 * 3600)
+        self.assertEqual(parse_duration("90m"), 5400)
+        self.assertEqual(parse_duration("5400s"), 5400)
+        self.assertEqual(parse_duration("1d"), 86400)
+        with self.assertRaises(Exception):
+            parse_duration("soon")
+
+
 if __name__ == "__main__":
     unittest.main()

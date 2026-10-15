@@ -187,13 +187,15 @@ Ollama runs locally and does **not** require internet access after model downloa
 python app.py
 ```
 
-With no options it prints what the program needs (the packages, Ollama and the model, the CSV header, where files go), the typical commands, and a status check of the current directory: whether Ollama is reachable and the model is pulled, how many notes `data.db` holds and how many are still pending, and whether the two exports already exist. There are four options, which can be combined:
+With no options it prints what the program needs (the packages, Ollama and the model, the CSV header, where files go), the typical commands, and a status check of the current directory: whether Ollama is reachable and the model is pulled, how many notes `data.db` holds and how many are still pending, whether another run holds the database, when it was last backed up, and whether the two exports already exist. The options can be combined:
 
 | Option         | Effect                                                                                   |
 | -------------- | ---------------------------------------------------------------------------------------- |
 | `--csv FILE`   | Ingest the notes in `FILE` into `data.db` (duplicates skipped); reports how many were added |
 | `--analyze`    | Run each model on every note that has no result for it yet, rebuild the consensus of the models for every note, then write `output/results.csv` and its review-sized copy `output/results-review.csv` |
-| `--clean`      | Delete `data.db` (and any SQLite journal files) and the two exports (`output/results.csv`, `output/results-review.csv`) from earlier runs, before anything else. Discards every stored result |
+| `--clean`      | Delete `data.db` (with any SQLite journal files and its backup `data.db.backup`) and the two exports (`output/results.csv`, `output/results-review.csv`) from earlier runs, before anything else. Discards every stored result. Refused while another run holds the database |
+| `--stop-after DURATION` | Stop starting new notes after this long (`23.5`, `23h30m`, `90m`, `5400s`; a bare number is hours; default `NLP_STOP_AFTER`). The note in progress is finished and stored, the consensus rebuilt, and the run exits 2 so the next `--analyze` resumes. For batch jobs: set it below the walltime |
+| `--work-left`  | Read-only: print each model's pending notes and whether the exports exist; exit 0 when `--analyze` has work, 4 when it has none |
 | `--location`   | Which model set to run: `server` (the default) is the three study models; `local` is three small stand-ins (`ministral-3:3b`, `gemma4:e2b`, `qwen3.5:4b`) for a workstation test. Either way each model gets its own labelled columns |
 
 ---
@@ -242,6 +244,8 @@ This will:
 5. Export `output/results.csv` and its review-sized copy `output/results-review.csv`
 
 Running `python app.py --analyze` again resumes: notes that already have a result for a model are skipped for that model. The consensus is rebuilt for every note on each run, so it always reflects every model's stored answers.
+
+A large corpus (the study's 100,000 notes are 300,000 model calls, weeks of model time) runs as many resumed runs, and the program is built to be stopped and restarted at any point. Each note's result is committed on its own, so a stop or kill loses at most the note in progress. Ctrl-C, and the signals a batch system sends (TERM, HUP, USR1, USR2), stop the run cleanly; `--stop-after` stops it before a walltime. Only one run may use a database at a time: a run holds `data.db.lock` (refreshed every 30 s) and a second run waits for it, takes it over once it is stale (its owner was killed), or is refused. Each run checks `data.db` (`PRAGMA quick_check`) and copies it to `data.db.backup` before changing it. The exports are written under `.partial` names and renamed into place only when whole. `ARGON_RUNBOOK.md` section 7.4 has the commands for a chain of Argon jobs and the time estimates. `start-resume-stop.md` is the day-to-day procedure: starting the chain, checking on it, stopping and resuming it over several days, and collecting the results.
 
 While it runs, the program reports what it is doing in two layers.
 
@@ -335,7 +339,7 @@ The `load` line for `qwen3.5:4b` is the kind of thing to watch for: the server p
 
 Only the structured fields are logged, never note text or the model's prose; the evidence sentences and raw responses are in the database and the export. Rejection reasons are logged without the rejected value.
 
-Before each model the program checks that Ollama is reachable (otherwise the run stops) and that the model is pulled (otherwise that model is skipped and its notes stay pending), and it stops a model's pass after three consecutive notes whose model call itself failed, since that means the server rather than the notes is the problem: the remaining notes stay pending for the next `--analyze`. The export is skipped when a run is incomplete, so a partial file never blocks the complete one (it is write-once). Ctrl-C stops the run cleanly: every stored result is kept, the note in progress is not stored, and `--analyze` resumes. Exit codes: 0 complete, 1 bad input, 2 incomplete (a model skipped or the run stopped early), 130 interrupted.
+Before each model the program checks that Ollama is reachable (otherwise the run stops) and that the model is pulled (otherwise that model is skipped and its notes stay pending), and it stops a model's pass after three consecutive notes whose model call itself failed, since that means the server rather than the notes is the problem: the remaining notes stay pending for the next `--analyze`. The export is skipped when a run is incomplete, so a partial file never blocks the complete one (it is write-once). Ctrl-C stops the run cleanly: every stored result is kept, the note in progress is not stored, and `--analyze` resumes. Exit codes: 0 complete, 1 bad input or a damaged database, 2 incomplete (a model skipped, the `--stop-after` limit reached, or the run stopped early), 3 another run holds the database, 130 interrupted with Ctrl-C, 143 stopped by TERM (128 + the signal number for HUP, USR1 and USR2).
 
 ---
 
@@ -385,7 +389,8 @@ Responsibilities:
 
 - Argument parsing
 - Safe ordering of pipeline steps (ingest, then analyze, then consensus, then export), each reported as a numbered step with the run header, the work plan and the closing summary
-- Exit codes: 0 complete, 1 bad input, 2 incomplete, 130 interrupted
+- One run per database (`run_lock.py`), a time limit (`--stop-after`), and stop signals handled like Ctrl-C
+- Exit codes: 0 complete, 1 bad input or a damaged database, 2 incomplete (including the `--stop-after` limit), 3 another run holds the database, 4 nothing left (`--work-left`), 130 interrupted, 128 + the signal number when stopped by a signal (143 for TERM)
 
 HIPAA:
 
@@ -597,7 +602,7 @@ Standard-library `unittest`, no model or server needed, run from the project dir
 python -m unittest discover -s tests -v
 ```
 
-27 cases: CSV files with a byte-order mark, other header spellings, bad bytes, NUL bytes, short rows, very long fields and repeated rows; scope names the sample never showed, the RES/FEL attestation form, instruments that are never the upper endoscope, biopsy ranges; an answer the server counted as cut; the TRUE/FALSE and formula-space conventions of the export; the streaming ingest, pending list and consensus; and the agreement of `results.csv` with `results-review.csv` on columns A to X. Add a case for every new input shape.
+32 cases: CSV files with a byte-order mark, other header spellings, bad bytes, NUL bytes, short rows, very long fields and repeated rows; scope names the sample never showed, the RES/FEL attestation form, instruments that are never the upper endoscope, biopsy ranges; an answer the server counted as cut; the TRUE/FALSE and formula-space conventions of the export; the streaming ingest, pending list and consensus; the agreement of `results.csv` with `results-review.csv` on columns A to X; and resuming safely: the run lock refusing a second run and taking over a stale one, the time limit stopping between notes, an export cut short leaving no `results.csv`, and a damaged database refused while a sound one is backed up. Add a case for every new input shape.
 
 ---
 

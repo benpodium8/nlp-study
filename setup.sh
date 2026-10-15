@@ -181,14 +181,14 @@ ensure_resource() {
     ok "[${name}] ready"
 }
 
-# notes.csv, data.db and output/ live inside the repo and are PHI: never rm -rf them.
+# notes.csv, data.db (with its journal and backup) and output/ live inside the repo and are PHI: never rm -rf them.
 # They are moved aside before a rebuild and moved back into the fresh checkout.
 preserve_user_data() {
     local dir="$1" p
     local -a keep=()
     [[ -d "$dir" ]] || return 0
     shopt -s nullglob
-    for p in "$dir"/*.csv "$dir"/*.db "$dir"/*.sqlite "$dir"/*.sqlite3 "$dir"/output; do
+    for p in "$dir"/*.csv "$dir"/*.db "$dir"/*.db.backup "$dir"/*.db-journal "$dir"/*.sqlite "$dir"/*.sqlite3 "$dir"/output; do
         if [[ -e "$p" ]]; then keep+=("$p"); fi
     done
     shopt -u nullglob
@@ -990,10 +990,36 @@ ${gpu_directives}
 set -eo pipefail
 export NLP_QUIET=1
 . "${ENV_SCRIPT}"
+JOB_HRT_DEFAULT="${JOB_HRT}"
 EOF
         cat <<'EOF'
 set -u
+job_started=$(date +%s)
 echo "nlp-study job ${JOB_ID:-?} on $(hostname), $(date); slots ${NSLOTS:-?}; models ${NLP_MODELS}; args: $*"
+
+# A job in a chain of resubmissions (qsub -hold_jid) that finds nothing left to do ends here,
+# before Ollama and the preflight. Skipped when the job ingests or cleans, or with NLP_ALWAYS_RUN=1.
+case " $* " in
+    *" --csv"*|*" --clean "*) ;;
+    *)
+        if [ -z "${NLP_ALWAYS_RUN:-}" ]; then
+            left=0; python app.py "$@" --work-left || left=$?
+            if [ "$left" -eq 4 ]; then echo "Nothing left to do; the job ends without starting Ollama."; exit 0; fi
+        fi ;;
+esac
+
+# The walltime in seconds: this job's own h_rt (qstat, so a qsub -l h_rt=... override counts),
+# else the one setup.sh wrote into this script.
+nlp_hrt_seconds() {
+    local v h m s
+    v="$(qstat -j "${JOB_ID:-0}" 2>/dev/null | grep -o 'h_rt=[0-9:]*' | head -1 | cut -d= -f2)" || true
+    [ -n "$v" ] || v="$JOB_HRT_DEFAULT"
+    case "$v" in
+        *:*:*) IFS=: read -r h m s <<<"$v"; echo $(( 10#$h * 3600 + 10#$m * 60 + 10#$s )) ;;
+        *) echo "$v" ;;
+    esac
+}
+
 nlp_start_ollama
 trap nlp_stop_ollama EXIT
 if [ -z "${NLP_SKIP_PREFLIGHT:-}" ]; then
@@ -1002,8 +1028,32 @@ if [ -z "${NLP_SKIP_PREFLIGHT:-}" ]; then
     NLP_PREFLIGHT_REPS="${NLP_PREFLIGHT_REPS:-1}" nlp_preflight 1 \
         || { echo "Preflight failed; not starting app.py." >&2; exit 1; }
 fi
-python app.py "$@" || { rc=$?; echo "app.py exited ${rc} (143 outside all.q usually means the memory limit)" >&2; exit "$rc"; }
-echo "app.py finished at $(date)"
+
+# Stop starting notes NLP_STOP_MARGIN_MINUTES (default 45) before SGE's h_rt kill, so the job
+# finishes its note, rebuilds the consensus and releases the database cleanly. An exported
+# NLP_STOP_AFTER (app.py reads it) or a --stop-after argument (it comes later) takes precedence.
+stop_args=()
+if [ -z "${NLP_STOP_AFTER:-}" ]; then
+    left_s=$(( $(nlp_hrt_seconds) - ${NLP_STOP_MARGIN_MINUTES:-45} * 60 - ($(date +%s) - job_started) ))
+    [ "$left_s" -gt 60 ] || left_s=60
+    stop_args=(--stop-after "${left_s}s")
+fi
+
+# app.py runs in the background so a TERM (eviction, qdel) reaching this script is passed on
+# and the script waits for app.py to stop cleanly instead of exiting under it.
+python app.py ${stop_args[@]+"${stop_args[@]}"} "$@" &
+app_pid=$!
+trap 'kill -TERM "$app_pid" 2>/dev/null || true' TERM HUP USR1 USR2
+rc=0; wait "$app_pid" || rc=$?
+while kill -0 "$app_pid" 2>/dev/null; do rc=0; wait "$app_pid" || rc=$?; done
+trap - TERM HUP USR1 USR2
+case "$rc" in
+    0) echo "app.py finished at $(date): every note analysed, consensus built, exports written unless they existed" ;;
+    2) echo "app.py stopped at $(date) with work left (time limit, or stopped early: see above); every stored result is kept. Resume: qsub ~/nlp-study.job --analyze" >&2 ;;
+    3) echo "app.py did not start: another run holds data.db (see above)" >&2 ;;
+    *) echo "app.py exited ${rc} at $(date) (143: stopped by TERM, or the memory limit outside all.q; 137: killed). Every stored result is kept; resume: qsub ~/nlp-study.job --analyze" >&2 ;;
+esac
+exit "$rc"
 EOF
     } | atomic_write "$JOB_SCRIPT"
     ok "Wrote ${JOB_SCRIPT}"
