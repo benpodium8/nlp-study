@@ -18,10 +18,17 @@ not flagged, and the failure stays on record in Models, Agreement and Outcome. A
 another type with no consensus, where no model found a procedure, is not flagged either,
 since there is no study value to recover, and Agreement says so. Every row records which
 models were consulted and how they voted (Models, Agreement, Outcome), so the consensus can
-be audited against the per-model columns.
+be audited against the per-model columns; Answered counts the models that answered, Disputed
+names the fields they split on, and Summary says in one plain-words line what the consensus
+found (export.py puts these columns under their export titles).
 
 A model's own ManualReviewRequired flag (review.py) does not carry over: it describes how
 that model reached its answer; the consensus is judged on whether the models agree.
+
+The reasons are written for the reader of results.csv: where one points at another column
+("see Failure reason", "see How the models voted") it uses that column's export title
+(export.py), and it names the fields by their short names (FellowPresent), which
+results-csv-guide.md maps to the column titles.
 """
 
 import re
@@ -264,6 +271,8 @@ def consensus(
     pending = [a for a in answers if a.llm_failed is None]
     reasons = []
     outcome = "none"
+    disputed = []       # the voted fields the answering models did not all agree on (Disputed)
+    undecided = set()   # the fields left empty for lack of a majority or by a conflict (for the Summary)
 
     models = "; ".join(
         a.label + ("" if a.answered else " (failed)" if a.llm_failed == 1 else " (not analysed)") for a in answers
@@ -278,16 +287,18 @@ def consensus(
     if pending:
         reasons.append(f"{_names(pending)} has not analysed this note; run --analyze again")
         agreement = f"{header}; no consensus until every model has run"
+        summary = "No consensus yet: a model has not analysed this note"
     elif len(answered) < 2:
+        summary = f"No consensus: {len(answered)} of {len(answers)} models answered"
         if not answered:
             if failed and all(a.error and a.error.startswith(TOO_LONG_PREFIX) for a in failed):
-                reasons.append("note too long for the context window, not sent to any model; see LLM_Error")
+                reasons.append("note too long for the context window, not sent to any model; see each model's Failure reason")
             else:
-                reasons.append("no model gave an answer the note supports; see each model's LLM_Error")
+                reasons.append("no model gave an answer the note supports; see each model's Failure reason")
             agreement = f"{header}; no consensus"
         else:
             if failed:
-                reasons.append(f"{_names(failed)} failed on this note; see LLM_Error")
+                reasons.append(f"{_names(failed)} failed on this note; see Failure reason")
             reasons.append(
                 f"only {answered[0].label} gave an answer the note supports, which is not a consensus; "
                 f"its own columns hold that answer"
@@ -318,14 +329,18 @@ def consensus(
         # The fields must agree with each other, as verify_against_note demands of one model's
         # answer; separate majorities can contradict, and a contradicted field is left empty.
         conflicts = []
+        undecided.update(empty)
         if values["FellowPresent"] == 1 and values["Endoscopy"] != 1 and values["Colonoscopy"] != 1:
             values["FellowPresent"] = None
+            undecided.add("FellowPresent")
             conflicts.append("FellowPresent left empty: a fellow takes part in a procedure, and the consensus has none")
         if values["DuodenalBiopsiesTaken"] == 1 and values["Endoscopy"] != 1:
             values["DuodenalBiopsiesTaken"] = values["NumberOfDuodenalBiopsies"] = None
+            undecided.update(("DuodenalBiopsiesTaken", "NumberOfDuodenalBiopsies"))
             conflicts.append("DuodenalBiopsiesTaken and NumberOfDuodenalBiopsies left empty: duodenal biopsies need an upper endoscopy, and the consensus has none")
         if values["ScopeType"] is not None and values["Endoscopy"] != 1:
             values["ScopeType"] = None
+            undecided.add("ScopeType")
             conflicts.append("ScopeType left empty: the consensus has no upper endoscopy")
 
         disputed = [
@@ -333,7 +348,7 @@ def consensus(
             for field in VOTED_FIELDS if field in empty or field in by_majority
         ]
         if disputed:
-            reasons.append(f"models disagree on {', '.join(disputed)}; see Agreement")
+            reasons.append(f"models disagree on {', '.join(disputed)}; see How the models voted")
         reasons.extend(conflicts)
         if values["Endoscopy"] == 1 and values["ScopeType"] is None and "ScopeType" not in empty:
             reasons.append("upper endoscopy documented but no scope name found")
@@ -372,7 +387,7 @@ def consensus(
             reasons.insert(
                 0,
                 f"{_names(failed)} failed on this note; the consensus rests on the other "
-                f"{len(answered)} models; see LLM_Error",
+                f"{len(answered)} models; see Failure reason",
             )
 
         agreement = f"{header}; " + ("; ".join(lines) if lines else "they agree on every field")
@@ -384,14 +399,70 @@ def consensus(
             outcome = "agreed"
         else:
             outcome = "unanimous"
+        summary = _summary(values, undecided)
 
     values["ManualReviewRequired"] = "true" if reasons else "false"
     values["ManualReviewReason"] = "; ".join(reasons) or None
+    values["Summary"] = summary
     values["Outcome"] = outcome
+    values["Answered"] = len(answered)
     values["Models"] = models
+    values["Disputed"] = "; ".join(disputed) or None
     values["Agreement"] = agreement
     assert set(values) == {field for field, _ in CONSENSUS_COLUMNS}
     return values
+
+
+def _summary(values: dict, undecided: set) -> str:
+    """
+    What a consensus of two or more models found, in one plain-words line for the Summary
+    column: the procedure(s) with the scope, the duodenal biopsies with their count, and the
+    fellow, naming a field "undecided" where the models left it empty (undecided: the fields
+    left empty for lack of a majority or by a conflict). Built from the consensus values
+    only, so it says nothing the fields do not.
+    """
+    egd, colonoscopy = values["Endoscopy"], values["Colonoscopy"]
+    parts = []
+    if egd == 1:
+        scope = values["ScopeType"]
+        if scope is not None:
+            parts.append(f"upper endoscopy with {scope}")
+        elif "ScopeType" in undecided:
+            parts.append("upper endoscopy, scope undecided")
+        else:
+            parts.append("upper endoscopy, scope not named")
+    elif egd is None:
+        parts.append("upper endoscopy undecided")
+
+    taken, count = values["DuodenalBiopsiesTaken"], values["NumberOfDuodenalBiopsies"]
+    if taken == 1:
+        if count is None:
+            how = "undecided" if "NumberOfDuodenalBiopsies" in undecided else "not stated"
+            parts.append(f"duodenal biopsies taken, count {how}")
+        else:
+            parts.append(f"{count} duodenal {'biopsy' if count == 1 else 'biopsies'}")
+    elif taken is None:
+        parts.append("duodenal biopsies undecided")
+    elif egd == 1:
+        parts.append("no duodenal biopsies")
+
+    if colonoscopy == 1:
+        parts.append("colonoscopy")
+    elif colonoscopy is None:
+        parts.append("colonoscopy undecided")
+
+    fellow = values["FellowPresent"]
+    if fellow == 1:
+        parts.append("fellow present")
+    elif fellow is None:
+        parts.append("fellow presence undecided")
+    elif egd == 1 or colonoscopy == 1:
+        parts.append("no fellow")
+
+    if not parts:
+        return "No procedure documented"
+    text = "; ".join(parts)
+    return text[0].upper() + text[1:]
 
 
 def _agreeing(field: str, vote: _Vote, answered: Sequence[ModelAnswer]) -> list:
@@ -487,7 +558,7 @@ def consolidate(conn, models: Sequence[ModelSpec] = MODELS, report=print, progre
     if unflagged_none:
         report(
             f"Not flagged although without consensus: {unflagged_none} note(s) of other types with no upper "
-            f"endoscopy wording where no model found a procedure, so an empty row is no loss to the study (see Agreement)."
+            f"endoscopy wording where no model found a procedure, so an empty row is no loss to the study (see How the models voted)."
         )
     if disputed:
         report("Fields the models did not all agree on: " + ", ".join(f"{field} {n}" for field, n in disputed.most_common()) + " note(s).")

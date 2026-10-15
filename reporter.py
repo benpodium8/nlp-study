@@ -404,7 +404,7 @@ class ModelRun:
         if review_required:
             self.flagged += 1
             for reason in (review_reason or "").split("; "):
-                if reason and not reason.startswith("see "):   # "; see LLM_Error" points at a column, it is not a reason
+                if reason and not reason.startswith("see "):   # "; see Failure reason" points at a column, it is not a reason
                     self.review_reasons[review_key(reason)] += 1
         self.call = None
 

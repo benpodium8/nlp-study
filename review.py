@@ -28,6 +28,9 @@ def manual_review(
     rejections of the answer from repetition loops. context_length is the window the model
     was called with (ModelSpec.num_ctx).
 
+    Where a reason points at another column ("see Failure reason", "see Rejected attempts") it
+    uses that column's title in results.csv (export.py), the file the reasons are read in.
+
     Triggers:
       - the note failed (no answer the note supports, or the model call failed)
       - the answer was accepted only after an attempt was rejected for its content (a
@@ -45,11 +48,11 @@ def manual_review(
 
     if llm_failed:
         if too_long:
-            reasons.append("note too long for the context window, not sent to the model; see LLM_Error")
+            reasons.append("note too long for the context window, not sent to the model; see Failure reason")
         elif error and error.startswith("LLM call failed"):
-            reasons.append("the model call failed; see LLM_Error")
+            reasons.append("the model call failed; see Failure reason")
         else:
-            reasons.append("no answer the note supports; see LLM_Error")
+            reasons.append("no answer the note supports; see Failure reason")
     elif attempts > 1:
         if rejections is None:
             reasons.append(
@@ -61,7 +64,7 @@ def manual_review(
             if content:
                 reasons.append(
                     f"accepted on attempt {attempts} after {len(content)} rejected answer(s), "
-                    f"repetition loops not counted; see LLM_Rejections"
+                    f"repetition loops not counted; see Rejected attempts"
                 )
 
     if result:

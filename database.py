@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS notes (
 );
 """
 
-# The fields the LLM extracts, with their SQLite types, in storage and export order.
+# The fields the LLM extracts, with their SQLite types, in storage order (export.py lays the
+# export out in its own reading order, under plain-words titles).
 # llm_analysis.EXPECTED_FIELDS validates the same set (plus the note id).
 RESULT_FIELDS = (
     ("ScopeType", "TEXT"),
@@ -56,12 +57,16 @@ RESULTS_COLUMNS = RESULT_FIELDS + REVIEW_FIELDS + DEBUG_FIELDS
 
 # The consensus block (consensus.py) consolidates the models' answers for a note. It is
 # stored and exported under this label, "ScopeType (consensus)" and so on, with the ten
-# fields, the review columns, and three columns that say how the consensus was reached.
+# fields, the review columns, and six columns that say what the consensus found and how it
+# was reached (export.py gives every column its export title).
 CONSENSUS_LABEL = "consensus"
 CONSENSUS_FIELDS = (
-    ("Outcome", "TEXT"),    # unanimous, agreed, majority, partial or none (consensus.OUTCOMES)
-    ("Models", "TEXT"),     # the model labels consulted, "; "-separated, each marked (failed) or (not analysed) when it gave no answer
-    ("Agreement", "TEXT"),  # how many models answered and how they voted on each field they did not agree on
+    ("Summary", "TEXT"),      # what the consensus found, in one plain-words line ("Upper endoscopy with Olympus H190; 4 duodenal biopsies; fellow present"), or why there is none
+    ("Outcome", "TEXT"),      # unanimous, agreed, majority, partial or none (consensus.OUTCOMES)
+    ("Answered", "INTEGER"),  # how many of the models consulted gave an answer the note supports
+    ("Models", "TEXT"),       # the model labels consulted, "; "-separated, each marked (failed) or (not analysed) when it gave no answer
+    ("Disputed", "TEXT"),     # the voted fields the answering models did not all agree on, each marked "(majority answer given)" or "(no majority, left empty)"; null when they agreed on every field
+    ("Agreement", "TEXT"),    # how many models answered and how they voted on each field they did not agree on
 )
 CONSENSUS_COLUMNS = RESULT_FIELDS + REVIEW_FIELDS + CONSENSUS_FIELDS
 
@@ -125,13 +130,15 @@ REQUIRED_CSV_COLUMNS = ("MRN", "Encounter", "NoteCsnID", "NoteDate", "NoteType",
 
 COUNT_NOTES_SQL = "SELECT COUNT(*) FROM notes;"
 
-# The note identifiers that open every export row; the note text closes it.
-NOTE_ID_COLUMNS = ("id", "mrn", "encounter", "note_csn_id", "note_date", "note_type")
-
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> list[tuple[str, str]]:
     """(name, declared type) of every column of table, in table order."""
     return [(row[1], row[2]) for row in conn.execute(f"PRAGMA table_info({table});")]
+
+
+def results_column_names(conn: sqlite3.Connection) -> set[str]:
+    """The names of every column the results table has."""
+    return {name for name, _ in _table_columns(conn, "results")}
 
 
 def results_labels(conn: sqlite3.Connection) -> list[str]:
@@ -601,62 +608,3 @@ def store_consensus(conn: sqlite3.Connection, rows: dict[int, dict]):
         for id, values in rows.items():
             _write_block(conn, id, CONSENSUS_LABEL, CONSENSUS_COLUMNS, tuple(values[f] for f, _ in CONSENSUS_COLUMNS))
 
-
-def export_columns(conn: sqlite3.Connection) -> list[str]:
-    """
-    The result columns the export carries, in order: the consensus block first (when the
-    table has it), then one block per model label (in the order the labels were added), each
-    block in its column order. A column the table lacks is skipped.
-    """
-    existing = {name for name, _ in _table_columns(conn, "results")}
-    blocks = [(CONSENSUS_LABEL, CONSENSUS_COLUMNS)] + [(label, RESULTS_COLUMNS) for label in results_labels(conn)]
-    return [
-        column_name(field, label)
-        for label, columns in blocks
-        for field, _ in columns
-        if column_name(field, label) in existing
-    ]
-
-
-def export_results(conn: sqlite3.Connection, output_folder="output", report=print) -> Path | None:
-    """
-    Writes every note with the consensus block and each model's labelled result columns to
-    output_folder/results.csv, creating the folder if needed: the identifiers first, then
-    the consensus block, then one block of columns per model, then the note text last. The
-    file is written only if it does not already exist (write-once); an existing file is left
-    alone and a message is reported. Returns the path written, or None when it was not.
-    """
-    started = time.perf_counter()
-    output_path = Path(output_folder)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    output_file = output_path / "results.csv"
-    if output_file.exists():
-        report(
-            f"File '{output_file}' already exists. Export skipped; "
-            "move it aside and run --analyze again to regenerate it from the database."
-        )
-        return None
-
-    columns = export_columns(conn)
-    cursor = conn.execute(
-        f"SELECT {', '.join(f'notes.{name}' for name in NOTE_ID_COLUMNS)}, "
-        + "".join(f"results.{quoted(name)}, " for name in columns)
-        + "notes.note FROM notes LEFT JOIN results ON notes.id = results.id ORDER BY notes.id;"
-    )
-    column_names = [desc[0] for desc in cursor.description]
-
-    row_count = 0
-    with output_file.open(mode="w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(column_names)
-        for row in cursor:
-            writer.writerow(row)
-            row_count += 1
-
-    size = output_file.stat().st_size
-    report(
-        f"Wrote {row_count} row(s) and {len(column_names)} columns to {output_file} "
-        f"({size / 1e6:.1f} MB) in {time.perf_counter() - started:.1f}s."
-    )
-    return output_file

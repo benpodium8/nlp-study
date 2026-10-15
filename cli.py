@@ -7,10 +7,10 @@ from rich.markup import escape
 
 from consensus import consolidate
 from database import (
-    COUNT_NOTES_SQL, REQUIRED_CSV_COLUMNS, create_db, database_status, ingest_csv, export_results, model_statistics,
-    pending_notes,
+    COUNT_NOTES_SQL, REQUIRED_CSV_COLUMNS, create_db, database_status, ingest_csv, model_statistics, pending_notes,
 )
 from data_worker import SUMMARY_EVERY, WorkerOutcome, data_worker
+from export import EXPORT_NAME, export_results
 from llm_analysis import LOCATIONS, MODELS, ModelSpec, max_note_chars, model_served, note_fits_context, ollama_status
 from reporter import FIELD_TALLIES, HEARTBEAT_SECONDS, ModelPlan, Reporter, duration, plural
 
@@ -18,7 +18,8 @@ from reporter import FIELD_TALLIES, HEARTBEAT_SECONDS, ModelPlan, Reporter, dura
 STORED_RATE_MIN_NOTES = 5
 
 DB_PATH = Path("data.db")
-EXPORT_PATH = Path("output") / "results.csv"
+EXPORT_PATH = Path("output") / EXPORT_NAME
+GUIDE_PATH = Path("results-csv-guide.md")
 
 # Result columns from before they were labelled belong to the first default model, whatever
 # model a run uses (see database.create_db).
@@ -83,29 +84,37 @@ While it runs
   resumes).
 
 Output
-  {EXPORT_PATH}   one row per note: the identifiers; the consensus block, each column
-                       named "<field> (consensus)"; one block of columns per model, each
-                       column named "<field> (<model>@<context>)", for example
-                       "ScopeType ({MODELS[0].label})"; and the note text last.
-                       The consensus block holds the ten fields the models agree on: a
-                       value needs at least two models that answered and agree, a strict
+  {EXPORT_PATH}   one row per note, laid out for Google Sheets or Excel; {GUIDE_PATH}
+                       explains every column. The note identifiers come first (columns A
+                       to F), then the consensus block, every column titled
+                       "<what> (consensus)": "Needs human review" (TRUE or FALSE, column G:
+                       the review queue) with "Review reasons", "Outcome" (unanimous,
+                       agreed, majority, partial, none), "Models answered", a one-line
+                       "Summary", the ten fields in plain words ("Upper endoscopy
+                       performed", "Scope type", "Number of duodenal biopsies", ...),
+                       "Models consulted", "Disputed fields" and "How the models voted";
+                       then one block per model, every column titled
+                       "<what> (<model>@<context>)", for example
+                       "Scope type ({MODELS[0].label})": "Failed", the same ten fields, the
+                       model's own "Needs review" with "Review reasons", "Attempts",
+                       "Seconds" and "Failure reason"; then every model's "Rejected
+                       attempts" and "Raw model response"; then "Note length (characters)"
+                       and the note text. Yes/no values are TRUE or FALSE; a cell is empty
+                       where there is no answer (no consensus, a failed model, a count the
+                       note does not state).
+                       The consensus block holds the fields the models agree on: a value
+                       needs at least two models that answered and agree, a strict
                        majority settles a disagreement (and flags the note), and a field
-                       with no majority stays empty. ManualReviewRequired ("true"/"false")
-                       with ManualReviewReason flags the rows a human can improve: the
-                       models disagreed, the agreed answer leaves a study field open,
-                       contradicts the note's own attestation of a trainee or sums two
-                       biopsy counts from one sentence, or a note that could hold a
-                       study value (a procedure note, upper endoscopy wording, or a
-                       model's answer that a procedure was performed) got fewer than two
-                       answers. A model's failure alone does not flag a row the others
-                       agree on. Outcome (unanimous, agreed,
-                       majority, partial, none), Models and Agreement say how the
-                       consensus was reached. A model's block holds the ten extracted
-                       fields, its own ManualReviewRequired with ManualReviewReason, and
-                       the debugging columns (LLM_Failed, LLM_Attempts, LLM_Seconds,
-                       LLM_Error, LLM_Rejections, RawResponse). A note whose answers the
-                       note text does not support is recorded with LLM_Failed 1, empty
-                       fields and the reason in LLM_Error.
+                       with no majority stays empty. "Needs human review" is TRUE where a
+                       human can improve the row: the models disagreed, the agreed answer
+                       leaves a study field open, contradicts the note's own attestation
+                       of a trainee or sums two biopsy counts from one sentence, or a note
+                       that could hold a study value (a procedure note, upper endoscopy
+                       wording, or a model's answer that a procedure was performed) got
+                       fewer than two answers. A model's failure alone does not flag a row
+                       the others agree on. A model whose answers the note text does not
+                       support is recorded with "Failed" TRUE, empty fields and the reason
+                       in "Failure reason".
                        Write-once: move it aside to regenerate it from the database.
   {DB_PATH}              the same data, kept for audit and for resuming.
   Both contain PHI; treat them accordingly."""
@@ -337,8 +346,8 @@ def run_summary(reporter: Reporter, conn, models: tuple[ModelSpec, ...], outcome
         items.append(("outcome", f"complete: {plural(outcome.processed, 'note')} analysed in this run"))
         if exported:
             items.append(("export", f"{exported} (write-once; move it aside to regenerate it)"))
-            items.append(("next", 'the review queue is every row with "ManualReviewRequired (consensus)" = true; '
-                                  '"Outcome (consensus)" = unanimous marks the rows every model agreed on'))
+            items.append(("next", 'the review queue is every row with "Needs human review (consensus)" TRUE (column G); '
+                                  f'"Outcome (consensus)" unanimous marks the rows every model agreed on; {GUIDE_PATH} explains the columns'))
         else:
             items.append(("export", f"{EXPORT_PATH} already existed and was left alone; move it aside and run {resume} to regenerate it"))
     reporter.header(items)
