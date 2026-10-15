@@ -170,7 +170,7 @@ For a workstation test without the large models, `--location local` runs the sam
 with three small stand-ins instead (about 11 GB in all; these need a current Ollama, not 0.24.0):
 
 ```powershell
-ollama pull gemma3:4b
+ollama pull ministral-3:3b
 ollama pull gemma4:e2b
 ollama pull qwen3.5:4b
 ```
@@ -187,14 +187,14 @@ Ollama runs locally and does **not** require internet access after model downloa
 python app.py
 ```
 
-With no options it prints what the program needs (the packages, Ollama and the model, the CSV header, where files go), the typical commands, and a status check of the current directory: whether Ollama is reachable and the model is pulled, how many notes `data.db` holds and how many are still pending, and whether `output/results.csv` already exists. There are four options, which can be combined:
+With no options it prints what the program needs (the packages, Ollama and the model, the CSV header, where files go), the typical commands, and a status check of the current directory: whether Ollama is reachable and the model is pulled, how many notes `data.db` holds and how many are still pending, and whether the two exports already exist. There are four options, which can be combined:
 
 | Option         | Effect                                                                                   |
 | -------------- | ---------------------------------------------------------------------------------------- |
 | `--csv FILE`   | Ingest the notes in `FILE` into `data.db` (duplicates skipped); reports how many were added |
 | `--analyze`    | Run each model on every note that has no result for it yet, rebuild the consensus of the models for every note, then write `output/results.csv` and its review-sized copy `output/results-review.csv` |
 | `--clean`      | Delete `data.db` (and any SQLite journal files) and the two exports (`output/results.csv`, `output/results-review.csv`) from earlier runs, before anything else. Discards every stored result |
-| `--location`   | Which model set to run: `server` (the default) is the three study models; `local` is three small stand-ins (`gemma3:4b`, `gemma4:e2b`, `qwen3.5:4b`) for a workstation test. Either way each model gets its own labelled columns |
+| `--location`   | Which model set to run: `server` (the default) is the three study models; `local` is three small stand-ins (`ministral-3:3b`, `gemma4:e2b`, `qwen3.5:4b`) for a workstation test. Either way each model gets its own labelled columns |
 
 ---
 
@@ -204,7 +204,7 @@ With no options it prints what the program needs (the packages, Ollama and the m
 python app.py --csv path\\to\\endoscopy_notes.csv
 ```
 
-**Required CSV columns:**
+**Required CSV columns** (matched in any case, with spaces, underscores, dashes and a byte-order mark ignored; `EncounterID`, `note_csn_id` and the like are accepted, extra columns ignored; see Troubleshooting):
 
 - MRN
 - Encounter
@@ -257,7 +257,7 @@ While it runs, the program reports what it is doing in two layers.
 
 **The live panel.** In a terminal, a panel at the bottom of the screen (refreshed four times a second, with the log lines scrolling above it) shows the note and attempt in progress, what the model is doing right now (waiting for the first token while the server reads the prompt, thinking, or answering, with the token count and the tokens per second over the last five seconds; its spinner turns faster the more tokens a second arrive, and crawls while none do), the progress bar, the running totals and rates, the time left for the model and for the run, and the field tally. `NLP_PLAIN=1` turns the panel off and gives the heartbeat lines instead.
 
-A workstation test (`--location local`, three small models, three notes, interrupted once and resumed) looks like this in a log:
+A workstation test (`--location local`, three small models, three notes, interrupted once and resumed) looks like this in a log. It was recorded on 2026-10-14, when the first stand-in was `gemma3:4b` (replaced by `ministral-3:3b` the same day) and a review reason still said `see LLM_Rejections` (now `see Rejected attempts`); the shape is unchanged:
 
 ```
 [10:55:21] database  /home/ben/nlp-study/data.db · 0 notes
@@ -408,7 +408,7 @@ A `data.db` from before the columns were labelled is converted on startup: its u
 
 Safeguards:
 
-- Duplicate detection on ingest
+- Duplicate detection on ingest (against the database, on an index of MRN, encounter and CSN, and within the file), with the file read in batches of 1,000 rows so a corpus of any size takes the memory of one batch
 - Idempotent inserts
 - Write-once exports
 
@@ -427,8 +427,8 @@ HIPAA Compliance:
 
 Workflow, one model at a time (so Ollama holds a single model loaded), per note:
 
-1. Skip if this model already has a result for it
-2. Run LLM analysis (with retries)
+1. Skip if this model already has a result for it (the pending list holds ids and lengths only; each note's text is fetched when its turn comes)
+2. Run LLM analysis (with retries), or record the note as too long without a call when it does not fit the context window
 3. Store the result atomically under the model's label
 
 Features:
@@ -535,20 +535,26 @@ Key Safeguards:
     read as history, a plan or instructions;
     a duodenal-biopsy quote must mention biopsies and name the duodenum (bulb, D1 to D3,
     first to third portion, or "to rule out celiac disease") and must not say none were
-    taken; a fellow quote must mention a trainee or a teaching attestation and must not be
-    a Staff Only attestation
+    taken; a fellow quote must mention a trainee or a teaching attestation (a Teaching
+    Statement, "was present and actively participated", or the "RES/FEL Staff Procedure
+    Presence Statement" form with or without its heading) and must not be a Staff Only
+    attestation
   - the flags must agree: no fellow and no duodenal biopsies without a procedure, no
     `ScopeType` without `Endoscopy = 1`
   - `ScopeType` must be a name the note states (brand and model may be joined when the
     note gives them apart), must look like an endoscope, and must not be a colonoscope
+    (by name, or by the model prefixes PCF, CF and EC) or an instrument of another kind (a
+    laryngoscope, bronchoscope, microscope and the like). No list of upper endoscopes is
+    kept, so a model the corpus has never shown is accepted as the note writes it
   - `NumberOfDuodenalBiopsies` must be a number the quoted sentence states. When the
     sentence adds up biopsies from two or more parts of the duodenum ("4 biopsies were taken
     of the duodenum and 3 additional from the bulb"), only the sum (7) is accepted, not a
     part; a sentence where one number is part of another ("6 including 2 from the bulb", "4
     biopsies (2 from the bulb)", "5 with 2 from the bulb") supports the numbers it states (6,
-    never 8), and one that also counts another organ is never added up. A duodenal site's
-    number (D2, the 2nd portion) is not a count. A count above 20 is rejected as some other
-    number from the note (an eosinophil count, a CPT code)
+    never 8), a range ("4-6 biopsies") supports either end and is never summed, and one that
+    also counts another organ is never added up. A duodenal site's number (D2, the 2nd
+    portion) is not a count. A count above 20 is rejected as some other number from the note
+    (an eosinophil count, a CPT code)
 - Output constrained to a JSON schema (`format=`): always a bare object with exactly the study
   fields, 0/1 flags, and text fields capped at 1000 characters
 - Greedy decoding (temperature 0) so a note gives the same answer on every run
@@ -559,14 +565,18 @@ Key Safeguards:
   0.8 with a repeat penalty of 1.1 and the attempt number as the seed, since a greedy retry
   would repeat the loop
 - Output capped at 2048 tokens (`num_predict`); context window `NLP_CONTEXT_LENGTH` tokens
-- Each call and the model load use an HTTP timeout of `NLP_LLM_TIMEOUT` seconds (default 1800): the answer is streamed, so this is the longest silence from the server before the call counts as failed, never a cap on a slow but working model. A failed call is recorded for the note and three in a row stop the pass
   (default 8192, `num_ctx`) on every call, the same as an Argon job. 8192 is what medgemma:27b
   fits in on the A10 with its KV cache; anything larger spills to the CPU. Notes that do not
-  fit the window are failed without a model call rather than silently truncated
+  fit the window are failed without a model call rather than silently truncated, and an answer
+  whose prompt the server itself counted as too long is discarded (see below)
+- Each call and the model load use an HTTP timeout of `NLP_LLM_TIMEOUT` seconds (default 1800):
+  the answer is streamed, so this is the longest silence from the server before the call counts
+  as failed, never a cap on a slow but working model. A failed call is recorded for the note and
+  three in a row stop the pass
 
 Model:
 
-- `MODELS` in `llm_analysis.py` lists the models every note is sent to, in run order, each with its context window and `think` setting: `medgemma:27b` (`LOCAL_MODEL`, MedGemma 27B, thinking off), `gemma4:26b-a4b-it-q4_K_M` (Gemma 4 26B A4B, thinking off) and `gpt-oss:20b` (reasoning at `"low"`). All three use the 8192-token window, so they see the same notes, and their columns are labelled `medgemma:27b@8192`, `gemma4:26b-a4b-it-q4_K_M@8192` and `gpt-oss:20b@8192`. To change the list, edit that block (one `ModelSpec` per line, the name as a quoted literal: `setup.sh` reads it) and pull the models. `LOCAL_MODELS` is the small set that `--location local` runs instead (`gemma3:4b`, `gemma4:e2b`, `qwen3.5:4b`, all with thinking off and the same window), for exercising the pipeline on a workstation; its columns are labelled `gemma3:4b@8192` and so on, so a local test never mixes with study results. Study runs use the default, `--location server`
+- `MODELS` in `llm_analysis.py` lists the models every note is sent to, in run order, each with its context window and `think` setting: `medgemma:27b` (`LOCAL_MODEL`, MedGemma 27B, thinking off), `gemma4:26b-a4b-it-q4_K_M` (Gemma 4 26B A4B, thinking off) and `gpt-oss:20b` (reasoning at `"low"`). All three use the 8192-token window, so they see the same notes, and their columns are labelled `medgemma:27b@8192`, `gemma4:26b-a4b-it-q4_K_M@8192` and `gpt-oss:20b@8192`. To change the list, edit that block (one `ModelSpec` per line, the name as a quoted literal: `setup.sh` reads it) and pull the models. `LOCAL_MODELS` is the small set that `--location local` runs instead (`ministral-3:3b`, `gemma4:e2b`, `qwen3.5:4b`, about 11 GB in all, all with thinking off and the same window), for exercising the pipeline on a workstation; its columns are labelled `ministral-3:3b@8192` and so on, so a local test never mixes with study results. Study runs use the default, `--location server`
 
 HIPAA:
 
@@ -574,6 +584,20 @@ HIPAA:
 - No API calls
 - No telemetry
 - No prompt logging outside SQLite
+
+---
+
+### `tests/test_robustness.py`
+
+**Purpose:** The checks that guard the pipeline against input the sample never showed
+
+Standard-library `unittest`, no model or server needed, run from the project directory:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+27 cases: CSV files with a byte-order mark, other header spellings, bad bytes, NUL bytes, short rows, very long fields and repeated rows; scope names the sample never showed, the RES/FEL attestation form, instruments that are never the upper endoscope, biopsy ranges; an answer the server counted as cut; the TRUE/FALSE and formula-space conventions of the export; the streaming ingest, pending list and consensus; and the agreement of `results.csv` with `results-review.csv` on columns A to X. Add a case for every new input shape.
 
 ---
 

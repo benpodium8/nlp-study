@@ -246,6 +246,12 @@ A model's Failure reason is the message its last answer was rejected with. The c
 | `<field> names an upper endoscopy but does not say it was carried out` | A bare mention: a history line, a plan, an instruction. |
 | `<field> contains '<word>', so it reads as history, a plan, a recommendation or instructions` | The quote is about a past or future procedure, not this note's. |
 | `ScopeType is not stated in the note` | The model named a scope the note does not name (often a brand added to a model number). |
+| `ScopeType names a colonoscope` or `ScopeType names an instrument that is not an upper endoscope` | The model gave a colonoscope (by name, or a PCF, CF or EC model) or another specialty's scope (a laryngoscope, a bronchoscope) as the upper endoscope. |
+| `DuodenalBiopsiesInformation does not name a duodenal site` | The quoted biopsy sentence does not say the biopsies came from the duodenum (bulb, D1 to D3, first to third portion). |
+| `FellowInformation is a Staff Only attestation or says there was no trainee` | The model answered fellow present but quoted the line that rules a trainee out. |
+| `FellowPresent is 1 but no procedure was performed in this note` or `DuodenalBiopsiesTaken is 1 but Endoscopy is 0` | The answer contradicted itself; the fields must agree. |
+| `NumberOfDuodenalBiopsies is <n>, which is not a plausible number` | A count above 20: some other number from the note. |
+| `the output was not valid JSON` or `... repeated text until it reached the 1000-character limit` | The model's text could not be used; in the second case it was a repetition loop. |
 | `NumberOfDuodenalBiopsies ... is not a number the quoted sentence states` | The count does not match the sentence. |
 | `the note is too long for the model: about <n> prompt tokens ...; no model call was made.` | Not sent. |
 | `the note is too long for the model: the server counted <n> prompt tokens and <m> answer tokens, more than the ... window holds ...; the answer was discarded.` | Sent, but the model's own token count showed the prompt did not fit together with the answer, so the model lost the instructions; the answer was discarded and the note counts as too long. |

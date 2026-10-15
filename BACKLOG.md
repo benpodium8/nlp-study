@@ -24,6 +24,16 @@ Evidence comes from running `nlp_analysis.py` over `samples/notes.csv` (10 notes
 > that is not the NLP (note type and a procedure regex). Everything else still applies to the LLM path, and
 > the line numbers cited below refer to the files as they were.
 
+> **Status, 2026-10-15.** Since the block above: every note goes to three models and `consensus.py` consolidates
+> their answers into the `(consensus)` block with its own review flag (F14 done, F2 largely done); `review.py` and
+> `reporter.py` exist (F9 done); the exports are `output/results.csv` and the review-sized `output/results-review.csv`,
+> write-once as a pair; the small stand-ins for `--location local` are `ministral-3:3b`, `gemma4:e2b` and `qwen3.5:4b`
+> (`gemma3:4b` was replaced on 2026-10-14); B7, B9, B10 and B15 are fixed and B16 partly (see each item); F5 is
+> declined by the researcher (no lookup table of scope types; the consensus writes the scope as the note spells it
+> instead); `tests/test_robustness.py` holds 27 unit tests (the test half of F1, no gold fixture yet); the ingest, the
+> analysis pass, the consensus and the export stream, measured flat in memory to 100,000 notes. `README.md` and
+> `ARGON_RUNBOOK.md` were re-synced the same day (B27).
+
 ---
 
 ## 1. What the study actually wants (from the PDF comments)
@@ -225,12 +235,16 @@ README said `ollama pull gemma4:e2b` and "Model: gemma4:e2b"; code said `gemma3:
 ### B27 (L) Runbook statements that no longer match the script
 `ARGON_RUNBOOK.md:3` describes a 955-line `setup.sh` dated 11:19; the working-tree file is 1,127 lines, dated 13:20. `:219` and `:805` say mksquashfs is pinned through `APPTAINER_MKSQUASHFS_ARGS`; that variable is gone and the mechanism is now the PATH wrapper (B14). `:308` says the repo is healthy when it contains `app.py`, `cli.py`, `llm_analysis.py`, `requirements.txt`; `verify_repo` (`setup.sh:224-235`) only checks for a valid HEAD and no missing tracked files. `:319` says setup mode "requires outbound HTTPS"; the script warns, sets `HAVE_NET=0` and continues with what is built (`setup.sh:890-894`). Section 2.2 documents "Explicitly stated count, else 0", which is the B1 flaw stated as a feature. Fix the runbook when B1 and B14 land, and re-derive the line count and timestamps from the committed file.
 
+2026-10-15 pass: README, runbook, guide, environment notes and the migration guide re-synced with the working tree (the CSV contract, the two exports, the retry and validation semantics in runbook 15.3, the timeout and token-count guards, the streaming paths, the tests, the local stand-ins).
+
 ---
 
 ## 3. Feature improvements (ordered by value to robustness, reliability, accuracy)
 
 ### F1 Gold-label fixture and an `--evaluate` command
 The ten annotated notes are already labelled: the docx highlights give the scope, the biopsy sentence and the fellow marker for every note (table in section 1), and the comments give the semantics. Write them into `samples/gold.csv` (note id, expected ScopeType raw and canonical, Endoscopy, Colonoscopy, count-or-null, taken, fellow, evidence) and add `python app.py --evaluate gold.csv` that runs NLP, LLM and reconciliation and prints per-field precision/recall/agreement for each of the three, plus the "agree but wrong" count that notes 6 and 9 expose. Every change in sections 2 and 3 is then measurable. Extend the gold set with 50 to 100 hand-labelled notes from the 5,000 corpus (stratified by NoteType) to measure the real false-positive rates listed above. Add pytest unit tests for the regexes using the sentences quoted in B3 to B6. This is the single highest-leverage item.
+
+Partly done 2026-10-15: `tests/test_robustness.py` (27 `unittest` cases: the CSV formats the ingest accepts, the verifier's guards, the server token-count guard, the export conventions, the streaming paths, the two-file export). No gold fixture and no `--evaluate` yet.
 
 ### F2 Replace "when in doubt, discard" with a review queue
 Add `NeedsReview INTEGER` and `ReviewReason TEXT` to `final_results` (disagreement on which field, one-sided scope, LLM failure, note too long, count unknown) and export `output/review_queue.csv` with both answers and both evidence sentences side by side. A research study needs adjudication, not silent nulls; the all-null rows are currently indistinguishable from "nothing in the note".
@@ -247,6 +261,8 @@ Split each note into sections (INDICATION, HISTORY, OPERATION/PROCEDURE or Proce
 
 ### F5 Canonical scope names
 Keep `ScopeType_raw` and add `ScopeType_canonical`: normalise case, spaces and hyphens, expand `GIF`-prefixed models to Olympus, map `H190`, `H 190`, `GIF-H 190`, `GIF H190`, `H-190` to `Olympus GIF-H190`, and so on for Q180, Q190, XP190N, XP160, H180. Reconcile on the canonical form (today "Olympus GIF XP190N video" versus "Olympus GIF XP190N" only matches by luck of the digit-token rule). Flag brand-only ("Olympus gastroscope") and unknown models for review instead of accepting them.
+
+Declined 2026-10-15: the researcher ruled out any lookup table or categorization of scope types, since the full corpus may hold scopes the sample never shows. Instead the consensus writes the agreed scope as the note spells it (`llm_analysis.scope_as_stated`), which removed the spelling variants the models introduced; grouping the raw strings stays a manual step, and brand-only names are accepted, as the gold does.
 
 ### F6 Per-site duodenal biopsy accounting
 Parse each biopsy clause into (count, site) pairs; sum sites that are duodenal (bulb, D1, D2, D3, second/third portion, "duodenum"), but do not double count "6 of the duodenum including 2 from bulb" (comment 3). Recognise count-less forms ("random biopsies", "multiple", "x4", "biopsies (4)") as taken = 1 with count null or the parsed number. Add `DuodenalBiopsySites TEXT` as evidence.

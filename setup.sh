@@ -44,6 +44,7 @@
 #     NLP_JOB_QUEUE=UI NLP_JOB_SLOTS=8 NLP_JOB_HRT=24:00:00 NLP_JOB_GPU=1
 #     NLP_CONTEXT_LENGTH=8192        Ollama context window used by the job (8192 fits medgemma:27b on the A10; larger spills to CPU)
 #     NLP_LLM_TIMEOUT=1800           longest silence (seconds) from Ollama in one model call before it counts as a failed call
+#     NLP_HEARTBEAT_SECONDS=60       seconds between the job log's "..." lines during a long model call
 #     NLP_PREFLIGHT_REPS=3 NLP_PREFLIGHT_BUDGET=600   live calls / seconds each
 #     NLP_ALLOW_INFERENCE=1          allow inference outside SGE (never on a login node)
 #     NLP_SKIP_PREFLIGHT=1           (job only) skip the fail-fast gate before app.py
@@ -613,10 +614,13 @@ def count_notes(repo, fits=None):
         return 0, 0
     csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
     total = too_long = 0
-    with path.open(newline="", encoding="utf-8", errors="replace") as fh:
+    with path.open(newline="", encoding="utf-8-sig", errors="replace") as fh:
         reader = csv.reader(fh)
         header = next(reader, None) or []
-        col = header.index("Note") if "Note" in header else None
+        # The same matching as database.match_csv_columns: any case, spaces, underscores and
+        # dashes ignored, "note_text" and "text" accepted for Note.
+        normalized = ["".join(ch for ch in name.lower() if ch.isalnum()) for name in header]
+        col = next((i for i, name in enumerate(normalized) if name in ("note", "notetext", "text")), None)
         for row in reader:
             total += 1
             if fits and col is not None and col < len(row) and not fits(row[col]):

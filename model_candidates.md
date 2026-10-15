@@ -20,7 +20,9 @@ Verified 2026-10-14 on the v0.24.0 Linux build kept from this evaluation (CPU on
 `llm_analysis()` call returned schema-valid JSON scoring 6/6 on the synthetic note for all
 three models, each on the Go engine, in 197 s (medgemma:27b), 41 s (gemma4) and 59 s
 (gpt-oss, `think="low"`); loaded sizes 20.0, 19.8 and 14.2 GB with the 8K cache.
-Sections 3 to 6 are kept as the record of the evaluation.
+Sections 3 to 6 are kept as the record of the evaluation. The three small stand-ins that
+`--location local` runs on a workstation (`ministral-3:3b`, `gemma4:e2b`, `qwen3.5:4b`;
+`LOCAL_MODELS` in `llm_analysis.py`) were not part of it and are not meant for Argon.
 
 ## 1. Constraints that decide the answer
 

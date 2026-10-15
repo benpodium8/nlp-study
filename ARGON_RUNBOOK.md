@@ -2,6 +2,8 @@
 
 Last consolidated: 2026-10-13 (second pass). Covers commit `f8f76c0` ("create the runbook, the backlog and redo the setup script"), which holds the rewritten `setup.sh` (1100 lines, `ENV_VERSION=2`), `.python-version` relaxed to `3.12`, `BACKLOG.md`, and this document, plus the uncommitted working-tree changes present at 13:20 the same day: `setup.sh` at 1127 lines (a `mksquashfs` PATH wrapper replacing the ineffective `APPTAINER_MKSQUASHFS_ARGS` export, curl stall timeouts, `GIT_TERMINAL_PROMPT=0`) and a revised `BACKLOG.md` (B19 to B21 renumbered, B27 added). Also covers the Argon session logs from 2026-09-14 (HawkID `apkane`).
 
+**Re-synced 2026-10-15** against the working tree of branch `nlp-study-2.0`: the three-model run and the consensus block, the two exports, the relaxed CSV contract, the token-count and timeout guards on the model call, the streaming ingest and consensus, and `tests/test_robustness.py`. Where a section describes a change by date, the date is when the code changed; the September logs and the rewrite of `setup.sh` are described as before. `migration-procedure.md` lists the differences between `main` and this branch.
+
 This document merges five artifacts from the 2026-09-14 Argon session, the project README and source, the sample data in `samples/`, and three reference pages:
 
 | Source | What it is |
@@ -55,7 +57,7 @@ The sequence the installer prints: `[login] ./setup.sh  ->  [qlogin] ./setup.sh 
 cp /path/to/notes.csv /nfsscratch/Users/apkane/nlp-study/repo/notes.csv
 ```
 
-The header row must contain exactly these six names (an extra `id` column is tolerated and ignored): `MRN, Encounter, NoteCsnID, NoteDate, NoteType, Note`. See [Troubleshooting: CSV must contain columns](#csv-must-contain-columns).
+The header row must carry these six columns, in any case, with spaces, underscores, dashes and a byte-order mark ignored and the usual other spellings accepted (`EncounterID`, `note_csn_id`); extra columns such as `id` are ignored: `MRN, Encounter, NoteCsnID, NoteDate, NoteType, Note`. See [Troubleshooting: CSV must contain columns](#csv-must-contain-columns).
 
 **Step 1. Build or repair on a login node** (needs internet; never runs inference):
 
@@ -134,10 +136,11 @@ notes.csv ──> SQLite notes table
 
 | Invocation | Effect |
 | --- | --- |
-| `python app.py` | Prints what the program needs, typical use, and a status check of the current directory (Ollama reachable, model pulled, notes in `data.db` and how many are pending, export present), then exits 0. On a login node the Ollama line says NOT reachable, which is expected there; the probe is a 3 s client request and starts nothing |
+| `python app.py` | Prints what the program needs, typical use, and a status check of the current directory (Ollama reachable, each model pulled, notes in `data.db` and how many are pending, both exports present), then exits 0. On a login node the Ollama line says NOT reachable, which is expected there; the probe is a 3 s client request and starts nothing |
 | `python app.py --csv FILE` | Ingests the CSV (duplicates skipped) and reports rows read, notes added and duplicates skipped |
-| `python app.py --analyze --csv FILE` | Ingests, runs each of the three models on every note that lacks its result, rebuilds the consensus block for every note, writes `output/results.csv` |
+| `python app.py --analyze --csv FILE` | Ingests, runs each of the three models on every note that lacks its result, rebuilds the consensus block for every note, writes `output/results.csv` and `output/results-review.csv` |
 | `python app.py --analyze` | Same, without ingesting. Resumes an interrupted run |
+| `python app.py --analyze --location local` | The same run with three small stand-ins (`ministral-3:3b`, `gemma4:e2b`, `qwen3.5:4b`; `LOCAL_MODELS` in `llm_analysis.py`), each under its own labelled columns, for a workstation test. `--location server`, the default, is the study set |
 | `python app.py --clean` | Deletes `data.db` (with any `-journal`/`-wal`/`-shm` file) and both exports (`output/results.csv`, `output/results-review.csv`), and `output/` if that leaves it empty. No prompt. Combined with `--csv`/`--analyze` it runs first, giving a fresh run; a missing `--csv` file aborts before anything is deleted |
 
 `--clean` runs first if given, then `--csv` ingests; `--analyze` then runs if given. The database file is always `data.db` in the current working directory and `output/` is created there too, so run the program from the repository directory. There is no command that prints notes or results; use `output/results.csv` or `sqlite3` (7.3).
@@ -148,7 +151,7 @@ notes.csv ──> SQLite notes table
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `ScopeType` | string or null | The upper endoscope as the note names it (brand and/or model, for example `Olympus H190`, `GIF-H 190`, `Olympus gastroscope`); colonoscopes are ignored |
+| `ScopeType` | string or null | The upper endoscope as the note names it (brand and/or model, for example `Olympus H190`, `GIF-H 190`, `Olympus gastroscope`); colonoscopes are ignored; the consensus writes it as the note spells it |
 | `Colonoscopy` | 0 or 1 | A colonoscopy was performed as this note's procedure (history, plans and instructions do not count) |
 | `ColonoscopyInformation` | string or null | Supporting sentence |
 | `Endoscopy` | 0 or 1 | An upper endoscopy / EGD was performed as this note's procedure (PEG placement with a gastroscope counts) |
@@ -163,14 +166,14 @@ What the researcher actually needs from these fields is in [15.5](#155-study-req
 
 ### 2.3 Failure handling in `data_worker.py`
 
-- `RetryableLLMError` (invalid JSON, a text field that reached the 1000-character cap, a missing field, wrong type, unexpected field, flag not 0/1, negative count): retried, up to 5 attempts total. Each retry is a complete generation with the rejection reason appended to the prompt (the rejected answer is not sent back), sampled at temperature 0.8 with `repeat_penalty` 1.1 and `seed` = attempt number.
-- `LLMAnalysisError` from the call itself (`LLM call failed: ...`, e.g. the server is down) or any other exception: stored immediately with `LLM_Failed = 1`, no retry.
+- `RetryableLLMError` (invalid JSON, a text field that reached the 1000-character cap, a missing field, wrong type, unexpected field, flag not 0/1, negative count, or an answer the note does not support: a quote not in the note, evidence about the wrong thing, a scope name the note does not state, a count the quoted sentence does not give; `verify_against_note`): retried, up to 5 attempts total. Each retry is a complete generation with the rejection reason appended to the prompt (the rejected answer is not sent back), sampled at temperature 0.8 with `repeat_penalty` 1.1 and `seed` = attempt number. A note that never gets a supported answer is stored with `LLM_Failed = 1` and the last rejection as `LLM_Error`.
+- `LLMAnalysisError` from the call itself (`LLM call failed: ...`: the server is down, or no byte came from it for `NLP_LLM_TIMEOUT` seconds) or any other exception: stored immediately with `LLM_Failed = 1`, no retry. Two more cases are stored without a retry and read as "too long" by the review and the consensus: a note that does not fit the context window is not sent at all (`LLM_Attempts` 0), and an answer whose prompt the server itself counted as larger than the window (the token counts arrive with the last chunk) is discarded (`PromptCutError`).
 - Every note gets a `results` row, and every model its own block of columns in it (`<field> (<model>@<context>)`, Appendix D) with `LLM_Attempts`, `LLM_Seconds` and, on failure, `LLM_Error`. The log (`reporter.py`) carries a run header (database, Ollama version, each model's size and quantization, the steps, the work left per model), a `load` line per model saying how long the load took and where the server put the model (`100% GPU` or a CPU share), one timestamped line per note (`ok` or `FAILED`, with the time taken, the attempt count, Ollama's prompt and answer token counts with the speed, and the structured fields, never note text), a `retry` line with the reason for every retry, a `progress` and a `fields` line every 10 notes with the projected time remaining for the model and for the rest of the run and the tally of the fields so far, a `...` heartbeat line every 60 s (`NLP_HEARTBEAT_SECONDS`) while a model call is in progress (the job log is not a terminal, so there is no live panel), a `Finished` summary per model that lists the failed ids and tallies the review and rejection reasons, the consensus summary with each model's agreement, and two closing tables.
 - Before each model the program checks that the server is reachable and the model is served; it stops a model's pass after 3 consecutive notes whose call failed (`LLM call failed`), after re-probing the server to say whether it died or the model is gone, and leaves the remaining notes pending. The export is skipped when the run is incomplete. Exit codes: 0 complete, 2 incomplete (a model skipped or the run stopped early), 130 on SIGINT (`qdel` sends SIGKILL after its grace period; the stored results are kept either way). A run where every note fails on content still exits 0, which is why the preflight exists (section 6).
 
 ### 2.4 Idempotency
 
-- Ingest skips a row only if all six fields match an existing row exactly.
+- Ingest skips a row only if all six fields match a stored note, or an earlier row of the same file, exactly.
 - `data_worker` runs one model at a time and skips any note that already has a result under that model's label (its `LLM_Failed` column is not null).
 - The consensus block (`consensus.py`) is rebuilt for every note on every `--analyze`, from the stored answers of the run's models, so it never goes stale after a resume.
 - The export is skipped if `output/results.csv` or `output/results-review.csv` already exists; the two are written together.
@@ -360,7 +363,7 @@ spacy 3.8.14, thinc 8.3.13, blis 1.3.3, numpy 2.2.6, ollama 0.6.2, httpx 0.28.1,
    ./migrate.sh --branch nlp-study-2.0      # or plain ./migrate.sh once main carries the rewrite
    ```
 
-4. Run `./setup.sh`. It writes the venv's dependency stamp (one pip run against the pinned `requirements.txt`, no downloads when the pins are already installed), pulls the pinned image (the first login-node exercise of the `mksquashfs` wrapper, BACKLOG B14), removes stored models that need a newer Ollama than the image, re-verifies the model store against the manifest for `LOCAL_MODEL` and downloads whatever is missing, rewrites both `$HOME` scripts with `NLP_ENV_VERSION=2`, and runs tier 0.
+4. Run `./setup.sh`. It writes the venv's dependency stamp (one pip run against the pinned `requirements.txt`, no downloads when the pins are already installed), pulls the pinned image (the first login-node exercise of the `mksquashfs` wrapper, BACKLOG B14), removes stored models that need a newer Ollama than the image, re-verifies the model store against the manifests of every model in `MODELS` and downloads whatever is missing (about 49 GB on a fresh store), rewrites both `$HOME` scripts with `NLP_ENV_VERSION=2`, and runs tier 0.
 5. Put `notes.csv` back from `preserved/migrate-<timestamp>/` (the migration prints the command), then `qlogin -q UI -pe smp 8` and `./setup.sh` again (or `./setup.sh --preflight`). The rewrite refuses `--preflight` if the env script lacks `NLP_ENV_VERSION=2`, so step 4 is mandatory first.
 
 ### 5.7 September version versus rewrite, at a glance
@@ -497,7 +500,7 @@ Submit again without `--csv`. Notes that already have a result for a model are s
 qsub ~/nlp-study.job --analyze
 ```
 
-The export is write-once. If `output/results.csv` exists it is skipped with a message, so after a resume the file on disk is from the first partial run (BACKLOG B17). Move or delete the old file first to regenerate it from the complete database.
+The exports are write-once and written only by a complete run: if `output/results.csv` or `output/results-review.csv` exists, both are skipped with a message, so after a resume the files on disk are from the first complete run. Move both aside to regenerate them from the complete database (BACKLOG B17).
 
 ### 7.5 Collecting results
 
@@ -563,10 +566,16 @@ The README describes a workstation deployment (Windows 10/11, with Mac and Linux
    curl -fsSL https://ollama.com/install.sh | sh
    ```
 
-7. Pull the model the code asks for. `LOCAL_MODEL` in `llm_analysis.py` is the authority and currently says `medgemma:27b` (MedGemma 27B, Q4_K_M, about 17.4 GB; see 5.4). To match Argon exactly, install Ollama 0.24.0 (`OLLAMA_VERSION=0.24.0` on the one-liner in step 6):
+7. Pull the models the code asks for. `MODELS` in `llm_analysis.py` is the authority: `medgemma:27b`, `gemma4:26b-a4b-it-q4_K_M` and `gpt-oss:20b` (about 49 GB in all; see 5.4). To match Argon exactly, install Ollama 0.24.0 (`OLLAMA_VERSION=0.24.0` on the one-liner in step 6):
 
    ```bash
-   ollama pull medgemma:27b
+   ollama pull medgemma:27b && ollama pull gemma4:26b-a4b-it-q4_K_M && ollama pull gpt-oss:20b
+   ```
+
+   For a test without the large models, `--location local` runs the same pipeline with three small stand-ins (`ministral-3:3b`, `gemma4:e2b`, `qwen3.5:4b`, about 11 GB; they need a current Ollama, not 0.24.0):
+
+   ```bash
+   ollama pull ministral-3:3b && ollama pull gemma4:e2b && ollama pull qwen3.5:4b
    ```
 
    Ollama needs internet only for this download. Afterwards it serves on `127.0.0.1:11434`, which is the `ollama` client's default, so `OLLAMA_HOST` need not be set.
@@ -715,7 +724,7 @@ Bug-level items are tracked in `BACKLOG.md` (B1 to B26) with proposed fixes; thi
 
 9. **Job preflight budget dropped from 900 s to 600 s** in the rewrite (it inherits the preflight script's default). On a CPU node a 27 B model can exceed 600 s for one call. Export `NLP_PREFLIGHT_BUDGET` at `qsub` time if the gate times out (BACKLOG B26).
 
-10. **The code does not yet implement the study's definitions.** The researcher's comments (15.5) require "biopsies taken, count unknown" to be representable and colonoscopes to be ignored; as of 2026-10-13 the prompt implements them (null count when taken but not stated, scope from the upper endoscope only, fellow from the attestation; BACKLOG B1 and B11), measured against the ten annotated notes on a workstation. Not yet confirmed on Argon: run the tier 1 preflight after pulling.
+10. **The study's definitions are implemented in the prompt, unconfirmed on Argon.** The researcher's comments (15.5) require "biopsies taken, count unknown" to be representable and colonoscopes to be ignored; as of 2026-10-13 the prompt implements them (null count when taken but not stated, scope from the upper endoscope only, fellow from the attestation; BACKLOG B1 and B11), measured against the ten annotated notes on a workstation. Not yet confirmed on Argon: run the tier 1 preflight after pulling.
 
 ---
 
@@ -748,7 +757,10 @@ The lock is `.setup.lock/` under the project root, with host, pid and start time
 Expected. Both generated scripts are rewritten on every setup run (the September version kept a `.bak`; the rewrite does not). Use `NLP_JOB_QUEUE`, `NLP_JOB_SLOTS`, `NLP_JOB_HRT`, `NLP_JOB_GPU`, or pass `qsub` options on the command line.
 
 **Q: Where is the list of known bugs and planned work?**
-`BACKLOG.md` in the repo: an evaluation of the pipeline against the researcher's comments and the 5000-note corpus, 26 bug fixes and 13 features, each with file and line references.
+`BACKLOG.md` in the repo: an evaluation of the pipeline against the researcher's comments and the 5000-note corpus, 27 bug fixes and 14 features, each with file and line references and a status.
+
+**Q: How do I run the tests?**
+From the repo directory inside the venv, on any node: `python -m unittest discover -s tests`. The 27 cases in `tests/test_robustness.py` need no model or server; they cover the CSV formats the ingest accepts, the checks against the note, the export conventions and the streaming paths.
 
 ### Data
 
@@ -876,9 +888,17 @@ The path is resolved relative to the current directory. In the job that is the r
 
 Not an error. Identical rows already exist in `notes`.
 
-#### `No notes to process.`
+#### `Header of notes.csv: byte-order mark skipped; 'EncounterID' read as Encounter.`
 
-The line before it says which: either the `notes` table is empty (ingest first, or pass `--csv`), or every note already has a `results` row (nothing left to do; delete rows to recompute, 15.3 item 26).
+Informational. The file was read as it came; the line says which header name served which column.
+
+#### `Warning: N byte(s) in notes.csv were not valid UTF-8 ...`, `... NUL byte(s) ... were dropped`, `... row(s) ... had fewer cells than the header`
+
+The file was read anyway; the count says how much was affected. A quote that spans a replaced character cannot match its note, so that note's answers may be rejected and the note flagged; if the count is large, re-export the file as UTF-8.
+
+#### `Nothing to do: every note already has a result from <model>.`
+
+Not an error: that model has a stored result for every note, and resume skips them. To recompute some notes with a model, clear its `LLM_Failed` column for those notes (see "Job finished quickly, exit 0, LLM columns all empty" and 15.3 item 26). An empty `notes` table shows as `0 notes` in the run header: ingest first, or pass `--csv`.
 
 ### setup.sh
 
@@ -1116,9 +1136,17 @@ sqlite3 data.db 'update results set "LLM_Failed (medgemma:27b@8192)" = null wher
 
 Then resubmit with `--analyze` and regenerate the export. (A `--reprocess-failed` flag is BACKLOG B21.)
 
-#### `File 'output/results.csv' already exists. Export skipped; ...`
+#### `LLM call failed: ... ReadTimeout` (or `timed out`)
 
-Write-once protection. Move the old file aside and re-run `--analyze` (the export is cheap when nothing new is pending).
+No byte came from the server for `NLP_LLM_TIMEOUT` seconds (default 1800) during one call. The note is recorded as a failed call; three in a row stop the pass after the server is re-probed. Read `~/nlp-study-logs/ollama-<JOB_ID>.log`; raise the variable only for a model known to be that slow.
+
+#### `Failure reason` says `the note is too long for the model: the server counted N prompt tokens ...`
+
+The length estimate let the note through, but the model's own tokenizer needed more tokens than the window holds together with the answer, so the server had cut the prompt; the answer was discarded and the note counts as too long, flagged for a human to read. Expected now and then for notes near the cut and for a model whose tokenizer is denser than Gemma 3's.
+
+#### `File(s) 'output/results.csv' already exist. Export skipped; ...`
+
+Write-once protection for the pair `results.csv` and `results-review.csv`: if either exists, neither is written. Move both aside and re-run `--analyze` (the export is cheap when nothing new is pending).
 
 #### NVIDIA driver too old
 
@@ -1174,11 +1202,11 @@ Things to hold in mind while changing the code, grouped by the layer they affect
 
 ### 15.2 Model and Ollama
 
-12. **`LOCAL_MODEL` in `llm_analysis.py` is parsed by `sed`.** Keep it a single line of the form `LOCAL_MODEL = "name:tag"` at column 0. Any model change requires `./setup.sh` on a login node to fetch the weights (and it prunes the old ones), and the README should be updated in the same commit (BACKLOG B24). The models a run sends each note to are `MODELS` in `llm_analysis.py` (three: `medgemma:27b`, `gemma4:26b-a4b-it-q4_K_M`, `gpt-oss:20b`); each writes its own block of result columns labelled `<name>@<num_ctx>` (Appendix D), so adding a model adds a block without touching existing results. `setup.sh` and `migrate.sh` read the block with `sed` (`detect_repo_models`): keep one `ModelSpec` per line, the first with `LOCAL_MODEL` and every other with its name as a double-quoted literal first argument. The preflight checks and exercises every model.
+12. **`LOCAL_MODEL` in `llm_analysis.py` is parsed by `sed`.** Keep it a single line of the form `LOCAL_MODEL = "name:tag"` at column 0. Any model change requires `./setup.sh` on a login node to fetch the weights (and it prunes the old ones), and the README should be updated in the same commit (BACKLOG B24). The models a run sends each note to are `MODELS` in `llm_analysis.py` (three: `medgemma:27b`, `gemma4:26b-a4b-it-q4_K_M`, `gpt-oss:20b`); each writes its own block of result columns labelled `<name>@<num_ctx>` (Appendix D), so adding a model adds a block without touching existing results. `setup.sh` and `migrate.sh` read the block with `sed` (`detect_repo_models`): keep one `ModelSpec` per line, the first with `LOCAL_MODEL` and every other with its name as a double-quoted literal first argument. The preflight checks and exercises every model. The small stand-ins `--location local` runs instead are `LOCAL_MODELS` (`ministral-3:3b`, `gemma4:e2b`, `qwen3.5:4b`), under their own labels, so a workstation test never mixes with study results; `setup.sh` does not fetch them.
 13. **Model size budget.** `medgemma:27b` is 17.4 GB of Q4_K_M weights and needs about 20 GB of VRAM once the 8192-token KV cache and compute buffers are allocated (`model_candidates.md` section 3), so it needs a 24 GB card: the A10 holds it, the P100 (16 GB) does not, and a larger `NLP_CONTEXT_LENGTH` spills it to the CPU. The September job script pinned `gpu_p100` for the 7 to 8 GB models of that time (`gemma4:e2b`, then Gemma 3 12B); the rewrite requests only `ngpus=1`, so pin the A10 or a larger card with `#$ -l <complex>`, or a smaller card will silently fall back to CPU. CPU inference needs about 20 GB of RAM plus headroom and decodes at roughly 3 tokens per second. The other two models: `gemma4:26b-a4b-it-q4_K_M` is 18.0 GB (about 20 GB loaded) and `gpt-oss:20b` 13.8 GB (about 15 GB loaded); each fits the A10 alone, no two together, hence `OLLAMA_MAX_LOADED_MODELS=1` and the model-by-model run order.
-14. **The module-level `ollama` client is wired by `OLLAMA_HOST` at import time.** Do not create `ollama.Client()` with a hard-coded host or port, and do not import `ollama` before the host is exported. The port is random per job to avoid collisions with other users on the node. If you add a client with a timeout (BACKLOG B15), keep it reading `OLLAMA_HOST`. `ollama_status()` in `llm_analysis.py` follows that rule: the no-argument `python app.py` builds a short-lived `ollama.Client(timeout=3)` that reads `OLLAMA_HOST` at call time and only lists models.
+14. **The module-level `ollama` client is wired by `OLLAMA_HOST` at import time.** Do not create `ollama.Client()` with a hard-coded host or port, and do not import `ollama` before the host is exported. The port is random per job to avoid collisions with other users on the node. Since 2026-10-15 `llm_analysis()` builds `ollama.Client(timeout=LLM_TIMEOUT)` for each call and each model load (B15); it reads `OLLAMA_HOST` at call time, which keeps this rule. `ollama_status()` in `llm_analysis.py` follows that rule: the no-argument `python app.py` builds a short-lived `ollama.Client(timeout=3)` that reads `OLLAMA_HOST` at call time and only lists models.
 15. **Decoding is greedy and schema-constrained.** `ollama.chat()` passes `format=RESPONSE_SCHEMA` (the JSON schema of the ten study fields: 0/1 enums, nullable strings with `maxLength` 1000) and `GENERATION_OPTIONS` (`temperature` 0, `seed` 0, `num_ctx` from `NLP_CONTEXT_LENGTH`, `num_predict` 2048), so the reply is always a bare JSON object and the same note gives the same answer on the same model build; Ollama's server default temperature would be 0.8. Greedy decoding can lock into a repetition loop (seen with gemma3:4b), which the schema cuts off at 1000 characters; a value that reaches the cap raises `RetryableLLMError`, as do invalid JSON and any validation failure, and the retry prompt says why the previous answer was rejected. A greedy retry would repeat the loop, so `generation_options()` makes attempts 2+ sample at temperature 0.8 with `repeat_penalty` 1.1 and `seed` = attempt number (still reproducible). Schema-constrained output needs Ollama 0.5 or newer; confirm the pinned 0.24.0 honours `maxLength` with the preflight. Re-run the preflight after any change here.
-16. **Context window.** The rewrite sets `OLLAMA_CONTEXT_LENGTH=8192` on the container (`NLP_CONTEXT_LENGTH`), and `llm_analysis.py` passes the same value as `num_ctx` on every call, so a workstation run uses the same window as a job. The September script and a workstation install without it get Ollama's default, 4096 on CPU. The prompt overhead is about 1,700 tokens; the 5000-note corpus has notes up to about 41,000 characters (roughly 13,000 tokens). Ollama truncates an over-long prompt server-side, keeping 5 leading tokens plus the tail so the system prompt is lost, and the client sees a normal response; that is why `data_worker.py` fails any note that `llm_analysis.note_fits_context` says would not fit, without calling the model (BACKLOG B10, fixed 2026-10-14). The default 8192 is what the A10 holds with medgemma:27b; a larger `NLP_CONTEXT_LENGTH` moves the cut up but pushes the model off the GPU, and the preflight prints both the cut and the placement.
+16. **Context window.** The rewrite sets `OLLAMA_CONTEXT_LENGTH=8192` on the container (`NLP_CONTEXT_LENGTH`), and `llm_analysis.py` passes the same value as `num_ctx` on every call, so a workstation run uses the same window as a job. The September script and a workstation install without it get Ollama's default, 4096 on CPU. The prompt overhead is about 1,700 tokens; the 5000-note corpus has notes up to about 41,000 characters (roughly 13,000 tokens). Ollama truncates an over-long prompt server-side, keeping 5 leading tokens plus the tail so the system prompt is lost, and the client sees a normal response; that is why `data_worker.py` fails any note that `llm_analysis.note_fits_context` says would not fit, without calling the model (BACKLOG B10, fixed 2026-10-14). The default 8192 is what the A10 holds with medgemma:27b; a larger `NLP_CONTEXT_LENGTH` moves the cut up but pushes the model off the GPU, and the preflight prints both the cut and the placement. Since 2026-10-15 the server's own token counts are checked after every call as well: prompt plus answer tokens over `num_ctx` means the context was shifted or cut, and that answer is discarded and the note recorded as too long (`PromptCutError`).
 17. **`OLLAMA_KEEP_ALIVE=-1` keeps the model loaded for the whole job.** Keep it; reloading a 17 GB model per note would dominate runtime. `OLLAMA_MAX_LOADED_MODELS=1` keeps a single model resident: the three models run one after another and no two of them fit the A10 together. `OLLAMA_NUM_PARALLEL=1` matches the single-threaded `data_worker`. Nothing limits llama.cpp's threads to the requested slots (BACKLOG B26).
 18. **The container tag is pinned.** Now pinned to `0.24.0`, the last release that uses a driver-535 GPU; a newer tag needs driver 550+ (BACKLOG B25). The Python packages, including `ollama` 0.6.2, are pinned in `requirements.txt` to the Argon versions.
 19. **GPU use requires three things to line up:** a `*-GPU` queue, `#$ -l ngpus=1` (and a card-type complex if you need one), and a node driver the container's CUDA runtime accepts. `nlp_start_ollama` only passes `--nv` when `nvidia-smi -L` works. Verify with the preflight placement line every time.
@@ -1186,12 +1214,12 @@ Things to hold in mind while changing the code, grouped by the layer they affect
 
 ### 15.3 Pipeline semantics
 
-21. **LLM failures are swallowed by design.** Any change to the schema, prompt or model must be followed by a tier 1 preflight; nothing else will tell you it broke. If you add a field, update all of: the prompt schema text, `EXPECTED_FIELDS`, `BOOL_FIELDS` if boolean, `normalize_llm_result` if integer, `RESULT_FIELDS` in `database.py` (the table schema, the insert and the export query are all built from it, and `create_db` adds the new column to an existing database), and `HARD`/`SOFT` plus the synthetic note in `setup.sh`.
+21. **LLM failures are swallowed by design.** Any change to the schema, prompt or model must be followed by a tier 1 preflight; nothing else will tell you it broke. If you add a field, update all of: the prompt schema text, `EXPECTED_FIELDS`, `BOOL_FIELDS` if boolean, `normalize_llm_result` if integer, `RESULT_FIELDS` in `database.py` (the table schema, the insert and the export query are all built from it, and `create_db` adds the new column to an existing database), the layout tables in `export.py` (the module asserts that every stored column has a title), `VOTED_FIELDS` or `EVIDENCE_FOR_FLAG` in `consensus.py`, `results-csv-guide.md`, and `HARD`/`SOFT` plus the synthetic note in `setup.sh`.
 22. **Keep `except Exception` in `llm_analysis()`, not `except BaseException`.** The preflight's timeout is a `BaseException` subclass precisely so that wrapper cannot swallow it.
-23. **Validation rejects extra fields and non-0/1 booleans.** `normalize_llm_result` first coerces `true`/`false` and numeric strings to integers, fills null booleans with 0, treats a non-numeric count as "not stated" (null) and keeps the count and the taken flag consistent; after that, a model that adds commentary keys or returns a value other than 0/1 fails validation and is not retried (only JSON parse errors are). `format=` with a schema would be stronger (BACKLOG B9).
-24. **Retries are only for JSON decode errors**, up to 5 attempts, each a full generation. Budget runtime accordingly and prefer fixing the prompt or decoding over raising the retry count.
+23. **Validation rejects extra fields and non-0/1 booleans, and every rejection is retried.** `format=RESPONSE_SCHEMA` keeps the reply to the ten fields; `normalize_llm_result` then coerces `true`/`false` and numeric strings to integers, fills null booleans with 0, treats a non-numeric count as "not stated" (null) and keeps the count and the taken flag consistent; a value that still fails validation, like an answer the note does not support (`verify_against_note`), raises `RetryableLLMError` and is retried with the reason in the prompt (BACKLOG B9, fixed 2026-10-13).
+24. **Retries cover invalid JSON, validation failures, answers the note does not support and repetition loops**, up to 5 attempts, each a full generation (attempts 2+ sampled, item 15). A failed call, a note too long for the window and a prompt the server counted as cut are not retried. Budget runtime accordingly and prefer fixing the prompt or the checks over raising the retry count.
 25. **`CREATE TABLE IF NOT EXISTS` does not migrate.** `create_db` adds any `results` column missing from an existing `data.db` (`ALTER TABLE ... ADD COLUMN`; existing rows get null), which covers adding a field. Anything else (renaming or retyping a column, changing `notes`) still needs a fresh database or a hand-written migration (BACKLOG B19).
-26. **Resume logic keys on row existence, not freshness.** Changing the prompt or model does not reprocess notes that already have a `results` row. Delete those rows to recompute.
+26. **Resume logic keys on a model's block being filled, not on freshness.** A note is pending for a model while that model's `LLM_Failed` column is null. Changing the prompt does not reprocess notes a model has answered; clear the model's `LLM_Failed` for those notes (14, "Job finished quickly, exit 0, LLM columns all empty") to recompute them with that model. A new model name gets a new block and processes every note.
 27. **Relative paths everywhere.** `data.db` and `output/` are resolved from the current directory. Run from the repo directory, or refactor to pass a path (BACKLOG B18).
 28. **The export is write-once.** `output/results.csv` and `output/results-review.csv` are written together and skipped together if either exists. After a resume the file on disk is stale (BACKLOG B17).
 29. **Ingest dedup is whole-row equality**, against the database and within the file, on an index of MRN, encounter and CSN since 2026-10-15 (5,000 rows in 0.3 s). A trailing space in one field creates a second note; identical notes under different CSN ids are analysed twice (BACKLOG B16).
@@ -1200,11 +1228,11 @@ Things to hold in mind while changing the code, grouped by the layer they affect
 
 ### 15.4 Operations and HIPAA
 
-31. **Logs are not PHI-free by construction.** `data_worker` logs one line per note with the note id, timing and the structured fields (scope model, flags, counts), never the evidence sentences, note text or raw output; but `LLMAnalysisError` messages can echo model output, which copies note sentences, and those messages reach the log in `~/nlp-study-logs/` in `$HOME` and the `LLM_Error` column (BACKLOG F11). Do not add debug prints of note content, raw LLM output or CSV rows. Ollama at `OLLAMA_DEBUG=INFO` does not log prompts; the Ollama logs now also live in `~/nlp-study-logs/`.
-32. **The job emails on end and abort** (`-m ea`). Do not put identifiers in the job name or in anything that reaches stdout at the end.
-33. **Everything binds to `127.0.0.1`.** Keep it that way; never expose the Ollama port on the node's interfaces.
-34. **Walltime versus volume.** 24 h at 8 slots is the default (`NLP_JOB_HRT`, `NLP_JOB_SLOTS`). Projected runtime comes from tier 1, which counts the real rows. Raise `h_rt` or plan resubmissions; the pipeline is resume-safe. Gating non-procedure notes before the LLM (BACKLOG F3) is the big lever.
-35. **Windows line endings** in any script copied to Argon need `dos2unix`. Shebangs with `\r` fail with confusing "no such file" errors.
+32. **Logs are not PHI-free by construction.** `reporter.py` logs one line per note with the note id, timing, token counts and the structured fields (scope name, flags, counts), never the evidence sentences, note text or raw output, and a rejection is logged in its `brief` form, without the rejected value; the full message with the value goes only to the `LLM_Error` and `LLM_Rejections` columns in `data.db` and the export (BACKLOG F11). Do not add debug prints of note content, raw LLM output or CSV rows. Ollama at `OLLAMA_DEBUG=INFO` does not log prompts; the Ollama logs now also live in `~/nlp-study-logs/`.
+33. **The job emails on end and abort** (`-m ea`). Do not put identifiers in the job name or in anything that reaches stdout at the end.
+34. **Everything binds to `127.0.0.1`.** Keep it that way; never expose the Ollama port on the node's interfaces.
+35. **Walltime versus volume.** 24 h at 8 slots is the default (`NLP_JOB_HRT`, `NLP_JOB_SLOTS`). Projected runtime comes from tier 1, which counts the real rows. Raise `h_rt` or plan resubmissions; the pipeline is resume-safe. Gating non-procedure notes before the LLM (BACKLOG F3) is the big lever.
+36. **Windows line endings** in any script copied to Argon need `dos2unix`. Shebangs with `\r` fail with confusing "no such file" errors.
 
 ### 15.5 Study requirements (the researcher's review comments)
 
@@ -1277,6 +1305,8 @@ September-only variables, no longer read: `SKIP_SMOKE_TEST`, `FORCE_SMOKE_TEST`,
 | --- | --- | --- |
 | `NLP_CONTEXT_LENGTH` | `8192` | `OLLAMA_CONTEXT_LENGTH` passed into the container |
 | `NLP_LLM_TIMEOUT` | `1800` | Longest silence (seconds) from Ollama during one model call or model load before it counts as a failed call; the answer is streamed, so a slow model is never cut off while producing |
+| `NLP_HEARTBEAT_SECONDS` | `60` | Seconds between the `...` heartbeat lines the job log gets during a long model call |
+| `NLP_PLAIN` | unset | `1` turns off the live panel in a terminal and gives the heartbeat lines instead |
 | `NLP_PREFLIGHT_REPS` | 3 (job forces 1 unless set) | Tier 1 repetitions |
 | `NLP_PREFLIGHT_BUDGET` | 600 | Per-call timeout in seconds |
 | `NLP_SKIP_PREFLIGHT` | unset | Bypass the gate in the job |
@@ -1387,7 +1417,7 @@ From the 19:22 and 19:33 server logs, Ollama 0.32.14 inside the container on a c
 
 ### Tables in `data.db`
 
-**notes**: `id` (autoincrement), `mrn`, `encounter`, `note_csn_id`, `note_date`, `note_type`, `note`.
+**notes**: `id` (autoincrement), `mrn`, `encounter`, `note_csn_id`, `note_date`, `note_type`, `note`, with the index `notes_identity` on (`mrn`, `encounter`, `note_csn_id`) for the ingest's duplicate check.
 
 **results** (one row per note id, one block of columns per model): every column is named `<field> (<model>@<context>)`, the label being the model's full name and the context window it was called with (`llm_analysis.ModelSpec.label`, today `medgemma:27b@8192`), so two models, or one model at two window sizes, never share a column, and SQL must double-quote the names. A block holds the ten extracted fields (`ScopeType`, `Colonoscopy`, `ColonoscopyInformation`, `Endoscopy`, `EndoscopyInformation`, `NumberOfDuodenalBiopsies`, `DuodenalBiopsiesTaken`, `DuodenalBiopsiesInformation`, `FellowPresent`, `FellowInformation`), the review columns `ManualReviewRequired` and `ManualReviewReason`, and six debugging columns: `LLM_Failed` (1 when no attempt gave an answer the note supports, or the call failed; the extracted fields are then null; null means the model has not run on the note), `LLM_Attempts` (model calls made for the note), `LLM_Seconds` (wall-clock time over all attempts), `LLM_Error` (the final error message when it failed), `LLM_Rejections` (why each rejected attempt was rejected) and `RawResponse` (verbatim text of the accepted model response, for audit). It carries no `note_csn_id`, so selecting the EGD cohort by CSN needs a join with `notes` (BACKLOG B20); `results.csv` is that join. `create_db` converts a table from before the labels (bare field names) into the first model's block, adds any column a block lacks, and adds a whole block for a model that has not run on that `data.db`.
 
@@ -1402,4 +1432,4 @@ Until 2026-10-13 the tables were `working_results` (NLP and LLM answers side by 
 | `results.csv` | One row per note, under plain-words titles (`export.py`; `results-csv-guide.md` explains them): `Note id`, `MRN`, `Encounter`, `NoteCsnID`, `NoteDate`, `NoteType` (columns A to F); the consensus block, each column titled `<what> (consensus)` (columns G to X): `Needs human review` (TRUE/FALSE, the review queue), `Review reasons`, `Outcome`, `Models answered`, `Summary`, the ten fields (`Upper endoscopy performed`, `Scope type`, `Upper endoscopy evidence quote`, `Duodenal biopsies taken`, `Number of duodenal biopsies`, `Duodenal biopsies evidence quote`, `Colonoscopy performed`, `Colonoscopy evidence quote`, `Fellow present`, `Fellow evidence quote`), `Models consulted`, `Disputed fields`, `How the models voted`; then one block of 16 columns per model, each titled `<what> (<model>@<context>)`: `Failed`, the ten fields, `Needs review`, `Review reasons`, `Attempts`, `Seconds`, `Failure reason`; then every model's `Rejected attempts` and `Raw model response`; then `Note length (characters)` and `Note`. Yes/no values are TRUE or FALSE; a cell is empty where the database holds NULL |
 | `results-review.csv` | The same rows with only the identifiers (A to F), the consensus block (G to X) and `Note length (characters)` (Y), written from the same pass as `results.csv` and write-once together with it; about 4% of its size, for Google Sheets. |
 
-It is written once and never overwritten. It contains PHI.
+Both are written once, together, and never overwritten. Both contain PHI.
