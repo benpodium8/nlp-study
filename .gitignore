@@ -5,4 +5,9 @@ __pycache__
 output/
 notes.csv
 samples
+sample-inputs
 environment-notes
+TODO.txt
+data.db.backup*
+data.db.lock*
+data.db-journal

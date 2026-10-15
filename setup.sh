@@ -1,601 +1,548 @@
 #!/bin/bash
 # =============================================================================
-#  setup_nlp_study.sh
+#  setup.sh -- re-runnable setup for nlp-study on the UIowa Argon cluster
+#  (SGE + Apptainer). Run it from any node; it does what that node allows:
 #
-#  One-shot, re-runnable setup for benpodium8/nlp-study on the UIowa Argon
-#  cluster. RUN THIS FROM A LOGIN NODE (it needs outbound internet; compute
-#  nodes frequently do not have it).
+#     login node     clone, venv, pip, container image, model download, then
+#                    static checks only (no Ollama process here, see below)
+#     qlogin / qsub  the same build steps for anything missing, if the node
+#                    has internet (most compute nodes do not), then a live
+#                    inference check through the repo's own llm_analysis()
 #
-#  ---------------------------------------------------------------------------
-#  RESOURCE HANDLING
-#  ---------------------------------------------------------------------------
-#  Every managed resource (repo, venv, container image, model) is health
-#  checked before anything is done to it, and lands in one of three states:
+#  Argon login nodes cap each user at one logical CPU and 16 GB and kill the
+#  largest process over the cap. Earlier versions of this script started
+#  `ollama serve` there to pull and smoke-test the model, and hung or died.
+#  This version never runs an Ollama process, or `apptainer exec` at all,
+#  outside an SGE allocation: the image is pulled with mksquashfs capped to
+#  one thread and 2 GB through a PATH wrapper (Apptainer 1.3 has no option
+#  for this on pull), and the model blobs are downloaded with curl straight
+#  into Ollama's on-disk store. Every network transfer has a stall timeout.
 #
-#     healthy  -> left alone and skipped
-#     broken   -> removed and rebuilt (e.g. a half-finished git clone)
-#     absent   -> created
-#
-#  So a failed run is always safe to resume by simply running the script again.
-#
-#  ---------------------------------------------------------------------------
-#  WHY THERE IS A PREFLIGHT
-#  ---------------------------------------------------------------------------
-#  data_worker.py catches every LLM exception per note, records llm_failed=1
-#  and continues to the next note. A wrong endpoint, a renamed model or a
-#  model that will not emit schema-clean JSON therefore does NOT crash the
-#  job. It runs for its full walltime and hands back a table in which every
-#  LLM column is null. There is no loud failure to react to.
-#
-#  So this script ships a preflight that exercises the repo's real code path
-#  -- llm_analysis.llm_analysis() on a synthetic, PHI-free note -- and refuses
-#  to bless the setup unless it comes back schema-valid.
-#
-#  The preflight is tiered, because inference is not permitted on a login
-#  node (per-user cap is 100% of ONE logical CPU and 16G of memory, and the
-#  limiter kills the largest process when you exceed it -- which is what hung
-#  the previous version of this script):
-#
-#     tier 0   static checks: imports, model-name agreement, endpoint
-#              reachability, client wiring, writability. No inference.
-#              Runs anywhere, including a login node. Seconds.
-#
-#     tier 1   tier 0 plus real llm_analysis() calls, schema validation,
-#              extraction spot-checks and a runtime projection.
-#              Compute nodes only.
-#
-#  Setup on a login node automatically stops at tier 0 and tells you how to
-#  finish. The generated job script runs tier 1 before app.py, so a batch job
-#  dies in the first minute instead of wasting 24 hours.
+#  Each resource (repo, venv, deps, sif, model) is health-checked and is either
+#  healthy (skipped), broken (removed and rebuilt) or absent (created), so
+#  re-running after a failure is always safe, and a node without internet
+#  simply uses what is already built.
 #
 #  Usage:
-#     ./setup_nlp_study.sh                  resume: skip healthy, repair broken
-#     ./setup_nlp_study.sh --status         report state of everything, change nothing
-#     ./setup_nlp_study.sh --preflight      check an EXISTING install, build nothing
-#     ./setup_nlp_study.sh --force repo     rebuild one resource unconditionally
-#     ./setup_nlp_study.sh --force all      rebuild everything
-#     ./setup_nlp_study.sh --clean          remove all managed scratch resources
+#     ./setup.sh                 build or repair, then preflight as far as this node allows
+#     ./setup.sh --preflight     check an existing install, build nothing
+#     ./setup.sh --status        report state, change nothing
+#     ./setup.sh --force NAME    rebuild repo|venv|deps|sif|model|all
+#     ./setup.sh --clean [-y]    remove everything on scratch (PHI is moved aside)
 #
-#  Resource names for --force: repo, venv, deps, sif, model, all
-#
-#  The intended sequence is:
-#     [login]   ./setup_nlp_study.sh            builds everything, tier 0
-#     [qlogin]  ./setup_nlp_study.sh --preflight  tier 1, proves the LLM works
-#     [login]   qsub ~/nlp-study.job --analyze --csv ./notes.csv
+#  Sequence:  [login] ./setup.sh  ->  [qlogin] ./setup.sh  ->  [login] qsub ~/nlp-study.job --analyze --csv ./notes.csv
 #
 #  Optional environment overrides:
-#     NLP_PYTHON=/path/to/python3.12    Skip Python auto-detection
-#     NLP_FAST_ROOT / NLP_BULK_ROOT     Force scratch locations
-#     PIP_INSTALL_ARGS="..."            Default: --only-binary=:all:
-#     MODEL=name:tag                    Override the model (normally read
-#                                       straight out of llm_analysis.py)
-#     SKIP_SMOKE_TEST=1                 Skip the preflight entirely
-#     FORCE_SMOKE_TEST=1                Run tier 1 even on a login node (do not)
-#     NLP_PREFLIGHT_REPS=3              Inference reps during tier 1
-#     NLP_PREFLIGHT_BUDGET=600          Per-call timeout, seconds
-#     NLP_NOTE_ESTIMATE=0               Row count in notes.csv, for projections
-#     NLP_JOB_QUEUE=UI                  Queue baked into the generated job script
-#     NLP_JOB_GPU=1                     Bake GPU directives into the job script
+#     MODEL="name:tag [name:tag ...]"  models to fetch, space-separated (default: the MODELS block in llm_analysis.py; hf.co/... works)
+#     NLP_REPO_URL=...               clone a fork or branch mirror instead of the GitHub repo
+#     NLP_PYTHON=/path/to/python     skip interpreter detection
+#     NLP_FAST_ROOT, NLP_BULK_ROOT   scratch dirs for repo+venv and image+model
+#     NLP_OLLAMA_IMAGE=docker://ollama/ollama:<tag>    container image (default 0.24.0: last to use driver 535 GPUs)
+#     NLP_REQUIRES_VERIFIED="name:tag ..."   models fetched although their config "requires" a newer Ollama than
+#                                    the image, because they are known to load on it (default: gpt-oss:20b)
+#     PIP_INSTALL_ARGS="..."         default: --only-binary=:all:
+#     NLP_JOB_QUEUE=UI NLP_JOB_SLOTS=8 NLP_JOB_HRT=24:00:00 NLP_JOB_GPU=1
+#     NLP_CONTEXT_LENGTH=8192        Ollama context window used by the job (8192 fits medgemma:27b on the A10; larger spills to CPU)
+#     NLP_LLM_TIMEOUT=1800           longest silence (seconds) from Ollama in one model call before it counts as a failed call
+#     NLP_HEARTBEAT_SECONDS=60       seconds between the job log's "..." lines during a long model call
+#     NLP_PREFLIGHT_REPS=3 NLP_PREFLIGHT_BUDGET=600   live calls / seconds each
+#     NLP_ALLOW_INFERENCE=1          allow inference outside SGE (never on a login node)
+#     NLP_SKIP_PREFLIGHT=1           (job only) skip the fail-fast gate before app.py
 # =============================================================================
+# shellcheck disable=SC1090,SC1091   # sourced files (module init, venv activate, env script) are runtime paths
+set -Eeuo pipefail
 
-set -euo pipefail
-
-# -----------------------------------------------------------------------------
-# Static configuration
-# -----------------------------------------------------------------------------
-readonly HAWKID="${USER}"
-readonly REPO_URL="https://github.com/benpodium8/nlp-study.git"
-readonly CONTAINER_URI="docker://ollama/ollama:latest"
-
-# Fallback only. The authoritative model name is LOCAL_MODEL in
-# llm_analysis.py, and detect_repo_model() adopts it once the repo exists.
-# The repo's own history ("change model from gemma4:e4b to gemma4:e2b")
-# is exactly why this is not hardcoded any more: pulling the wrong weights
-# costs 7.2 GB and a silent all-null run.
-readonly MODEL_FALLBACK="gemma4:e2b"
-readonly MODEL_OVERRIDE="${MODEL:-}"   # explicit MODEL=... wins over the repo
-MODEL=""
-MODEL_SOURCE="unresolved"
-
+# ----------------------------------------------------------------------------- config
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"; readonly SELF
+readonly REPO_URL="${NLP_REPO_URL:-https://github.com/benpodium8/nlp-study.git}"
+# 0.24.0 is the last Ollama whose CUDA build runs on Argon's driver 535 (A10 nodes): 0.30.0+
+# need driver 550+ and crash or fall back to CPU. Move up only after the driver is upgraded.
+readonly OLLAMA_DRIVER535_MAX="0.24.0"
+readonly OLLAMA_IMAGE="${NLP_OLLAMA_IMAGE:-docker://ollama/ollama:${OLLAMA_DRIVER535_MAX}}"
+# Models whose registry config declares a newer "requires" than the image but are known to load on
+# it: 0.24.0 ignores the field, and its Go engine runs gpt-oss (load-tested 2026-10-13, see
+# model_candidates.md). The requires check (model_fits_ollama) only logs for these. Space-separated.
+readonly REQUIRES_VERIFIED="${NLP_REQUIRES_VERIFIED-gpt-oss:20b}"
 readonly JOB_SCRIPT="${HOME}/nlp-study.job"
 readonly ENV_SCRIPT="${HOME}/nlp-study-env.sh"
 readonly LOG_DIR="${HOME}/nlp-study-logs"
-readonly SETUP_LOG="${HOME}/nlp-study-setup-$(date +%Y%m%d-%H%M%S).log"
+SETUP_LOG="${LOG_DIR}/setup-$(date +%Y%m%d-%H%M%S).log"; readonly SETUP_LOG
+readonly PIP_ARGS_DEFAULT="--only-binary=:all:"   # never build sdists: they fail slowly on old toolchains
+readonly JOB_QUEUE="${NLP_JOB_QUEUE:-UI}" JOB_SLOTS="${NLP_JOB_SLOTS:-8}" JOB_HRT="${NLP_JOB_HRT:-24:00:00}"
+readonly MODEL_OVERRIDE="${MODEL:-}"
+readonly ENV_VERSION=2                             # bump when the generated scripts change shape
+readonly HAWKID="${USER:-$(id -un)}"               # SGE sets USER; fall back for stripped environments
+export GIT_TERMINAL_PROMPT=0                       # never block on a credential prompt
+# curl: fail instead of hanging when a transfer stalls (under 1 KB/s for 60 s)
+readonly CURL_NET=(--connect-timeout 30 --speed-limit 1024 --speed-time 60)
 
-readonly JOB_QUEUE="${NLP_JOB_QUEUE:-UI}"
+MODEL="" MODEL_SOURCE="" SIF_OLLAMA="" M_REQUIRES=""
+MODELS=()   # every model the program calls, in run order; MODEL is the one the model_* functions act on
+PROJECT_ROOT="" ASSET_ROOT="" REPO_DIR="" VENV_DIR="" SIF_PATH="" SIF_PARTIAL="" SIF_IMAGE_STAMP="" MODELS_DIR=""
+APPT_CACHE="" APPT_TMP="" PREFLIGHT_PY="" PYTHON_BIN="" PYTHON_VER=""
+MODE="setup" FORCE_LIST="" ASSUME_YES=""
+V_STATE="absent" V_REASON=""
+M_NS="" M_NAME="" M_TAG="" MANIFEST=""
+CURL_PID="" LOCK_DIR="" PRESERVED_DIR=""
 
-# Extra flags for `pip install -r requirements.txt`.
-#
-# Default is --only-binary=:all: because this cluster runs CentOS 7 (glibc 2.17,
-# GCC 4.8). When pip cannot find a wheel it falls back to building from an
-# sdist, and for spacy/thinc/blis that either burns ten minutes before dying or
-# produces a broken build. Wheels-only turns that into an immediate, legible
-# "no matching distribution found" naming the exact package.
-#
-# Override:  PIP_INSTALL_ARGS="--only-binary=:all: --no-cache-dir" ./setup_nlp_study.sh
-# Disable:   PIP_INSTALL_ARGS="" ./setup_nlp_study.sh
-readonly PIP_ARGS_DEFAULT="--only-binary=:all:"
-
-# Resolved at runtime by resolve_scratch_roots(); Argon does not mount the same
-# scratch filesystems on every host.
-PROJECT_ROOT=""   # many small files: git repo + virtualenv
-ASSET_ROOT=""     # few large files: .sif image + model blobs
-REPO_DIR=""
-VENV_DIR=""
-SIF_PATH=""
-MODELS_DIR=""
-APPT_CACHE=""
-APPT_TMP=""
-PREFLIGHT_PY=""
-
-PYTHON_BIN=""
-PYTHON_VER=""
-OLLAMA_PID=""
-NV_FLAG=""
-MODE="setup"
-FORCE_LIST=""
-ASSUME_YES=""
-
-# -----------------------------------------------------------------------------
-# Output helpers
-# -----------------------------------------------------------------------------
-if [[ -t 1 ]]; then
-    C_RESET=$'\033[0m'; C_DIM=$'\033[2m';     C_CYAN=$'\033[36m'
-    C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'
-    C_BOLD=$'\033[1m'
+# ----------------------------------------------------------------------------- output
+IS_TTY=""; [[ ! -t 1 ]] || IS_TTY=1
+if [[ -n "$IS_TTY" ]]; then
+    C_RESET=$'\033[0m' C_DIM=$'\033[2m' C_BOLD=$'\033[1m' C_CYAN=$'\033[36m'
+    C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_RED=$'\033[31m'
 else
-    C_RESET=''; C_DIM=''; C_CYAN=''; C_GREEN=''; C_YELLOW=''; C_RED=''; C_BOLD=''
+    C_RESET='' C_DIM='' C_BOLD='' C_CYAN='' C_GREEN='' C_YELLOW='' C_RED=''
 fi
+_ts()     { date '+%H:%M:%S'; }
+section() { printf '\n%s%s== %s ==%s\n' "$C_BOLD" "$C_CYAN" "$*" "$C_RESET"; }
+log()     { printf '%s[%s]%s %s\n' "$C_DIM" "$(_ts)" "$C_RESET" "$*"; }
+ok()      { printf '%s[%s]   OK   %s%s\n' "$C_GREEN" "$(_ts)" "$*" "$C_RESET"; }
+warn()    { printf '%s[%s]  WARN  %s%s\n' "$C_YELLOW" "$(_ts)" "$*" "$C_RESET"; }
+err()     { printf '%s[%s] ERROR  %s%s\n' "$C_RED" "$(_ts)" "$*" "$C_RESET" >&2; }
+die()     { err "$*"; exit 1; }
+run()     { printf '%s         $ %s%s\n' "$C_DIM" "$*" "$C_RESET"; "$@"; }
+git_in()  { local d="$1"; shift; ( cd "$d" && git "$@" ); }   # `git -C` needs git >= 1.8.5
+usage()   { sed -n '/^#  Usage:/,/^# ====/p' "$0" | sed '$d; s/^# \{0,2\}//'; }
+in_sge_job()    { [[ -n "${JOB_ID:-}${PE_HOSTFILE:-}" ]]; }
+is_login_node() { [[ "$(hostname)" == *login* ]]; }
 
-_ts() { date '+%H:%M:%S'; }
-
-section() {
-    printf '\n%s%s══════════════════════════════════════════════════════════════%s\n' \
-        "$C_BOLD" "$C_CYAN" "$C_RESET"
-    printf '%s%s  %s%s\n' "$C_BOLD" "$C_CYAN" "$*" "$C_RESET"
-    printf '%s%s══════════════════════════════════════════════════════════════%s\n' \
-        "$C_BOLD" "$C_CYAN" "$C_RESET"
-}
-log()  { printf '%s[%s]%s %s\n' "$C_DIM" "$(_ts)" "$C_RESET" "$*"; }
-ok()   { printf '%s[%s]   OK   %s%s\n' "$C_GREEN" "$(_ts)" "$*" "$C_RESET"; }
-warn() { printf '%s[%s]  WARN  %s%s\n' "$C_YELLOW" "$(_ts)" "$*" "$C_RESET"; }
-err()  { printf '%s[%s] ERROR  %s%s\n' "$C_RED" "$(_ts)" "$*" "$C_RESET" >&2; }
-die()  { err "$*"; exit 1; }
-
-run() {
-    printf '%s         $ %s%s\n' "$C_DIM" "$*" "$C_RESET"
-    "$@"
-}
-
-# `git -C <path>` requires git >= 1.8.5. CentOS 7 ships 1.8.3.1, where -C is an
-# unknown option. Use a subshell cd instead, which works on every git ever.
-git_in() {
-    local dir="$1"; shift
-    ( cd "$dir" && git "$@" )
-}
-
-usage() {
-    sed -n '2,80p' "$0" | sed 's/^#//; s/^ //'
-}
-
-# Where are we? Decides whether inference is allowed.
-#   login    -> login node. 1 logical CPU, 16G, killer. Tier 0 only.
-#   job      -> inside an SGE allocation (qlogin or batch). Tier 1 fine.
-#   compute  -> not a login node and no SGE vars. Treat as tier 1 capable,
-#               but say so, because it usually means something is unusual.
-node_kind() {
-    if [[ -n "${JOB_ID:-}" || -n "${PE_HOSTFILE:-}" || -n "${SGE_TASK_ID:-}" ]]; then
-        printf 'job'; return
-    fi
-    if [[ "$(hostname)" == *login* ]]; then
-        printf 'login'; return
-    fi
-    printf 'compute'
-}
-
-# -----------------------------------------------------------------------------
-# Argument parsing
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --status)      MODE="status";    shift ;;
-        --clean)       MODE="clean";     shift ;;
-        --preflight)   MODE="preflight"; shift ;;
-        --yes|-y)      ASSUME_YES="1";   shift ;;
-        --force)
-            [[ $# -ge 2 ]] || die "--force needs a resource name (repo|venv|deps|sif|model|all)"
-            FORCE_LIST="${FORCE_LIST},${2}"; shift 2 ;;
-        --force=*)     FORCE_LIST="${FORCE_LIST},${1#--force=}"; shift ;;
-        -h|--help)     usage; exit 0 ;;
-        *)             die "Unknown option: $1  (try --help)" ;;
+        --status)    MODE="status" ;;
+        --clean)     MODE="clean" ;;
+        --preflight) MODE="preflight" ;;
+        -y|--yes)    ASSUME_YES=1 ;;
+        --force)     [[ $# -ge 2 ]] || die "--force needs repo|venv|deps|sif|model|all"; FORCE_LIST="${FORCE_LIST},$2"; shift ;;
+        --force=*)   FORCE_LIST="${FORCE_LIST},${1#--force=}" ;;
+        -h|--help)   usage; exit 0 ;;
+        *)           die "Unknown option: $1 (try --help)" ;;
     esac
+    shift
 done
+force_requested() { [[ ",${FORCE_LIST}," == *",all,"* || ",${FORCE_LIST}," == *",${1},"* ]]; }
 
-# Backwards compatibility with the earlier env-var flags.
-[[ -n "${FORCE_VENV:-}" ]] && FORCE_LIST="${FORCE_LIST},venv"
-[[ -n "${FORCE_SIF:-}"  ]] && FORCE_LIST="${FORCE_LIST},sif"
-
-force_requested() {
-    [[ ",${FORCE_LIST}," == *",all,"* ]] && return 0
-    [[ ",${FORCE_LIST}," == *",${1},"* ]] && return 0
-    return 1
+# Set by the environment check in setup mode. Nothing that is already healthy
+# needs the network, so a compute node without internet can run every mode.
+HAVE_NET=1
+require_net() {
+    [[ "$HAVE_NET" -eq 1 ]] || die "[$1] has to be built or updated, but this node has no outbound internet. Run ${SELF} on a login node first."
 }
 
-# -----------------------------------------------------------------------------
-# Traps
-# -----------------------------------------------------------------------------
-stop_ollama() {
-    if [[ -n "$OLLAMA_PID" ]] && kill -0 "$OLLAMA_PID" 2>/dev/null; then
-        log "Stopping setup-time Ollama server (pid ${OLLAMA_PID})"
-        kill "$OLLAMA_PID" 2>/dev/null || true
-        wait "$OLLAMA_PID" 2>/dev/null || true
+# One builder at a time per scratch tree: two concurrent runs would append to the
+# same partial downloads. mkdir is atomic, NFS included. A lock whose owner is
+# dead on this host, or older than six hours, is stale and taken over.
+pid_alive() { [[ "$1" =~ ^[1-9][0-9]*$ ]] && kill -0 "$1" 2>/dev/null; }
+acquire_lock() {
+    local dir="${PROJECT_ROOT}/.setup.lock" host="?" pid=0 since=0
+    if ! mkdir "$dir" 2>/dev/null; then
+        read -r host pid since < "${dir}/owner" 2>/dev/null || true
+        [[ "$since" =~ ^[0-9]+$ ]] || since=0
+        if { [[ "$host" == "$(hostname)" ]] && ! pid_alive "$pid"; } || [[ $(( $(date +%s) - since )) -gt 21600 ]]; then
+            warn "Taking over a stale setup lock (host ${host}, pid ${pid})."
+            rm -rf "$dir"; mkdir "$dir" || die "Could not create ${dir}"
+        else
+            die "Another setup run is active on ${host} (pid ${pid}, since $(date -d "@${since}" 2>/dev/null || echo '?')). Wait for it, or if it is dead:  rm -rf ${dir}"
+        fi
     fi
-    OLLAMA_PID=""
+    printf '%s %s %s\n' "$(hostname)" "$$" "$(date +%s)" > "${dir}/owner"
+    LOCK_DIR="$dir"
 }
-trap stop_ollama EXIT
+release_lock() { [[ -z "$LOCK_DIR" ]] || rm -rf "$LOCK_DIR"; LOCK_DIR=""; }
 
-on_error() {
-    local exit_code=$1 line=$2
-    printf '\n'
-    err "Setup failed at line ${line} (exit code ${exit_code})."
-    err "Full transcript: ${SETUP_LOG}"
-    printf '\n%sState at failure:%s\n' "$C_BOLD" "$C_RESET"
-    printf '  Host          : %s  (%s)\n' "$(hostname)" "$(node_kind)"
-    printf '  Python in use : %s\n' "${PYTHON_BIN:-<not yet detected>}"
-    printf '  Repo dir      : %s\n' "${REPO_DIR:-<not yet resolved>}"
-    printf '  Venv dir      : %s\n' "${VENV_DIR:-<not yet resolved>}"
-    printf '  SIF path      : %s\n' "${SIF_PATH:-<not yet resolved>}"
-    printf '  Models dir    : %s\n' "${MODELS_DIR:-<not yet resolved>}"
-    printf '  Model         : %s (%s)\n' "${MODEL:-<not yet resolved>}" "$MODEL_SOURCE"
-    if [[ -n "${ASSET_ROOT:-}" && -f "${ASSET_ROOT}/ollama-setup.log" ]]; then
-        printf '\n%sLast 30 lines of the Ollama server log:%s\n' "$C_BOLD" "$C_RESET"
-        tail -n 30 "${ASSET_ROOT}/ollama-setup.log" || true
-    fi
-    printf '\n%sNothing here is fatal. Re-run the script: anything left half-built%s\n' "$C_BOLD" "$C_RESET"
-    printf '%sis detected and rebuilt automatically. Use --status to inspect first.%s\n\n' "$C_BOLD" "$C_RESET"
-    exit "$exit_code"
+# atomic_write FILE (content on stdin): a job sourcing the file never sees it half-written.
+atomic_write() {
+    local tmp="$1.tmp.$$"
+    cat > "$tmp" && chmod +x "$tmp" && mv -f "$tmp" "$1"
 }
-trap 'on_error $? $LINENO' ERR
 
-exec > >(tee -a "$SETUP_LOG") 2>&1
-
-# =============================================================================
-#  Resource state machine
-# =============================================================================
-#  Each verify_* function sets V_STATE to healthy|broken|absent and, when
-#  broken, a human-readable V_REASON. ensure_resource() then decides.
-# -----------------------------------------------------------------------------
-V_STATE="absent"
-V_REASON=""
-
+# ----------------------------------------------------------------------------- resource state machine
+# Each verify_NAME sets V_STATE=healthy|broken|absent (and V_REASON); ensure_resource acts on it.
 ensure_resource() {
-    local name="$1" verify="$2" destroy="$3" create="$4"
-
-    V_STATE="absent"; V_REASON=""
-    "$verify"
-
+    local name="$1" why
+    V_STATE="absent"; V_REASON=""; "verify_$name"
     if force_requested "$name"; then
-        if [[ "$V_STATE" != "absent" ]]; then
-            warn "[${name}] --force given: removing the existing copy."
-            "$destroy"
-        fi
-        log "[${name}] building ..."
-        "$create"
-        ok "[${name}] rebuilt."
-        return
-    fi
-
-    case "$V_STATE" in
-        healthy)
-            ok "[${name}] already present and healthy — skipping."
-            ;;
-        broken)
-            warn "[${name}] present but unusable: ${V_REASON}"
-            warn "[${name}] removing the damaged copy and rebuilding."
-            "$destroy"
-            "$create"
-            ok "[${name}] rebuilt."
-            ;;
-        absent)
-            log "[${name}] not present — creating."
-            "$create"
-            ok "[${name}] created."
-            ;;
-    esac
-}
-
-# Move anything that looks like user data out of a directory before deleting it.
-# The pipeline keeps notes.csv, the SQLite DB and output/ inside the repo, and
-# all three are PHI. Never silently rm -rf them.
-preserve_user_data() {
-    local dir="$1"
-    [[ -d "$dir" ]] || return 0
-
-    local stash="${PROJECT_ROOT}/preserved/$(date +%Y%m%d-%H%M%S)"
-    local candidates=() existing=() p
-
-    shopt -s nullglob
-    candidates=( "$dir"/*.csv "$dir"/*.db "$dir"/*.sqlite "$dir"/*.sqlite3 )
-    shopt -u nullglob
-    # 'output' has no wildcard, so nullglob would not strip it when absent.
-    # Filter on real existence rather than trusting the glob results.
-    candidates+=( "$dir/output" )
-    for p in ${candidates[@]+"${candidates[@]}"}; do
-        [[ -e "$p" ]] && existing+=("$p")
-    done
-
-    [[ ${#existing[@]} -gt 0 ]] || return 0
-
-    warn "Found user data in ${dir} — moving it aside rather than deleting:"
-    mkdir -p "$stash"
-    for p in "${existing[@]}"; do
-        mv "$p" "${stash}/" && warn "    preserved: $(basename "$p")"
-    done
-    warn "Saved to: ${stash}"
-    warn "That path is still on scratch and subject to cleanup. Copy anything"
-    warn "you care about to durable storage."
-}
-
-# The model the program will actually ask for. Read it out of the repo rather
-# than trusting the constant at the top of this file, so a `git pull` that
-# swaps models cannot leave us serving weights nobody requests.
-detect_repo_model() {
-    local f="${REPO_DIR}/llm_analysis.py" found=""
-    if [[ -r "$f" ]]; then
-        found="$(sed -n 's/^[[:space:]]*LOCAL_MODEL[[:space:]]*=[[:space:]]*["'"'"']\([^"'"'"']*\)["'"'"'].*/\1/p' "$f" | head -1)"
-    fi
-
-    if [[ -n "$MODEL_OVERRIDE" ]]; then
-        MODEL="$MODEL_OVERRIDE"
-        MODEL_SOURCE="MODEL env override"
-        if [[ -n "$found" && "$found" != "$MODEL" ]]; then
-            warn "MODEL=${MODEL} was given, but llm_analysis.py asks for ${found}."
-            warn "The program will call ${found}, so the preflight will fail on this"
-            warn "unless you also edit the repo. Drop the override to follow the repo."
-        fi
-        return 0
-    fi
-
-    if [[ -n "$found" ]]; then
-        MODEL="$found"
-        MODEL_SOURCE="llm_analysis.py"
-        if [[ "$found" != "$MODEL_FALLBACK" ]]; then
-            warn "The repo has moved off ${MODEL_FALLBACK}: llm_analysis.py now"
-            warn "requests ${found}. Following the repo and pulling that instead."
-        fi
+        why="--force given"
     else
-        MODEL="$MODEL_FALLBACK"
-        MODEL_SOURCE="fallback (could not parse llm_analysis.py)"
-        warn "Could not read LOCAL_MODEL from llm_analysis.py; assuming ${MODEL}."
-        warn "If the repo was restructured this is a guess. Verify by hand."
+        case "$V_STATE" in
+            healthy) ok "[${name}] healthy, skipping"; return 0 ;;
+            broken)  why="unusable: ${V_REASON}" ;;
+            absent)  why="absent" ;;
+        esac
     fi
+    case "$name" in repo|sif|model) require_net "$name" ;; esac   # before anything is destroyed
+    if [[ "$V_STATE" == "absent" ]]; then
+        log "[${name}] ${why}; creating"
+    else
+        warn "[${name}] ${why}; removing the existing copy and rebuilding"
+        "destroy_$name"
+    fi
+    "create_$name"
+    ok "[${name}] ready"
 }
 
-# =============================================================================
-# Resource definitions
-# =============================================================================
+# notes.csv, data.db (with its journal and backup) and output/ live inside the repo and are PHI: never rm -rf them.
+# They are moved aside before a rebuild and moved back into the fresh checkout.
+preserve_user_data() {
+    local dir="$1" p
+    local -a keep=()
+    [[ -d "$dir" ]] || return 0
+    shopt -s nullglob
+    for p in "$dir"/*.csv "$dir"/*.db "$dir"/*.db.backup "$dir"/*.db-journal "$dir"/*.sqlite "$dir"/*.sqlite3 "$dir"/output; do
+        if [[ -e "$p" ]]; then keep+=("$p"); fi
+    done
+    shopt -u nullglob
+    [[ ${#keep[@]} -gt 0 ]] || return 0
+    PRESERVED_DIR="${PROJECT_ROOT}/preserved/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$PRESERVED_DIR"
+    mv "${keep[@]}" "$PRESERVED_DIR"/
+    warn "User data in ${dir} moved to ${PRESERVED_DIR}"
+}
+restore_user_data() {   # after a successful re-clone: put this run's stash back
+    local dir="$1" p
+    [[ -n "$PRESERVED_DIR" && -d "$PRESERVED_DIR" ]] || return 0
+    shopt -s nullglob
+    for p in "$PRESERVED_DIR"/*; do
+        if [[ -e "${dir}/$(basename "$p")" ]]; then
+            warn "[repo] not restoring $(basename "$p"): the fresh checkout has one; yours stays in ${PRESERVED_DIR}"
+        else
+            mv "$p" "$dir"/
+        fi
+    done
+    shopt -u nullglob
+    if rmdir "$PRESERVED_DIR" 2>/dev/null; then ok "[repo] user data (csv/db/output) moved back into the new checkout"
+    else warn "[repo] some files were left in ${PRESERVED_DIR}"; fi
+    PRESERVED_DIR=""
+}
+
+# The models the program will actually call: LOCAL_MODEL in llm_analysis.py (the first) plus
+# the other names in its MODELS block, one ModelSpec per line with the name as a double-quoted
+# literal (the first line uses LOCAL_MODEL itself and is covered by the first sed).
+detect_repo_models() {
+    local src="${REPO_DIR}/llm_analysis.py" found="" others=""
+    if [[ -r "$src" ]]; then
+        found="$(sed -n "s/^LOCAL_MODEL *= *[\"']\([^\"']*\)[\"'].*/\1/p" "$src" | head -1)"
+        others="$(sed -n '/^MODELS = (/,/^)/p' "$src" | sed -n 's/^ *ModelSpec("\([^"]*\)".*/\1/p' | tr '\n' ' ')"
+    fi
+    MODELS=()
+    if [[ -n "$MODEL_OVERRIDE" ]]; then
+        read -r -a MODELS <<< "$MODEL_OVERRIDE"; MODEL_SOURCE="MODEL env override"
+        [[ -z "$found" || "${found} ${others}" == "${MODELS[*]} " ]] \
+            || warn "MODEL='${MODELS[*]}' given, but llm_analysis.py asks for ${found} ${others}; the program will call what the repo says."
+    elif [[ -n "$found" ]]; then
+        read -r -a MODELS <<< "${found} ${others}"; MODEL_SOURCE="llm_analysis.py"
+    else
+        MODEL_SOURCE="unknown"
+    fi
+    MODEL="${MODELS[0]:-}"
+}
 
 # --- repo --------------------------------------------------------------------
 verify_repo() {
-    if [[ ! -e "$REPO_DIR" ]]; then V_STATE="absent"; return; fi
-    if [[ ! -d "$REPO_DIR" ]]; then
-        V_STATE="broken"; V_REASON="path exists but is not a directory"; return
+    [[ -e "$REPO_DIR" ]] || { V_STATE="absent"; return 0; }
+    if [[ -z "$(ls -A "$REPO_DIR" 2>/dev/null)" ]]; then rmdir "$REPO_DIR" 2>/dev/null || true; V_STATE="absent"; return 0; fi
+    if ! git_in "$REPO_DIR" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+        V_STATE="broken"; V_REASON="not a complete git checkout (interrupted clone)"; return 0
     fi
-    if [[ -z "$(ls -A "$REPO_DIR" 2>/dev/null)" ]]; then
-        rmdir "$REPO_DIR" 2>/dev/null || true
-        V_STATE="absent"; return
-    fi
-    if ! git_in "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-        V_STATE="broken"
-        V_REASON="directory has contents but is not a git repo (interrupted clone)"
-        return
-    fi
-    local missing=() f
-    for f in app.py cli.py llm_analysis.py nlp_analysis.py data_worker.py \
-             database.py requirements.txt; do
-        [[ -f "${REPO_DIR}/${f}" ]] || missing+=("$f")
-    done
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        V_STATE="broken"; V_REASON="incomplete checkout, missing: ${missing[*]}"; return
+    # An interrupted checkout leaves tracked files missing; an upstream rename does not, so no rebuild loop.
+    if git_in "$REPO_DIR" status --porcelain 2>/dev/null | grep -q '^.D'; then
+        V_STATE="broken"; V_REASON="tracked files are missing from the checkout"; return 0
     fi
     V_STATE="healthy"
 }
-
-destroy_repo() {
-    preserve_user_data "$REPO_DIR"
-    run rm -rf "$REPO_DIR"
-}
-
+destroy_repo() { preserve_user_data "$REPO_DIR"; run rm -rf "$REPO_DIR"; }
 create_repo() {
-    if ! run git clone "$REPO_URL" "$REPO_DIR"; then
-        err "git clone failed."
-        err "On CentOS 7, an old git/curl/NSS stack sometimes cannot negotiate"
-        err "TLS with GitHub. If the error mentions SSL, TLS or 'gnutls', try:"
-        err "    git config --global http.sslVersion tlsv1.2"
-        err "and re-run. If it mentions authentication, check that the repo is"
-        err "still public."
-        return 1
-    fi
+    run git clone "$REPO_URL" "$REPO_DIR" || die "git clone failed. On an old TLS stack try: git config --global http.sslVersion tlsv1.2"
+    restore_user_data "$REPO_DIR"
 }
-
 update_repo() {
-    log "Fetching latest commits ..."
-    if ! git_in "$REPO_DIR" diff --quiet 2>/dev/null; then
-        warn "Working tree has local modifications; skipping pull to preserve them."
-        warn "Review with: cd ${REPO_DIR} && git status"
-        return 0
-    fi
-    run git_in "$REPO_DIR" fetch --all --prune
-    git_in "$REPO_DIR" pull --ff-only || warn "Fast-forward pull declined; leaving checkout as-is."
+    if ! git_in "$REPO_DIR" diff --quiet 2>/dev/null; then warn "[repo] local modifications present; not pulling"; return 0; fi
+    git_in "$REPO_DIR" pull --ff-only --quiet 2>&1 | sed 's/^/         /' \
+        || warn "[repo] pull failed (offline or diverged); keeping the current checkout"
 }
 
 # --- venv --------------------------------------------------------------------
 verify_venv() {
-    if [[ ! -e "$VENV_DIR" ]]; then V_STATE="absent"; return; fi
-    if [[ -z "$(ls -A "$VENV_DIR" 2>/dev/null)" ]]; then
-        rmdir "$VENV_DIR" 2>/dev/null || true
-        V_STATE="absent"; return
-    fi
-    if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
-        V_STATE="broken"; V_REASON="no usable bin/python (interrupted creation)"; return
-    fi
-    if ! "${VENV_DIR}/bin/python" -c 'import sys' >/dev/null 2>&1; then
-        V_STATE="broken"
-        V_REASON="bin/python will not execute (base interpreter moved, or module unloaded)"
-        return
-    fi
+    [[ -e "$VENV_DIR" ]] || { V_STATE="absent"; return 0; }
     local have
-    have="$("${VENV_DIR}/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
-    if [[ -n "$PYTHON_VER" && "$have" != "$PYTHON_VER" ]]; then
-        V_STATE="broken"
-        V_REASON="built against Python ${have} but ${PYTHON_VER} is selected now"
-        return
+    if ! have="$("${VENV_DIR}/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)"; then
+        V_STATE="broken"; V_REASON="bin/python does not run (interrupted creation, or base interpreter gone)"; return 0
     fi
+    if [[ -n "$PYTHON_VER" && "$have" != "$PYTHON_VER" ]]; then
+        V_STATE="broken"; V_REASON="built on Python ${have}, but ${PYTHON_VER} is selected now"; return 0
+    fi
+    [[ -r "${VENV_DIR}/bin/activate" ]] || { V_STATE="broken"; V_REASON="incomplete (no bin/activate)"; return 0; }
     V_STATE="healthy"
 }
-
 destroy_venv() { run rm -rf "$VENV_DIR"; }
 create_venv()  { run "$PYTHON_BIN" -m venv "$VENV_DIR"; }
 
 # --- container image ---------------------------------------------------------
+# Pulled to a .partial name and renamed on success, so an existing file is a
+# complete one. `apptainer sif list` parses the header without mounting or
+# executing anything, which keeps this check safe on a login node. The image
+# reference it was pulled from is recorded next to it; a different OLLAMA_IMAGE
+# means a re-pull, except offline, where the existing image is kept with a warning.
 verify_sif() {
-    if [[ ! -e "$SIF_PATH" ]]; then V_STATE="absent"; return; fi
-    if [[ ! -s "$SIF_PATH" ]]; then
-        V_STATE="broken"; V_REASON="file is zero bytes"; return
+    local pulled
+    [[ -e "$SIF_PATH" ]] || { V_STATE="absent"; return 0; }
+    if [[ "$(stat -c %s "$SIF_PATH")" -lt 104857600 ]] || ! apptainer sif list "$SIF_PATH" >/dev/null 2>&1; then
+        V_STATE="broken"; V_REASON="not a valid SIF image"; return 0
     fi
-    if ! apptainer exec "$SIF_PATH" ollama --version >/dev/null 2>&1; then
-        V_STATE="broken"
-        V_REASON="image will not execute (truncated or corrupt download)"
-        return
+    pulled="$(cat "$SIF_IMAGE_STAMP" 2>/dev/null || true)"
+    if [[ "$pulled" != "$OLLAMA_IMAGE" ]]; then
+        if [[ "$HAVE_NET" -eq 1 ]]; then
+            V_STATE="broken"; V_REASON="pulled from ${pulled:-an unrecorded image}, but ${OLLAMA_IMAGE} is selected"; return 0
+        fi
+        warn "[sif] pulled from ${pulled:-an unrecorded image}, not ${OLLAMA_IMAGE}; offline, so using it as it is"
     fi
     V_STATE="healthy"
 }
-
-destroy_sif() {
-    run rm -f "$SIF_PATH"
-    # A corrupt cached layer will otherwise be reused and reproduce the problem.
-    log "Clearing the Apptainer layer cache so the pull genuinely re-downloads."
-    apptainer cache clean --force >/dev/null 2>&1 || true
-}
-
-create_sif() {
-    log "Pulling ${CONTAINER_URI} (~2 GB, then SquashFS conversion). A few minutes."
-    run apptainer pull "$SIF_PATH" "$CONTAINER_URI"
-}
-
-# =============================================================================
-#  Ollama helpers, shared by setup and --preflight
-# =============================================================================
-
-detect_gpu() {
-    NV_FLAG=""
-    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-        NV_FLAG="--nv"
-        log "GPU visible on this host; Apptainer gets --nv:"
-        nvidia-smi -L 2>/dev/null | sed 's/^/         /' || true
-    else
-        log "No GPU on this host. Inference will be CPU-only."
-    fi
-}
-
-# OLLAMA_MODELS must be set explicitly: the upstream image defaults to
-# /root/.ollama/models, but under Apptainer you are unprivileged, so that path
-# is not writable and Ollama fails with a confusing error.
-apptainer_ollama() {
-    apptainer exec ${NV_FLAG:+--nv} \
-        --bind "${MODELS_DIR}:/models" \
-        --env OLLAMA_MODELS=/models \
-        --env OLLAMA_HOST="$OLLAMA_HOST" \
-        --env OLLAMA_KEEP_ALIVE=-1 \
-        "$SIF_PATH" "$@"
-}
-
-pick_free_port() {
-    local py
-    py="$(command -v python || command -v python3)"
-    "$py" -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'
-}
-
-start_ollama_server() {
-    local port
-    port="$(pick_free_port)"
-    export OLLAMA_HOST="127.0.0.1:${port}"
-    log "Ollama will listen on ${OLLAMA_HOST} for this session."
-
-    OLLAMA_LOG="${ASSET_ROOT}/ollama-setup.log"
-    : > "$OLLAMA_LOG"
-
-    log "Starting Ollama server ..."
-    apptainer_ollama ollama serve >> "$OLLAMA_LOG" 2>&1 &
-    OLLAMA_PID=$!
-    log "pid ${OLLAMA_PID}, log ${OLLAMA_LOG}"
-
-    local i
-    for i in $(seq 1 60); do
-        if ! kill -0 "$OLLAMA_PID" 2>/dev/null; then
-            err "Ollama server died on startup. Log:"; cat "$OLLAMA_LOG"; return 1
-        fi
-        if curl -sf --max-time 3 "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
-            printf '\n'; ok "API responding after ~$((i * 2))s."; return 0
-        fi
-        printf '%s         ... waiting (%d/60)%s\r' "$C_DIM" "$i" "$C_RESET"
-        sleep 2
+destroy_sif() { run rm -f "$SIF_PATH" "$SIF_PARTIAL" "$SIF_IMAGE_STAMP"; apptainer cache clean --force >/dev/null 2>&1 || true; }
+# Apptainer 1.3 offers no way to pass mksquashfs options on pull, and the defaults
+# (every CPU, 25% of RAM) break the login-node cap. Apptainer resolves mksquashfs
+# through $PATH first unless apptainer.conf pins "mksquashfs path", so a wrapper
+# that appends the caps does the job. Sets MKSQUASHFS_WRAP to the wrapper dir, or "".
+MKSQUASHFS_WRAP=""
+make_mksquashfs_wrapper() {
+    local real="" d conf
+    MKSQUASHFS_WRAP=""
+    for d in "$PATH" /usr/sbin /sbin /usr/local/sbin /usr/local/bin /usr/bin /bin; do
+        real="$(PATH="$d" command -v mksquashfs 2>/dev/null || true)"
+        [[ -z "$real" ]] || break
     done
-    printf '\n'
-    err "Server never became ready. Log:"; cat "$OLLAMA_LOG"
+    if [[ -z "$real" ]]; then warn "[sif] mksquashfs not found; the pull will use Apptainer's default, uncapped"; return 0; fi
+    conf="$(apptainer buildcfg 2>/dev/null | sed -n 's/^APPTAINER_CONF_FILE=//p')"
+    if [[ -r "$conf" ]] && grep -qE '^[[:space:]]*mksquashfs path[[:space:]]*=[[:space:]]*[^[:space:]]' "$conf"; then
+        warn "[sif] apptainer.conf pins mksquashfs; its CPU and memory use cannot be capped here"; return 0
+    fi
+    mkdir -p "${ASSET_ROOT}/bin"
+    printf '#!/bin/bash\n# generated by setup.sh: cap mksquashfs for the login-node limits\nexec %q "$@" -processors %s -mem 2G\n' \
+        "$real" "${NSLOTS:-1}" > "${ASSET_ROOT}/bin/mksquashfs"
+    chmod +x "${ASSET_ROOT}/bin/mksquashfs"
+    MKSQUASHFS_WRAP="${ASSET_ROOT}/bin"
+}
+create_sif() {
+    rm -f "$SIF_PARTIAL"
+    make_mksquashfs_wrapper
+    log "[sif] pulling ${OLLAMA_IMAGE} (a few GB; mksquashfs capped to ${NSLOTS:-1} thread(s), allow several minutes)"
+    PATH="${MKSQUASHFS_WRAP:+${MKSQUASHFS_WRAP}:}${PATH}" run apptainer pull "$SIF_PARTIAL" "$OLLAMA_IMAGE"
+    mv "$SIF_PARTIAL" "$SIF_PATH"
+    printf '%s\n' "$OLLAMA_IMAGE" > "$SIF_IMAGE_STAMP"
+}
+version_gt() { [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" == "$1" ]]; }
+# The Ollama version of the image on disk, from the tag it was pulled under
+# (ollama/ollama:0.24.0 -> 0.24.0). Empty for "latest", a digest, or no record.
+refresh_sif_ollama() {
+    local ref re=':v?([0-9]+\.[0-9]+\.[0-9]+)(-[A-Za-z0-9.]+)?$'
+    ref="$(cat "$SIF_IMAGE_STAMP" 2>/dev/null || true)"
+    SIF_OLLAMA=""
+    if [[ "$ref" =~ $re ]]; then SIF_OLLAMA="${BASH_REMATCH[1]}"; fi
+}
+
+# --- model -------------------------------------------------------------------
+# Fetched with curl straight from the registry into Ollama's own on-disk layout
+# (manifests/<host>/<ns>/<name>/<tag> plus blobs/sha256-<hex>), so no Ollama
+# process ever runs on the login node. The manifest is written last: its
+# presence means every blob is complete. Downloads resume after interruption.
+# Names parse as Ollama does: medgemma:27b is registry.ollama.ai/library/medgemma:27b,
+# and hf.co/<user>/<repo>:<quant> is served by Hugging Face over the same protocol.
+model_parts() {
+    local ref="${MODEL%%:*}"
+    M_TAG="${MODEL#*:}"; [[ "$M_TAG" != "$MODEL" ]] || M_TAG="latest"
+    M_HOST="registry.ollama.ai"; M_NS="library"; M_NAME="$ref"
+    case "$ref" in
+        */*/*) M_HOST="${ref%%/*}"; ref="${ref#*/}"; M_NS="${ref%/*}"; M_NAME="${ref##*/}" ;;
+        */*)   M_NS="${ref%/*}"; M_NAME="${ref##*/}" ;;
+    esac
+    MANIFEST="${MODELS_DIR}/manifests/${M_HOST}/${M_NS}/${M_NAME}/${M_TAG}"
+}
+# A model's config blob may name the oldest Ollama that runs it ("requires"). The
+# registry enforces that on `ollama pull`, but curl bypasses the check and Ollama
+# 0.24.0 does not repeat it on load, so it is checked here against the image.
+config_requires() {   # config_requires CONFIG_BLOB: prints the "requires" version, or nothing
+    local py
+    py="$(command -v "${VENV_DIR}/bin/python" || command -v python3)" || return 0
+    "$py" -I -c 'import json, sys; print(json.load(open(sys.argv[1])).get("requires", ""))' "$1" 2>/dev/null || true
+}
+requires_verified() {   # requires_verified NAME: NAME is listed in REQUIRES_VERIFIED
+    local m
+    for m in $REQUIRES_VERIFIED; do [[ "$m" != "$1" ]] || return 0; done
     return 1
 }
-
-# Report where the model actually got loaded. If this says CPU when you asked
-# for a GPU, the run will be an order of magnitude slower than you planned.
-report_model_placement() {
-    log "Model placement (PROCESSOR column is the one that matters):"
-    apptainer_ollama ollama ps 2>/dev/null | sed 's/^/         /' || \
-        warn "ollama ps unavailable in this image version."
+model_fits_ollama() {   # model_fits_ollama CONFIG_BLOB [NAME]: false only when the config requires a newer
+    local name="${2-$MODEL}"   # Ollama than the image and NAME (default MODEL) is not known to load anyway; sets M_REQUIRES
+    M_REQUIRES="$(config_requires "$1")"
+    if [[ -n "$SIF_OLLAMA" && -n "$M_REQUIRES" ]] && version_gt "$M_REQUIRES" "$SIF_OLLAMA"; then
+        if [[ -n "$name" ]] && requires_verified "$name"; then
+            log "[model] ${name}: its config says it requires Ollama ${M_REQUIRES}, but it is known to load on ${SIF_OLLAMA} (NLP_REQUIRES_VERIFIED)"
+            return 0
+        fi
+        return 1
+    fi
+    return 0
+}
+manifest_blobs() {   # prints "<digest> <size>" per blob (config first); prints nothing for a bad manifest
+    local py
+    py="$(command -v "${VENV_DIR}/bin/python" || command -v python3)" || return 0   # not `python`: 2.7 on CentOS 7
+    "$py" -I - "$1" <<'PY' 2>/dev/null || true
+import json, sys
+m = json.load(open(sys.argv[1]))
+for b in [m["config"]] + m["layers"]:
+    print(b["digest"], b["size"])
+PY
+}
+verify_model() {
+    [[ -n "$MODEL" ]] || { V_STATE="absent"; V_REASON="model name unknown until the repo exists"; return 0; }
+    model_parts
+    [[ -f "$MANIFEST" ]] || { V_STATE="absent"; return 0; }
+    local d s f n=0
+    while read -r d s; do
+        f="${MODELS_DIR}/blobs/${d/:/-}"
+        if [[ ! -f "$f" || "$(stat -c %s "$f")" != "$s" ]]; then
+            V_STATE="broken"; V_REASON="blob ${d:7:12} missing or truncated"; return 0
+        fi
+        n=$((n + 1))
+    done < <(manifest_blobs "$MANIFEST")
+    if [[ "$n" -eq 0 ]]; then V_STATE="broken"; V_REASON="manifest unreadable (or no python to parse it)"; return 0; fi
+    read -r d s < <(manifest_blobs "$MANIFEST")
+    if ! model_fits_ollama "${MODELS_DIR}/blobs/${d/:/-}"; then
+        V_STATE="broken"; V_REASON="requires Ollama ${M_REQUIRES}, the image has ${SIF_OLLAMA}"; return 0
+    fi
+    V_STATE="healthy"
+}
+verify_models() {   # every model in MODELS; V_STATE is the worst state found and V_REASON names the model
+    local m state="healthy" reason=""
+    [[ ${#MODELS[@]} -gt 0 ]] || { V_STATE="absent"; V_REASON="model names unknown until the repo exists"; return 0; }
+    for m in "${MODELS[@]}"; do
+        MODEL="$m"; V_STATE="absent"; V_REASON=""; verify_model
+        case "$V_STATE" in
+            broken) state="broken"; reason="${m}: ${V_REASON}"; break ;;
+            absent) if [[ "$state" == "healthy" ]]; then state="absent"; reason="${m} is not in the store"; fi ;;
+        esac
+    done
+    MODEL="${MODELS[0]}"; V_STATE="$state"; V_REASON="$reason"
+}
+destroy_model() {
+    model_parts
+    rm -f "$MANIFEST" "${MANIFEST}.partial"
+    # Blobs are kept: create_model only fetches what is missing or short. --force model wipes
+    # them once, before the models are fetched (section 5), since the models share the store.
+}
+create_model() {
+    [[ -n "$MODEL" ]] || die "Cannot tell which model to fetch: LOCAL_MODEL not found in llm_analysis.py. Set MODEL=name:tag."
+    model_parts
+    local base="https://${M_HOST}/v2/${M_NS}/${M_NAME}" tmp="${MANIFEST}.partial" d s total=0 count=0
+    mkdir -p "${MANIFEST%/*}" "${MODELS_DIR}/blobs"
+    curl -fsSL --retry 3 --max-time 120 -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+         -o "$tmp" "${base}/manifests/${M_TAG}" \
+        || die "${M_HOST} has no '${MODEL}' (or it is gated). Check LOCAL_MODEL in llm_analysis.py (or MODEL=...)."
+    while read -r d s; do total=$((total + s)); count=$((count + 1)); done < <(manifest_blobs "$tmp")
+    [[ "$count" -gt 0 ]] || die "Unreadable manifest for ${MODEL} (left at ${tmp})."
+    # The config blob is a few hundred bytes: check it before committing to gigabytes.
+    read -r d s < <(manifest_blobs "$tmp")
+    fetch_blob "${base}/blobs/${d}" "${MODELS_DIR}/blobs/${d/:/-}" "$s" "${d#sha256:}"
+    if ! model_fits_ollama "${MODELS_DIR}/blobs/${d/:/-}"; then
+        rm -f "$tmp"
+        die "${MODEL} requires Ollama ${M_REQUIRES}, but the image has ${SIF_OLLAMA} (the last release that uses Argon's driver-535 GPUs is ${OLLAMA_DRIVER535_MAX}). Pick a build without that requirement in llm_analysis.py (LOCAL_MODEL or the MODELS block), e.g. a GGUF from hf.co; if it is known to load on the image anyway, list it in NLP_REQUIRES_VERIFIED."
+    fi
+    log "[model] ${MODEL}: ${count} blobs, $((total / 1048576)) MB, into ${MODELS_DIR}"
+    while read -r d s; do
+        fetch_blob "${base}/blobs/${d}" "${MODELS_DIR}/blobs/${d/:/-}" "$s" "${d#sha256:}"
+    done < <(manifest_blobs "$tmp")
+    mv "$tmp" "$MANIFEST"
+}
+fetch_blob() {   # fetch_blob URL DEST SIZE SHA256: single-threaded curl, resumable, checksummed, retried
+    local url="$1" dest="$2" size="$3" sha="$4" part="$2.partial" attempt have t
+    if [[ -f "$dest" && "$(stat -c %s "$dest")" -eq "$size" ]]; then return 0; fi
+    log "[model] blob ${sha:0:12} ($((size / 1048576)) MB)"
+    for attempt in 1 2 3 4 5; do
+        have="$(stat -c %s "$part" 2>/dev/null || echo 0)"
+        if [[ "$have" -gt "$size" ]]; then rm -f "$part"; have=0; fi
+        if [[ "$have" -lt "$size" ]]; then
+            curl -fsSL "${CURL_NET[@]}" -C - -o "$part" "$url" </dev/null & CURL_PID=$!
+            t=0
+            while kill -0 "$CURL_PID" 2>/dev/null; do
+                sleep 2; t=$((t + 2))
+                if (( t % 30 == 0 )); then
+                    printf '         %6d / %d MB\n' "$(( $(stat -c %s "$part" 2>/dev/null || echo 0) / 1048576 ))" "$((size / 1048576))"
+                fi
+            done
+            if ! wait "$CURL_PID"; then
+                CURL_PID=""; warn "[model] download interrupted (attempt ${attempt}/5); resuming in 10 s"; sleep 10; continue
+            fi
+            CURL_PID=""
+        fi
+        [[ "$(stat -c %s "$part" 2>/dev/null || echo 0)" -eq "$size" ]] || continue
+        log "[model] verifying sha256 of ${sha:0:12}"
+        if [[ "$(sha256sum "$part" | cut -d' ' -f1)" == "$sha" ]]; then mv "$part" "$dest"; return 0; fi
+        warn "[model] checksum mismatch on ${sha:0:12} (attempt ${attempt}/5); downloading it again"
+        rm -f "$part"
+    done
+    die "[model] blob ${sha:0:12} could not be downloaded intact after 5 attempts. Re-run to try again."
+}
+# Any stored model, not only the repo's, that needs a newer Ollama than the image
+# loses its manifest here; prune_model_store then drops the blobs nothing else uses.
+remove_incompatible_models() {
+    local mf d s m
+    local -a own=()
+    if [[ -z "$SIF_OLLAMA" ]]; then
+        log "[model] the image's Ollama version is unknown (no version tag); stored models not checked against it"; return 0
+    fi
+    for m in ${MODELS[@]+"${MODELS[@]}"}; do MODEL="$m"; model_parts; own+=("$MANIFEST"); done   # the repo's models: verify_model judges them
+    MODEL="${MODELS[0]:-}"
+    while IFS= read -r mf; do
+        for m in ${own[@]+"${own[@]}"}; do [[ "$mf" != "$m" && "$mf" != "${m}.partial" ]] || continue 2; done
+        d=""; read -r d s < <(manifest_blobs "$mf") || true
+        [[ -n "$d" && -f "${MODELS_DIR}/blobs/${d/:/-}" ]] || continue   # unreadable or incomplete: verify_model handles the ones in use
+        if ! model_fits_ollama "${MODELS_DIR}/blobs/${d/:/-}" ""; then
+            warn "[model] removing ${mf#"${MODELS_DIR}/manifests/"}: requires Ollama ${M_REQUIRES}, the image has ${SIF_OLLAMA}"
+            run rm -f "$mf"
+        fi
+    done < <(find "${MODELS_DIR}/manifests" -type f 2>/dev/null)   # .partial too: it pins blobs
+    find "${MODELS_DIR}/manifests" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+}
+prune_model_store() {   # blobs no manifest references any more, left behind by a model change
+    local referenced f n=0
+    referenced="$(find "${MODELS_DIR}/manifests" -type f -exec cat {} + 2>/dev/null | grep -oE 'sha256:[0-9a-f]{64}' | tr ':' '-' | sort -u || true)"
+    [[ -n "$referenced" ]] || return 0
+    shopt -s nullglob
+    for f in "${MODELS_DIR}"/blobs/sha256-*; do
+        if [[ "$f" != *.partial ]] && ! grep -qx "$(basename "$f")" <<< "$referenced"; then rm -f "$f"; n=$((n + 1)); fi
+    done
+    shopt -u nullglob
+    [[ "$n" -eq 0 ]] || log "[model] pruned ${n} blob(s) that no manifest references"
 }
 
-# =============================================================================
-#  Preflight harness
-# =============================================================================
-
+# ----------------------------------------------------------------------------- generated: preflight
 write_preflight_script() {
-    PREFLIGHT_PY="${PROJECT_ROOT}/nlp-preflight.py"
-    cat > "$PREFLIGHT_PY" <<'PREFLIGHT_PY_EOF'
+    atomic_write "$PREFLIGHT_PY" <<'PREFLIGHT_EOF'
 #!/usr/bin/env python
+"""nlp-preflight.py -- generated by setup.sh, do not hand-edit.
+
+data_worker.py catches every LLM exception per note, records llm_failed=1 and
+keeps going, so a dead endpoint or a wrong model never crashes a run; it just
+makes the run worthless. This script fails loudly up front instead.
+
+  --tier 0   static checks only: imports, model names, every model's blobs on
+             disk, writable dirs. No inference, no Ollama process. Safe anywhere.
+  --tier 1   tier 0 plus live calls through llm_analysis() for every model,
+             against the server at OLLAMA_HOST, with schema and extraction
+             checks. Compute nodes.
 """
-nlp-preflight.py  --  generated by setup_nlp_study.sh, do not hand-edit.
-
-Fails fast on anything that would make `python app.py --analyze` quietly
-produce a table full of llm_failed=1 rows several hours from now.
-
-data_worker.py catches every LLM exception per note, records llm_failed=1
-and moves on. A misconfigured endpoint, a renamed model or a model that
-will not emit schema-clean JSON therefore does NOT stop the run -- it
-just makes the run worthless. This script front-loads that discovery.
-
-It imports the repo exactly as shipped. It changes nothing.
-
-Tiers:
-  --tier 0   static checks only. No inference. Safe on a login node.
-  --tier 1   tier 0 plus real llm_analysis() calls on a synthetic note.
-             Needs a compute node.
-"""
-
 import argparse
+import csv
 import json
 import os
+import shutil
 import signal
 import sys
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Synthetic note. Entirely fabricated, contains no PHI, and is written to
-# exercise every field in llm_analysis.EXPECTED_FIELDS.
-# ---------------------------------------------------------------------------
-SYNTHETIC_NOTE = """PROCEDURE NOTE
+# Fabricated, PHI-free note that exercises every field in llm_analysis.EXPECTED_FIELDS.
+NOTE = """PROCEDURE NOTE
 
 Indication: Dyspepsia with suspected celiac disease.
 
@@ -611,1314 +558,811 @@ No colonoscopy was performed during this encounter.
 The attending physician was assisted by a gastroenterology fellow
 throughout the procedure.
 """
+HARD = {"Endoscopy": 1, "Colonoscopy": 0}      # unambiguous in the note: a miss is a failure
+SOFT = {"DuodenalBiopsiesTaken": 1, "NumberOfDuodenalBiopsies": 4, "FellowPresent": 1}
 
-# What a correct extraction looks like. 'hard' entries abort the run;
-# 'soft' entries only warn, because phrasing sensitivity is expected.
-HARD_EXPECT = {
-    "Endoscopy": 1,
-    "Colonoscopy": 0,
-}
-SOFT_EXPECT = {
-    "DuodenalBiopsiesTaken": 1,
-    "NumberOfDuodenalBiopsies": 4,
-    "FellowPresent": 1,
-}
-
-C = {
-    "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m",
-    "green": "\033[32m", "yellow": "\033[33m", "red": "\033[31m",
-    "cyan": "\033[36m",
-}
-if not sys.stdout.isatty():
-    C = {k: "" for k in C}
-
-FAILURES = []
-WARNINGS = []
+COLOR = sys.stdout.isatty() or os.environ.get("NLP_COLOR") == "1"
+FAILS, WARNS = [], []
 
 
-def ok(msg):
-    print(f"{C['green']}  PASS  {msg}{C['reset']}")
-
-
-def warn(msg):
-    WARNINGS.append(msg)
-    print(f"{C['yellow']}  WARN  {msg}{C['reset']}")
-
-
-def fail(msg, hint=None):
-    FAILURES.append(msg)
-    print(f"{C['red']}  FAIL  {msg}{C['reset']}")
-    if hint:
-        for line in hint.strip().splitlines():
-            print(f"{C['dim']}        {line}{C['reset']}")
+def paint(code, text):
+    return f"\033[{code}m{text}\033[0m" if COLOR else text
 
 
 def head(msg):
-    print(f"\n{C['bold']}{C['cyan']}-- {msg}{C['reset']}")
+    print(paint("1;36", f"\n-- {msg}"))
 
 
-class PreflightTimeout(Exception):
-    pass
+def ok(msg):
+    print(paint("32", f"  PASS  {msg}"))
 
 
-def _alarm(signum, frame):
-    raise PreflightTimeout("preflight call exceeded its time budget")
+def warn(msg):
+    WARNS.append(msg)
+    print(paint("33", f"  WARN  {msg}"))
 
 
-# ===========================================================================
-# Tier 0 -- static checks. No inference. Cheap enough for a login node.
-# ===========================================================================
-def tier0(repo: Path, expected_model: str):
-    head("Repo imports")
+def fail(msg, hint=""):
+    FAILS.append(msg)
+    print(paint("31", f"  FAIL  {msg}"))
+    for line in hint.splitlines():
+        print(paint("2", f"        {line}"))
 
+
+class Timeout(BaseException):
+    """BaseException so llm_analysis()'s `except Exception` cannot swallow it."""
+
+
+def split_model(model):
+    ref, _, tag = model.partition(":")
+    parts = ref.split("/")
+    host = parts.pop(0) if len(parts) > 2 else "registry.ollama.ai"
+    name = parts.pop()
+    return host, "/".join(parts) or "library", name, tag or "latest"
+
+
+def http_json(url, timeout=10):
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def count_notes(repo, fits=None):
+    """(rows in notes.csv, rows whose note does not fit the context window); fits is
+    llm_analysis.note_fits_context, or None to skip the second count."""
+    path = repo / "notes.csv"
+    if not path.is_file():
+        return 0, 0
+    csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
+    total = too_long = 0
+    with path.open(newline="", encoding="utf-8-sig", errors="replace") as fh:
+        reader = csv.reader(fh)
+        header = next(reader, None) or []
+        # The same matching as database.match_csv_columns: any case, spaces, underscores and
+        # dashes ignored, "note_text" and "text" accepted for Note.
+        normalized = ["".join(ch for ch in name.lower() if ch.isalnum()) for name in header]
+        col = next((i for i, name in enumerate(normalized) if name in ("note", "notetext", "text")), None)
+        for row in reader:
+            total += 1
+            if fits and col is not None and col < len(row) and not fits(row[col]):
+                too_long += 1
+    return total, too_long
+
+
+def tier0(repo, models, models_dir):
+    head("Imports")
     sys.path.insert(0, str(repo))
     mods = {}
-    for name in ("llm_analysis", "nlp_analysis", "data_worker", "database", "cli"):
+    for name in ("llm_analysis", "data_worker", "database", "cli"):
         try:
             mods[name] = __import__(name)
             ok(f"import {name}")
-        except Exception as e:
-            fail(f"import {name}: {type(e).__name__}: {e}",
-                 "A dependency is missing from the venv, or the repo moved.\n"
-                 "Re-run the setup script without --preflight to repair it.")
+        except Exception as exc:
+            fail(f"import {name}: {type(exc).__name__}: {exc}",
+                 "A dependency is missing or the repo changed. Re-run setup.sh (without --preflight).")
             return None
-
-    for name in ("ollama", "spacy", "rich", "click"):
+    for name in ("ollama", "rich"):
         try:
             __import__(name)
-            try:
-                from importlib.metadata import version as _ver
-                v = _ver(name)
-            except Exception:
-                v = "?"
-            ok(f"import {name} ({v})")
-        except Exception as e:
-            fail(f"import {name}: {e}")
+            ok(f"import {name}")
+        except Exception as exc:
+            fail(f"import {name}: {exc}")
 
-    head("Model name agreement")
-
-    local_model = getattr(mods["llm_analysis"], "LOCAL_MODEL", None)
-    if local_model is None:
-        fail("llm_analysis.LOCAL_MODEL is gone",
-             "The repo changed shape. The setup script can no longer tell\n"
-             "which model to pull. Inspect llm_analysis.py by hand.")
-    elif local_model != expected_model:
-        fail(f"model drift: llm_analysis.LOCAL_MODEL is {local_model!r}, "
-             f"setup pulled {expected_model!r}",
-             f"The repo was updated to a different model. Re-run:\n"
-             f"    MODEL={local_model} ./setup_nlp_study.sh --force model\n"
-             f"and update MODEL at the top of the setup script.")
+    head("Models")
+    llm = mods["llm_analysis"]
+    local = getattr(llm, "LOCAL_MODEL", None)
+    repo_models = [spec.name for spec in getattr(llm, "MODELS", ())] or [local]
+    if local == models[0]:
+        ok(f"llm_analysis.LOCAL_MODEL == {models[0]!r}")
     else:
-        ok(f"llm_analysis.LOCAL_MODEL == {local_model!r}")
-
-    head("Ollama endpoint")
-
-    host = os.environ.get("OLLAMA_HOST")
-    if not host:
-        fail("OLLAMA_HOST is not set",
-             "llm_analysis.py calls the module-level ollama client, which reads\n"
-             "OLLAMA_HOST when `import ollama` runs. Export it before python starts.")
-        return None
-    ok(f"OLLAMA_HOST = {host}")
-
-    base = host if host.startswith("http") else f"http://{host}"
-    try:
-        with urllib.request.urlopen(f"{base}/api/tags", timeout=10) as r:
-            tags = json.loads(r.read().decode())
-    except Exception as e:
-        fail(f"cannot reach {base}/api/tags: {e}",
-             "The server is not running, or is on a different port.\n"
-             "In a job this means every note records llm_failed=1 and the\n"
-             "run completes 'successfully' with no LLM data at all.")
-        return None
-    ok(f"{base}/api/tags responded")
-
-    names = [m.get("name", "") for m in tags.get("models", [])]
-    target = local_model or expected_model
-    if target in names:
-        ok(f"model {target!r} is registered with this server")
+        fail(f"llm_analysis.LOCAL_MODEL is {local!r} but setup fetched {models[0]!r}",
+             "Re-run setup.sh: it reads LOCAL_MODEL and fetches whatever the repo asks for.")
+    if repo_models == list(models):
+        ok(f"llm_analysis.MODELS names {len(models)} model(s): {', '.join(models)}")
     else:
-        fail(f"model {target!r} not served here (has: {names or 'nothing'})",
-             "OLLAMA_MODELS is probably pointing somewhere other than the\n"
-             "directory the model was pulled into.")
-
-    head("Client wiring")
-
-    # llm_analysis uses the module-level default client, not an explicit one.
-    # Confirm that client actually resolved to our host.
-    try:
-        import ollama
-        client_host = getattr(getattr(ollama, "_client", None), "_client", None)
-        client_host = getattr(client_host, "base_url", None)
-        if client_host is None:
-            warn("could not introspect the default ollama client host "
-                 "(client internals differ in this version); relying on /api/tags above")
-        else:
-            ch = str(client_host).rstrip("/")
-            if ch.endswith(base.rstrip("/").split("//")[-1]) or base.rstrip("/") in ch:
-                ok(f"default ollama client points at {ch}")
+        fail(f"llm_analysis.MODELS names {repo_models} but setup fetched {list(models)}",
+             "Re-run setup.sh: it reads the MODELS block and fetches every model the repo asks for.")
+    for model in models:
+        host, ns, name, tag = split_model(model)
+        manifest = models_dir / "manifests" / host / ns / name / tag
+        try:
+            data = json.loads(manifest.read_text())
+            blobs = [data["config"]] + data["layers"]
+            bad = []
+            for blob in blobs:
+                path = models_dir / "blobs" / blob["digest"].replace(":", "-")
+                if not path.is_file() or path.stat().st_size != blob["size"]:
+                    bad.append(blob["digest"][7:19])
+            if bad:
+                fail(f"{model}: model blobs missing or truncated: {bad}", "Re-run setup.sh; it resumes the download.")
             else:
-                fail(f"default ollama client points at {ch}, not {base}",
-                     "OLLAMA_HOST was changed after `import ollama`. Export it first.")
-    except Exception as e:
-        warn(f"client introspection skipped: {e}")
+                ok(f"{model}: model store complete, {len(blobs)} blobs under {models_dir}")
+        except Exception as exc:
+            fail(f"{model}: no usable manifest at {manifest}: {exc}", "Re-run setup.sh to fetch the model.")
 
     head("Filesystem")
-
-    for target_dir, label in ((repo, "repo (sqlite db lands here)"),
-                              (repo / "output", "output/ (csv exports land here)")):
+    for path, what in ((repo, "data.db"), (repo / "output", "csv exports")):
         try:
-            target_dir.mkdir(parents=True, exist_ok=True)
-            probe = target_dir / ".preflight-probe"
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".preflight-probe"
             probe.write_text("x")
             probe.unlink()
-            ok(f"writable: {target_dir}  {C['dim']}{label}{C['reset']}")
-        except Exception as e:
-            fail(f"not writable: {target_dir} ({e})",
-                 "app.py creates data.db in the cwd and exports into output/.")
+            ok(f"writable: {path} ({what})")
+        except Exception as exc:
+            fail(f"not writable: {path} ({exc})")
 
+    head("Context window")
+    llm = mods["llm_analysis"]
+    ctx = getattr(llm, "CONTEXT_LENGTH", None)
+    fits = getattr(llm, "note_fits_context", None)
+    if ctx is None or fits is None:
+        warn("llm_analysis has no CONTEXT_LENGTH / note_fits_context; the repo is older than this preflight")
+    else:
+        source = "from NLP_CONTEXT_LENGTH" if os.environ.get("NLP_CONTEXT_LENGTH") else "the default"
+        try:
+            cut = int((ctx - llm.ANSWER_RESERVE_TOKENS - llm.PROMPT_OVERHEAD_TOKENS) * llm.NOTE_CHARS_PER_TOKEN)
+            ok(f"num_ctx {ctx} ({source}); notes over about {cut:,} characters are failed without a model call")
+        except AttributeError:
+            ok(f"num_ctx {ctx} ({source})")
+        total, too_long = count_notes(repo, fits)
+        if total and too_long:
+            warn(f"notes.csv: {too_long} of {total} notes exceed the cut and will be recorded as failed "
+                 "(LLM_Attempts 0). Expected at 8192 (about 2% of the corpus); a larger window only "
+                 "helps on a GPU with room for the bigger KV cache, which the A10 does not have with medgemma:27b")
+        elif total:
+            ok(f"notes.csv: all {total} notes fit the context window")
     return mods
 
 
-# ===========================================================================
-# Tier 1 -- real inference through the repo's own code path.
-# ===========================================================================
-def tier1(mods, reps: int, budget: int, note_estimate: int):
-    head(f"Live extraction ({reps} rep(s), {budget}s budget each)")
-
-    llm_analysis = mods["llm_analysis"]
-    fn = llm_analysis.llm_analysis
-    LLMAnalysisError = llm_analysis.LLMAnalysisError
-
-    timings = []
-    parsed = None
-    raw = None
-    clean_json_first_try = 0
-
-    for i in range(1, reps + 1):
-        signal.signal(signal.SIGALRM, _alarm)
-        signal.alarm(budget)
-        t0 = time.time()
-        try:
-            parsed, raw = fn(-1, SYNTHETIC_NOTE)
-            dt = time.time() - t0
-            timings.append(dt)
-            ok(f"rep {i}/{reps}: schema-valid JSON in {dt:.1f}s")
-            if raw.strip().startswith("{") and raw.strip().endswith("}"):
-                clean_json_first_try += 1
-        except PreflightTimeout:
-            fail(f"rep {i}/{reps}: no response within {budget}s",
-                 "This is the hang you hit before. Either the model is running\n"
-                 "on CPU when you expected a GPU, or it is emitting a very long\n"
-                 "reasoning trace. Check the PROCESSOR column in `ollama ps`.")
-            return
-        except LLMAnalysisError as e:
-            msg = str(e)
-            dt = time.time() - t0
-            if "exceeded its time budget" in msg:
-                fail(f"rep {i}/{reps}: no response within {budget}s",
-                     "Same as above: check `ollama ps` for CPU vs GPU placement.")
-                return
-            fail(f"rep {i}/{reps}: {msg}  ({dt:.1f}s)",
-                 "This exact exception is what data_worker.py swallows per note.\n"
-                 "In a real run it becomes llm_failed=1 and the job keeps going.")
-            if raw is not None:
-                print(f"{C['dim']}        raw head: {raw[:300]!r}{C['reset']}")
-            return
-        except Exception as e:
-            fail(f"rep {i}/{reps}: unexpected {type(e).__name__}: {e}")
-            return
-        finally:
-            signal.alarm(0)
-
-    head("Extraction quality on the synthetic note")
-
-    for field, want in HARD_EXPECT.items():
-        got = parsed.get(field)
-        if got == want:
-            ok(f"{field} == {want}")
+def placement(base, want_ctx=None):
+    """Where the loaded model sits (GPU/CPU, including its KV cache) and the context it was
+    loaded with, which must not be smaller than the num_ctx the repo asks for."""
+    head("Model placement")
+    try:
+        loaded = http_json(f"{base}/api/ps").get("models", [])
+    except Exception as exc:
+        warn(f"/api/ps unavailable: {exc}")
+        return
+    if not loaded:
+        warn("no model is loaded; the call never reached the model")
+    for entry in loaded:
+        size, vram = entry.get("size", 0), entry.get("size_vram", 0)
+        pct = 100 * vram // size if size else 0
+        loaded_ctx = entry.get("context_length")
+        desc = f"{entry.get('name')}: {pct}% on GPU ({vram / 1e9:.1f} of {size / 1e9:.1f} GB, KV cache included)"
+        if loaded_ctx:
+            desc += f", context {loaded_ctx}"
+        if pct == 100:
+            ok(desc)
+        elif vram == 0 and not shutil.which("nvidia-smi"):
+            ok(desc + ", CPU-only node")
         else:
-            fail(f"{field} == {got!r}, expected {want}",
-                 "This case is unambiguous in the note text. A model that gets it\n"
-                 "wrong here will misclassify the real corpus. Do not submit.")
+            warn(desc + "; partly or fully on CPU, expect it to be slow. The KV cache grows with the "
+                 "context window: a lower NLP_CONTEXT_LENGTH may bring the model back onto the GPU")
+        if loaded_ctx and want_ctx and loaded_ctx < want_ctx:
+            fail(f"loaded context {loaded_ctx} is smaller than the num_ctx {want_ctx} the repo asks for",
+                 "Prompts longer than the loaded context are truncated silently (the system prompt is lost). "
+                 "Check the Ollama version and OLLAMA_CONTEXT_LENGTH.")
 
-    for field, want in SOFT_EXPECT.items():
-        got = parsed.get(field)
-        if got == want:
-            ok(f"{field} == {want}")
+
+def tier1(mods, models, reps, budget, notes):
+    head("Ollama endpoint")
+    host = os.environ.get("OLLAMA_HOST", "")
+    if not host:
+        fail("OLLAMA_HOST is not set", "Start the server (nlp_start_ollama) before running python.")
+        return
+    base = host if host.startswith("http") else f"http://{host}"
+    try:
+        served = [m.get("name") for m in http_json(f"{base}/api/tags").get("models", [])]
+    except Exception as exc:
+        fail(f"cannot reach {base}/api/tags: {exc}", "In a job this means every note records llm_failed=1.")
+        return
+    ok(f"{base}/api/tags responded")
+    missing = [m for m in models if m not in served and f"{m}:latest" not in served]
+    if missing:
+        fail(f"{missing} not served (server has: {served or 'nothing'})",
+             "OLLAMA_MODELS inside the container does not point at the fetched blobs.")
+        return
+    ok(f"served: {', '.join(models)}")
+    try:
+        import ollama
+        url = str(ollama._client._client.base_url).rstrip("/")
+        if host.split("//")[-1].rstrip("/") in url:
+            ok(f"ollama default client -> {url}")
         else:
-            warn(f"{field} == {got!r}, expected {want} "
-                 f"(phrasing-sensitive; review before trusting the run)")
+            fail(f"ollama default client -> {url}, not {base}", "OLLAMA_HOST was set after `import ollama`.")
+            return
+    except Exception as exc:
+        warn(f"could not introspect the ollama client ({exc}); relying on /api/tags")
 
-    scope = parsed.get("ScopeType")
-    if scope and "H190" in str(scope):
-        ok(f"ScopeType == {scope!r}")
-    else:
-        warn(f"ScopeType == {scope!r}, expected something like 'Olympus H190'")
+    llm = mods["llm_analysis"]
+    specs = {spec.name: spec for spec in getattr(llm, "MODELS", ())}
 
-    head("Cost projection")
+    def on_alarm(*_):
+        raise Timeout()
 
-    if raw.strip().startswith("{"):
-        ok("raw output is bare JSON; the repair layer is not being exercised")
-    else:
-        warn("raw output is not bare JSON, so parse_json_with_repair is doing work")
-        warn("data_worker retries up to 5x per note on JSON errors; each retry is "
-             "a full generation, so this can multiply runtime by 5")
-        print(f"{C['dim']}        raw head: {raw.strip()[:200]!r}{C['reset']}")
-
-    if clean_json_first_try < reps:
-        warn(f"only {clean_json_first_try}/{reps} reps returned bare JSON "
-             f"(inconsistent formatting across calls)")
-
-    avg = sum(timings) / len(timings)
-    spread = max(timings) - min(timings)
-    print(f"\n        per-note latency : {avg:.1f}s avg, "
-          f"{min(timings):.1f}-{max(timings):.1f}s range")
-    if spread > avg:
-        warn("latency spread exceeds the mean; the node is likely contended")
-
-    for n in (100, 1000, note_estimate):
-        if n <= 0:
+    signal.signal(signal.SIGALRM, on_alarm)
+    per_note = {}
+    for model in models:
+        spec = specs.get(model, model)   # the ModelSpec carries the model's window and think setting
+        head(f"Live extraction with {model}: {reps} call(s) through llm_analysis(), {budget}s budget each")
+        times, parsed, raw = [], None, None
+        for i in range(1, reps + 1):
+            start = time.time()
+            signal.alarm(budget)
+            try:
+                parsed, raw = llm.llm_analysis(-1, NOTE, spec)
+            except Timeout:
+                fail(f"{model} call {i}: no response within {budget}s",
+                     "Model on CPU instead of GPU, or a very long output. See placement below.")
+                break
+            except llm.LLMAnalysisError as exc:
+                fail(f"{model} call {i}: {exc}", "Exactly what data_worker.py swallows per note as llm_failed=1.")
+                break
+            except Exception as exc:
+                fail(f"{model} call {i}: unexpected {type(exc).__name__}: {exc}")
+                break
+            finally:
+                signal.alarm(0)
+            times.append(time.time() - start)
+            ok(f"{model} call {i}: schema-valid JSON in {times[-1]:.1f}s")
+        placement(base, getattr(spec, "num_ctx", None) or getattr(llm, "CONTEXT_LENGTH", None))
+        if len(times) < reps:
             continue
-        hrs = avg * n / 3600.0
-        print(f"        {n:>6} notes    ~{hrs:6.1f} h  "
-              f"{C['dim']}(single-threaded, no retries){C['reset']}")
-    print()
 
-    if avg > 60:
-        warn("over a minute per note. Request a GPU queue, or expect a very "
-             "long h_rt. See the notes in the generated job script.")
+        head(f"Extraction quality on the synthetic note ({model})")
+        for field, want in HARD.items():
+            if parsed.get(field) == want:
+                ok(f"{field} == {want}")
+            else:
+                fail(f"{model}: {field} == {parsed.get(field)!r}, expected {want}",
+                     "Unambiguous in the note text; a model that misses it will misclassify the corpus.")
+        for field, want in SOFT.items():
+            if parsed.get(field) == want:
+                ok(f"{field} == {want}")
+            else:
+                warn(f"{model}: {field} == {parsed.get(field)!r}, expected {want} (phrasing-sensitive; review before trusting the run)")
+        scope = parsed.get("ScopeType")
+        report = ok if scope and "H190" in str(scope) else warn
+        report(f"ScopeType == {scope!r} (expected something like 'Olympus H190')")
+        if not raw.strip().startswith("{"):
+            warn(f"{model}: output is not bare JSON, so the repair layer is doing work; data_worker retries up to 5x per note on invalid or unusable output")
+        per_note[model] = sum(times) / len(times)
+        print(f"        {per_note[model]:.1f}s per note (range {min(times):.1f}-{max(times):.1f}s)")
 
+    if per_note:
+        head("Throughput")
+        total = sum(per_note.values())
+        for model, avg in per_note.items():
+            print(f"        {avg:6.1f}s per note  {model}")
+        if len(per_note) > 1:
+            print(f"        {total:6.1f}s per note over all {len(per_note)} models")
+        for n in (100, 1000, notes):
+            if n > 0:
+                print(f"        {n:>6} notes  ~{total * n / 3600:6.1f} h  (single-threaded, no retries, every model)")
+        if total > 60:
+            warn("over a minute per note across the models: use a GPU queue (NLP_JOB_QUEUE=UI-GPU NLP_JOB_GPU=1) or a longer NLP_JOB_HRT")
 
 def main():
-    p = argparse.ArgumentParser(description="Fail-fast preflight for nlp-study.")
-    p.add_argument("--repo", required=True, type=Path)
-    p.add_argument("--model", required=True)
-    p.add_argument("--tier", type=int, default=1, choices=(0, 1))
-    p.add_argument("--reps", type=int,
-                   default=int(os.environ.get("NLP_PREFLIGHT_REPS", "3")))
-    p.add_argument("--budget", type=int,
-                   default=int(os.environ.get("NLP_PREFLIGHT_BUDGET", "600")))
-    p.add_argument("--notes", type=int,
-                   default=int(os.environ.get("NLP_NOTE_ESTIMATE", "0")),
-                   help="row count in notes.csv, for the runtime projection")
-    args = p.parse_args()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repo", required=True, type=Path)
+    ap.add_argument("--model", action="append", dest="models", required=True, metavar="NAME",
+                    help="a model the program calls; repeat for each, in run order")
+    ap.add_argument("--models-dir", required=True, type=Path)
+    ap.add_argument("--tier", type=int, default=1, choices=(0, 1))
+    ap.add_argument("--reps", type=int, default=int(os.environ.get("NLP_PREFLIGHT_REPS", "3")))
+    ap.add_argument("--budget", type=int, default=int(os.environ.get("NLP_PREFLIGHT_BUDGET", "600")))
+    ap.add_argument("--notes", type=int, default=0, help="rows in notes.csv, for the projection (default: counted)")
+    args = ap.parse_args()
+    print(paint("1", f"nlp-study preflight, tier {args.tier}: repo={args.repo} models={' '.join(args.models)}"))
 
-    print(f"{C['bold']}nlp-study preflight  (tier {args.tier}){C['reset']}")
-    print(f"{C['dim']}repo={args.repo}  model={args.model}{C['reset']}")
+    mods = tier0(args.repo, args.models, args.models_dir)
+    if args.tier >= 1 and mods and not FAILS:
+        tier1(mods, args.models, args.reps, args.budget, args.notes or count_notes(args.repo)[0])
 
-    mods = tier0(args.repo, args.model)
-
-    if FAILURES:
-        summarise(args.tier)
-        return 1
-
-    if args.tier >= 1 and mods is not None:
-        tier1(mods, args.reps, args.budget, args.notes)
-
-    return summarise(args.tier)
-
-
-def summarise(tier):
     print()
-    if FAILURES:
-        print(f"{C['red']}{C['bold']}PREFLIGHT FAILED "
-              f"({len(FAILURES)} problem(s)){C['reset']}")
-        for f in FAILURES:
-            print(f"{C['red']}  - {f}{C['reset']}")
-        print(f"\n{C['bold']}Do not submit the job. Every one of these becomes a "
-              f"silent llm_failed=1{C['reset']}")
-        print(f"{C['bold']}row rather than a crash, so the run would waste its "
-              f"full walltime.{C['reset']}\n")
+    if FAILS:
+        print(paint("1;31", f"PREFLIGHT FAILED ({len(FAILS)} problem(s))"))
+        for msg in FAILS:
+            print(paint("31", f"  - {msg}"))
+        print("Do not submit the job: each of these becomes a silent llm_failed=1 row, not a crash.")
         return 1
-
-    if WARNINGS:
-        print(f"{C['yellow']}{C['bold']}PREFLIGHT PASSED with "
-              f"{len(WARNINGS)} warning(s){C['reset']}")
-    else:
-        print(f"{C['green']}{C['bold']}PREFLIGHT PASSED{C['reset']}")
-
-    if tier == 0:
-        print(f"{C['dim']}Static checks only. The model has not actually been "
-              f"run. Re-check on a compute node.{C['reset']}")
-    print()
+    print(paint("1;32", "PREFLIGHT PASSED") + (paint("33", f" with {len(WARNS)} warning(s)") if WARNS else ""))
+    if args.tier == 0:
+        print(paint("2", "Static checks only; the model has not been run. Repeat inside qlogin: setup.sh (or setup.sh --preflight)"))
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
-PREFLIGHT_PY_EOF
-    chmod +x "$PREFLIGHT_PY"
+PREFLIGHT_EOF
     ok "Wrote ${PREFLIGHT_PY}"
 }
 
-# Project real runtime rather than a round number, when notes.csv is staged.
-# Only the row count is read; no note content is touched.
-estimate_note_count() {
-    if [[ -z "${NLP_NOTE_ESTIMATE:-}" && -f "${REPO_DIR}/notes.csv" ]]; then
-        local lines
-        lines="$(wc -l < "${REPO_DIR}/notes.csv" 2>/dev/null || echo 1)"
-        NLP_NOTE_ESTIMATE="$(( lines > 1 ? lines - 1 : 0 ))"
-        log "notes.csv is staged: ${NLP_NOTE_ESTIMATE} rows, used for the projection."
-    fi
-    export NLP_NOTE_ESTIMATE="${NLP_NOTE_ESTIMATE:-0}"
-}
-
-run_preflight() {
-    local tier="$1"
-    estimate_note_count
-    python "$PREFLIGHT_PY" \
-        --repo "$REPO_DIR" \
-        --model "$MODEL" \
-        --tier "$tier"
-}
-
-# =============================================================================
-# 0. Environment report
-# =============================================================================
-section "0. Environment report"
-
-NODE_KIND="$(node_kind)"
-
-log "Started $(date)   mode=${MODE}   force='${FORCE_LIST#,}'"
-log "Transcript: ${SETUP_LOG}"
-printf '\n'
-printf '  HawkID            : %s\n' "$HAWKID"
-printf '  Hostname          : %s\n' "$(hostname)"
-printf '  Node kind         : %s\n' "$NODE_KIND"
-printf '  SGE JOB_ID        : %s\n' "${JOB_ID:-<none>}"
-printf '  OS                : %s\n' "$(cat /etc/redhat-release 2>/dev/null || echo unknown)"
-printf '  Kernel            : %s\n' "$(uname -r)"
-printf '  Bash              : %s\n' "$BASH_VERSION"
-printf '  System glibc      : %s\n' "$(ldd --version 2>/dev/null | head -1)"
-printf '  HOME              : %s\n' "$HOME"
-printf '\n'
-
-case "$NODE_KIND" in
-    login)
-        if [[ "$MODE" == "setup" ]]; then
-            ok "Running on a login node — correct for building (needs internet)."
-        else
-            warn "Running on a login node. Inference is capped at one logical CPU"
-            warn "and 16G here, so tier 1 of the preflight will be refused."
-        fi ;;
-    job)
-        ok "Inside an SGE allocation (JOB_ID=${JOB_ID:-?}) — inference is allowed."
-        if [[ "$MODE" == "setup" ]]; then
-            warn "Building from inside a job: compute nodes often lack outbound"
-            warn "internet, so the clone/pull steps may fail. Build on a login node."
-        fi ;;
-    compute)
-        warn "Not a login node and no SGE variables set. Proceeding, but if this"
-        warn "is an unscheduled host you may be taking resources you were not given."
-        if [[ "$MODE" == "setup" ]]; then
-            warn "Press Ctrl-C within 10 seconds to abort."
-            sleep 10
-        fi ;;
-esac
-
-if [[ "$MODE" == "setup" ]]; then
-    log "The glibc above is why we do not use Ollama's install.sh: the upstream"
-    log "binary needs GLIBC_2.27+ and will not start on CentOS 7 (glibc 2.17)."
-fi
-
-# =============================================================================
-# 1. Prerequisite checks
-# =============================================================================
-section "1. Prerequisite checks"
-
-for cmd in git curl apptainer; do
-    if command -v "$cmd" >/dev/null 2>&1; then
-        ok "$(printf '%-10s' "$cmd") -> $(command -v "$cmd")"
+# ----------------------------------------------------------------------------- generated: env + job scripts
+# The env script is the single definition of how Ollama is started and stopped;
+# the job script, --preflight and interactive qlogin sessions all source it.
+write_runtime_scripts() {
+    local gpu_directives
+    if [[ -n "${NLP_JOB_GPU:-}" ]]; then
+        gpu_directives='#$ -l ngpus=1'$'\n''# To pin a card type add "#$ -l <complex>" (see qconf -sc); the preflight reports whether the model landed on the GPU.'
+        [[ "$JOB_QUEUE" == *GPU* || "$JOB_QUEUE" == "all.q" ]] \
+            || warn "NLP_JOB_GPU=1 but queue '${JOB_QUEUE}' has no GPUs; the job would never start. Use NLP_JOB_QUEUE=UI-GPU."
     else
-        die "Required command '$cmd' not found on PATH."
-    fi
-done
-log "Apptainer version: $(apptainer --version 2>&1)"
-log "git version: $(git --version 2>&1)"
-
-# Informational only: the script never uses `git -C`, but knowing which side of
-# the 1.8.5 boundary you are on explains a lot of unrelated git advice online.
-if git -C / --version >/dev/null 2>&1; then
-    ok "git supports 'git -C' (>= 1.8.5)."
-else
-    warn "git predates 1.8.5, so 'git -C <path>' is unsupported on this host."
-    warn "This script uses subshell 'cd' instead and is unaffected."
-fi
-
-if [[ "$MODE" == "setup" ]]; then
-    log "Checking outbound network access ..."
-    if curl -sfI --max-time 20 https://github.com >/dev/null 2>&1; then
-        ok "Outbound HTTPS works."
-    else
-        die "Cannot reach https://github.com. Run this from a login node."
-    fi
-fi
-
-# =============================================================================
-# 2. Resolve scratch locations
-# =============================================================================
-section "2. Scratch filesystem layout"
-
-log "Scratch filesystems visible on $(hostname):"
-for fs in /scratch /nfsscratch /localscratch; do
-    if [[ -d "$fs" ]]; then
-        printf '  %-14s present   %s\n' "$fs" \
-            "$(df -h "$fs" 2>/dev/null | awk 'NR==2 {printf "%s avail of %s", $4, $2}')"
-    else
-        printf '  %-14s %sNOT MOUNTED on this host%s\n' "$fs" "$C_YELLOW" "$C_RESET"
-    fi
-done
-printf '\n'
-log "Mount table entries mentioning scratch:"
-grep -i scratch /proc/mounts | sed 's/^/         /' || printf '         (none)\n'
-printf '\n'
-
-# Existence is not usability: /scratch/Users is often root-owned with per-user
-# directories provisioned separately.
-probe_writable() {
-    local dir="$1"
-    [[ -d "$(dirname "$dir")" ]] || return 1
-    mkdir -p "$dir" 2>/dev/null || return 1
-    local probe="${dir}/.write-probe.$$"
-    touch "$probe" 2>/dev/null || return 1
-    rm -f "$probe" 2>/dev/null
-    return 0
-}
-
-resolve_scratch_roots() {
-    local fast_candidates=("/scratch/Users/${HAWKID}" "/nfsscratch/Users/${HAWKID}")
-    local bulk_candidates=("/nfsscratch/Users/${HAWKID}" "/scratch/Users/${HAWKID}")
-    local c
-
-    if [[ -n "${NLP_FAST_ROOT:-}" ]]; then
-        fast_candidates=("$NLP_FAST_ROOT"); log "NLP_FAST_ROOT override: ${NLP_FAST_ROOT}"
-    fi
-    if [[ -n "${NLP_BULK_ROOT:-}" ]]; then
-        bulk_candidates=("$NLP_BULK_ROOT"); log "NLP_BULK_ROOT override: ${NLP_BULK_ROOT}"
+        gpu_directives="# No GPU requested. For one, regenerate with: NLP_JOB_QUEUE=UI-GPU NLP_JOB_GPU=1 ${SELF}"
     fi
 
-    for c in "${fast_candidates[@]}"; do
-        if probe_writable "$c"; then PROJECT_ROOT="${c}/nlp-study"; break; fi
-        log "  not usable for repo/venv: ${c}"
-    done
-    for c in "${bulk_candidates[@]}"; do
-        if probe_writable "$c"; then ASSET_ROOT="${c}/nlp-study-assets"; break; fi
-        log "  not usable for image/models: ${c}"
-    done
-}
-
-log "Resolving usable scratch roots for HawkID '${HAWKID}' ..."
-resolve_scratch_roots
-
-if [[ -z "$PROJECT_ROOT" || -z "$ASSET_ROOT" ]]; then
-    err "No writable scratch directory found for '${HAWKID}'."
-    printf '\n'
-    err "You cannot mount these yourself; they are system mounts owned by ITS."
-    err "  1. Are you on a login node?   hostname"
-    err "  2. Does your directory exist?  ls -ld /nfsscratch/Users/${HAWKID}"
-    err "  3. If not, email research-computing@uiowa.edu."
-    err "  4. To use somewhere else entirely:"
-    err "       NLP_FAST_ROOT=/path NLP_BULK_ROOT=/path $0"
-    exit 1
-fi
-
-REPO_DIR="${PROJECT_ROOT}/repo"
-VENV_DIR="${PROJECT_ROOT}/venv"
-SIF_PATH="${ASSET_ROOT}/ollama.sif"
-MODELS_DIR="${ASSET_ROOT}/ollama-models"
-APPT_CACHE="${ASSET_ROOT}/apptainer-cache"
-APPT_TMP="${ASSET_ROOT}/apptainer-tmp"
-PREFLIGHT_PY="${PROJECT_ROOT}/nlp-preflight.py"
-
-ok "Repo + venv    -> ${PROJECT_ROOT}"
-ok "Image + models -> ${ASSET_ROOT}"
-
-mkdir -p "$PROJECT_ROOT" "$ASSET_ROOT" "$MODELS_DIR" "$APPT_CACHE" "$APPT_TMP" "$LOG_DIR"
-# NOTE: deliberately NOT creating REPO_DIR or VENV_DIR here. Pre-creating them
-# is what made the previous version fail on re-run: git clone refuses a
-# non-empty target. Their create_* functions own them.
-
-export APPTAINER_CACHEDIR="$APPT_CACHE"
-export APPTAINER_TMPDIR="$APPT_TMP"
-export SINGULARITY_CACHEDIR="$APPT_CACHE"
-export SINGULARITY_TMPDIR="$APPT_TMP"
-
-# Sweep leftover build scratch from an interrupted `apptainer pull`; these can
-# be several GB. Only touch entries older than an hour so a concurrent run of
-# this script is never disturbed.
-if [[ -d "$APPT_TMP" ]]; then
-    stale="$(find "$APPT_TMP" -mindepth 1 -maxdepth 1 -mmin +60 2>/dev/null | wc -l)"
-    if [[ "$stale" -gt 0 ]]; then
-        warn "Clearing ${stale} stale Apptainer build dir(s) from ${APPT_TMP}"
-        find "$APPT_TMP" -mindepth 1 -maxdepth 1 -mmin +60 -exec rm -rf {} + 2>/dev/null || true
-    fi
-fi
-
-# Kill orphaned servers from an earlier run that died without its EXIT trap.
-if [[ -n "$SIF_PATH" ]]; then
-    orphans="$(pgrep -u "$HAWKID" -f "$SIF_PATH" 2>/dev/null || true)"
-    if [[ -n "$orphans" ]]; then
-        warn "Found orphaned Ollama process(es) from a previous run: ${orphans//$'\n'/ }"
-        # shellcheck disable=SC2086
-        kill $orphans 2>/dev/null || true
-        sleep 2
-        ok "Orphans cleared."
-    fi
-fi
-
-# The model name is a property of the repo, so resolve it as soon as the repo
-# path is known and a checkout might already exist.
-detect_repo_model
-log "Model: ${MODEL}   (source: ${MODEL_SOURCE})"
-
-# =============================================================================
-#  --status
-# =============================================================================
-if [[ "$MODE" == "status" ]]; then
-    section "Resource status"
-    report() {
-        local name="$1" verify="$2" path="$3"
-        V_STATE="absent"; V_REASON=""
-        "$verify"
-        local colour="$C_YELLOW"
-        [[ "$V_STATE" == "healthy" ]] && colour="$C_GREEN"
-        [[ "$V_STATE" == "broken"  ]] && colour="$C_RED"
-        printf '  %-10s %s%-8s%s %s\n' "$name" "$colour" "$V_STATE" "$C_RESET" "$path"
-        [[ -n "$V_REASON" ]] && printf '             %sreason: %s%s\n' "$C_DIM" "$V_REASON" "$C_RESET"
-        return 0
-    }
-    report repo verify_repo "$REPO_DIR"
-    report venv verify_venv "$VENV_DIR"
-    report sif  verify_sif  "$SIF_PATH"
-    if [[ -d "$MODELS_DIR" ]] && [[ -n "$(ls -A "$MODELS_DIR" 2>/dev/null)" ]]; then
-        printf '  %-10s %s%-8s%s %s (%s)\n' model "$C_GREEN" present "$C_RESET" \
-            "$MODELS_DIR" "$(du -sh "$MODELS_DIR" 2>/dev/null | cut -f1)"
-    else
-        printf '  %-10s %s%-8s%s %s\n' model "$C_YELLOW" absent "$C_RESET" "$MODELS_DIR"
-    fi
-    if [[ -f "$PREFLIGHT_PY" ]]; then
-        printf '  %-10s %s%-8s%s %s\n' preflight "$C_GREEN" present "$C_RESET" "$PREFLIGHT_PY"
-    else
-        printf '  %-10s %s%-8s%s %s\n' preflight "$C_YELLOW" absent "$C_RESET" "$PREFLIGHT_PY"
-    fi
-    printf '\n'
-    printf '  model wanted by llm_analysis.py : %s (%s)\n' "$MODEL" "$MODEL_SOURCE"
-    printf '\n'
-    for f in "$JOB_SCRIPT" "$ENV_SCRIPT"; do
-        [[ -f "$f" ]] && ok "generated: $f" || warn "missing: $f"
-    done
-    printf '\n'
-    log "Re-run without --status to build or repair anything not healthy."
-    log "Run --preflight inside a qlogin session to prove the LLM actually works."
-    exit 0
-fi
-
-# =============================================================================
-#  --clean
-# =============================================================================
-if [[ "$MODE" == "clean" ]]; then
-    section "Removing all managed scratch resources"
-    printf '\nAbout to delete:\n  %s\n  %s\n\n' "$PROJECT_ROOT" "$ASSET_ROOT"
-    warn "User data (csv / db / output) will be moved to ${PROJECT_ROOT}/preserved first."
-    if [[ -z "$ASSUME_YES" ]]; then
-        if [[ -t 0 ]]; then
-            read -r -p "Type 'yes' to continue: " reply
-            [[ "$reply" == "yes" ]] || die "Aborted."
-        else
-            die "Refusing to clean non-interactively without --yes."
-        fi
-    fi
-    preserve_user_data "$REPO_DIR"
-    run rm -rf "$REPO_DIR" "$VENV_DIR" "$SIF_PATH" "$MODELS_DIR" "$APPT_CACHE" "$APPT_TMP"
-    rm -f "$PREFLIGHT_PY"
-    apptainer cache clean --force >/dev/null 2>&1 || true
-    ok "Scratch resources removed."
-    log "Left alone: ${JOB_SCRIPT}, ${ENV_SCRIPT}, ${LOG_DIR}/, and anything under"
-    log "            ${PROJECT_ROOT}/preserved/"
-    exit 0
-fi
-
-# =============================================================================
-#  --preflight
-# =============================================================================
-#  Checks an existing install and builds nothing. This is what you run inside
-#  a qlogin session after building on a login node.
-# -----------------------------------------------------------------------------
-if [[ "$MODE" == "preflight" ]]; then
-    section "Preflight on the existing install"
-
-    check_healthy() {
-        local name="$1" verify="$2"
-        V_STATE="absent"; V_REASON=""
-        "$verify"
-        if [[ "$V_STATE" != "healthy" ]]; then
-            err "[${name}] is ${V_STATE}${V_REASON:+ (${V_REASON})}."
-            err "Preflight builds nothing. Repair it from a login node first:"
-            err "    ./setup_nlp_study.sh"
-            exit 1
-        fi
-        ok "[${name}] healthy."
-    }
-
-    check_healthy repo verify_repo
-    check_healthy venv verify_venv
-    check_healthy sif  verify_sif
-
-    if [[ ! -d "$MODELS_DIR" || -z "$(ls -A "$MODELS_DIR" 2>/dev/null)" ]]; then
-        err "No model blobs in ${MODELS_DIR}."
-        err "Pull them from a login node first: ./setup_nlp_study.sh"
-        exit 1
-    fi
-    ok "[model] blobs present ($(du -sh "$MODELS_DIR" 2>/dev/null | cut -f1))."
-
-    # shellcheck disable=SC1091
-    source "${VENV_DIR}/bin/activate"
-    log "Interpreter: $(command -v python) ($(python --version 2>&1))"
-
-    write_preflight_script
-    detect_gpu
-
-    PREFLIGHT_TIER=1
-    if [[ "$NODE_KIND" == "login" && -z "${FORCE_SMOKE_TEST:-}" ]]; then
-        PREFLIGHT_TIER=0
-        warn "Login node: running tier 0 only. Tier 1 needs a compute node."
-    fi
-
-    start_ollama_server || exit 1
-
-    PREFLIGHT_RC=0
-    run_preflight "$PREFLIGHT_TIER" || PREFLIGHT_RC=$?
-
-    if [[ "$PREFLIGHT_TIER" -ge 1 ]]; then
-        report_model_placement
-    fi
-
-    stop_ollama
-
-    if [[ "$PREFLIGHT_RC" -ne 0 ]]; then
-        err "Preflight failed. Do not submit the job."
-        exit "$PREFLIGHT_RC"
-    fi
-
-    if [[ "$PREFLIGHT_TIER" -ge 1 ]]; then
-        printf '\n'
-        ok "Tier 1 passed on $(hostname). The LLM path works end to end."
-        log "Submit from a login node:"
-        log "    qsub ~/nlp-study.job --analyze --csv ./notes.csv"
-    else
-        printf '\n'
-        log "Tier 0 passed. Get onto a compute node and repeat:"
-        log "    qlogin -q ${JOB_QUEUE} -pe smp 8"
-        log "    $0 --preflight"
-    fi
-    exit 0
-fi
-
-# =============================================================================
-# 3. Repository
-# =============================================================================
-section "3. Repository: ${REPO_URL}"
-
-ensure_resource repo verify_repo destroy_repo create_repo
-
-# If we skipped because it was already healthy, still try to bring it current.
-if ! force_requested repo && [[ "$V_STATE" == "healthy" ]]; then
-    update_repo
-fi
-
-log "HEAD: $(git_in "$REPO_DIR" log -1 --format='%h %ad %s' --date=short)"
-log "Contents:"
-ls -la "$REPO_DIR" | sed 's/^/         /'
-
-# The checkout just changed under us (fresh clone, or a pull that could have
-# moved LOCAL_MODEL). Re-read it before anything downloads several GB.
-detect_repo_model
-ok "Model requested by the repo: ${MODEL}  (source: ${MODEL_SOURCE})"
-
-# =============================================================================
-# 4. Python interpreter
-# =============================================================================
-section "4. Locating a suitable Python interpreter"
-
-WANTED="3.12"
-if [[ -f "${REPO_DIR}/.python-version" ]]; then
-    raw="$(tr -d '[:space:]' < "${REPO_DIR}/.python-version")"
-    log ".python-version pins: ${raw}"
-    WANTED="$(printf '%s' "$raw" | cut -d. -f1,2)"
-else
-    warn "No .python-version file; defaulting to ${WANTED}"
-fi
-log "Target Python: ${WANTED}"
-
-if ! command -v module >/dev/null 2>&1; then
-    for init in /etc/profile.d/modules.sh /etc/profile.d/lmod.sh \
-                /usr/share/Modules/init/bash /usr/share/lmod/lmod/init/bash; do
-        if [[ -r "$init" ]]; then
-            set +u; . "$init" 2>/dev/null || true; set -u
-            break
-        fi
-    done
-fi
-
-if command -v module >/dev/null 2>&1; then
-    ok "Environment Modules available."
-    log "Python modules Argon offers:"
-    set +u
-    module avail python 2>&1 | sed 's/^/         /' | head -40 || true
-    for candidate in "py-${WANTED}" "python/${WANTED}" "python${WANTED}" \
-                     "python/3.12" "python/3.11" "python3"; do
-        if module load "$candidate" >/dev/null 2>&1; then
-            ok "module load ${candidate} -> succeeded"
-            break
-        fi
-    done
-    set -u
-else
-    warn "No 'module' command found; relying on PATH only."
-fi
-
-check_python() {
-    local cand="$1" v major minor
-    command -v "$cand" >/dev/null 2>&1 || return 1
-    v="$("$cand" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)" || return 1
-    major="${v%%.*}"; minor="${v##*.}"
-    [[ "$major" -eq 3 && "$minor" -ge 10 ]] || return 1
-    PYTHON_BIN="$(command -v "$cand")"
-    PYTHON_VER="$v"
-    return 0
-}
-
-log "Probing candidate interpreters ..."
-for cand in ${NLP_PYTHON:-} "python${WANTED}" python3.13 python3.12 python3.11 python3.10 python3; do
-    [[ -z "$cand" ]] && continue
-    if check_python "$cand"; then
-        ok "Selected ${PYTHON_BIN}  (Python ${PYTHON_VER})"
-        break
-    fi
-    log "  rejected: ${cand} ($(command -v "$cand" 2>/dev/null || echo 'not on PATH'))"
-done
-
-if [[ -z "$PYTHON_BIN" ]]; then
-    err "No Python >= 3.10 found. Load a module by hand and pass it explicitly:"
-    err "    module load python/3.12.5"
-    err "    NLP_PYTHON=\$(command -v python3.12) $0"
-    exit 1
-fi
-[[ "$PYTHON_VER" == "$WANTED" ]] || \
-    warn "Repo pins ${WANTED} but ${PYTHON_VER} selected; usually fine."
-
-# =============================================================================
-# 5. Virtual environment
-# =============================================================================
-section "5. Virtual environment"
-
-ensure_resource venv verify_venv destroy_venv create_venv
-
-# shellcheck disable=SC1091
-source "${VENV_DIR}/bin/activate"
-log "Interpreter : $(command -v python)  ($(python --version 2>&1))"
-
-# =============================================================================
-# 5b. Dependencies
-# =============================================================================
-section "5b. Dependencies"
-
-deps_satisfied() {
-    python - <<'PY' >/dev/null 2>&1
-import sys
-try:
-    from importlib.metadata import distribution
-    from packaging.requirements import Requirement
-except Exception:
-    sys.exit(1)
-import pathlib, os
-req_file = os.environ["REQ_FILE"]
-for line in pathlib.Path(req_file).read_text().splitlines():
-    line = line.split("#")[0].strip()
-    if not line or line.startswith("-"):
-        continue
-    try:
-        r = Requirement(line)
-        d = distribution(r.name)
-        if r.specifier and d.version not in r.specifier:
-            sys.exit(1)
-    except Exception:
-        sys.exit(1)
-sys.exit(0)
-PY
-}
-
-export REQ_FILE="${REPO_DIR}/requirements.txt"
-
-if ! force_requested deps && ! force_requested venv && deps_satisfied; then
-    ok "[deps] every requirement already satisfied — skipping pip."
-else
-    log "Upgrading pip toolchain ..."
-    run python -m pip install --upgrade pip setuptools wheel
-    log "pip version: $(python -m pip --version)"
-
-    log "Wheel platform tags pip accepts on this host:"
-    python -m pip debug --verbose 2>/dev/null \
-        | sed -n '/Compatible tags/,$p' \
-        | grep -E 'manylinux|linux_x86_64|Compatible tags' \
-        | head -15 | sed 's/^/         /' \
-        || warn "pip debug unavailable; continuing."
-
-    printf '%s         --- requirements.txt ---%s\n' "$C_DIM" "$C_RESET"
-    sed 's/^/         /' "$REQ_FILE"
-    printf '%s         ------------------------%s\n' "$C_DIM" "$C_RESET"
-
-    # ${VAR-default}, not ${VAR:-default}: PIP_INSTALL_ARGS="" means no flags.
-    IFS=' ' read -r -a PIP_ARGS <<< "${PIP_INSTALL_ARGS-$PIP_ARGS_DEFAULT}"
-
-    # Bash 4.2 (CentOS 7) errors on "${arr[@]}" for an empty array under set -u.
-    pip_install_requirements() {
-        if [[ ${#PIP_ARGS[@]} -gt 0 ]]; then
-            log "Extra pip flags: ${PIP_ARGS[*]}"
-            run python -m pip install "${PIP_ARGS[@]}" -r "$REQ_FILE"
-        else
-            warn "No extra pip flags set; source builds are permitted."
-            run python -m pip install -r "$REQ_FILE"
-        fi
-    }
-
-    if ! pip_install_requirements; then
-        err "pip install failed."
-        printf '\n'
-        if [[ " ${PIP_ARGS[*]:-} " == *" --only-binary=:all: "* ]]; then
-            err "Wheels-only mode is on, so this is almost certainly"
-            err "'Could not find a version that satisfies...' — no wheel exists"
-            err "for this platform. Identify the package:"
-            err "    source ${VENV_DIR}/bin/activate"
-            err "    pip download --only-binary=:all: --no-deps -d /tmp/wt <package>"
-            err ""
-            err "Then pick one:"
-            err "  - Pin an older version with a manylinux2014 wheel."
-            err "    spaCy is the usual culprit; try spacy==3.7.5."
-            err "  - Allow a source build for that one package:"
-            err "        pip install --no-binary <package> <package>"
-            err "    then re-run this script; finished work is skipped."
-            err "  - Move the dependency stack into a container, as Ollama is."
-        else
-            err "A source build likely failed. On CentOS 7 (GCC 4.8, glibc 2.17)"
-            err "most modern C-extension packages will not compile. Retry with:"
-            err "    PIP_INSTALL_ARGS='--only-binary=:all:' $0"
-        fi
-        exit 1
-    fi
-    ok "Dependencies installed."
-fi
-
-log "Installed packages:"
-python -m pip list --format=columns | sed 's/^/         /'
-
-# spaCy trained pipelines, if the repo loads any by name.
-#
-# As of this writing nlp_analysis.py uses spacy.blank("en") plus a sentencizer,
-# so nothing needs downloading. This block exists so that if the repo later
-# switches to spacy.load("en_core_web_sm"), setup notices on a login node
-# (where there is internet) rather than the job failing on a compute node
-# (where there usually is not).
-if python -c 'import spacy' 2>/dev/null; then
-    ok "spaCy imports cleanly ($(python -c 'import spacy; print(spacy.__version__)'))"
-    SPACY_MODELS="$(grep -rhoE "spacy\.load\(\s*[\"'][A-Za-z0-9_]+[\"']" "$REPO_DIR" \
-                      --include='*.py' 2>/dev/null \
-                    | grep -oE "[\"'][A-Za-z0-9_]+[\"']" | tr -d "\"'" | sort -u || true)"
-    if [[ -n "$SPACY_MODELS" ]]; then
-        for m in $SPACY_MODELS; do
-            if python -c "import ${m}" 2>/dev/null; then
-                ok "spaCy pipeline '${m}' already installed — skipping."
-            else
-                log "Repo calls spacy.load('${m}') -> downloading ..."
-                run python -m spacy download "$m"
-            fi
-        done
-    else
-        ok "No spacy.load('<name>') calls found; no trained pipeline needed."
-    fi
-else
-    warn "spaCy not importable. If nlp_analysis.py needs it, runs will fail."
-fi
-
-# =============================================================================
-# 6. Ollama container image
-# =============================================================================
-section "6. Ollama container image"
-
-ensure_resource sif verify_sif destroy_sif create_sif
-
-log "Image size: $(du -h "$SIF_PATH" | cut -f1)"
-log "Ollama version inside the container:"
-run apptainer exec "$SIF_PATH" ollama --version
-
-# =============================================================================
-# 7. Model
-# =============================================================================
-section "7. Model: ${MODEL}"
-
-detect_gpu
-
-if force_requested model; then
-    warn "[model] --force given: clearing ${MODELS_DIR}"
-    run rm -rf "${MODELS_DIR:?}"/*
-fi
-
-start_ollama_server || exit 1
-
-if apptainer_ollama ollama list 2>/dev/null | grep -q "^${MODEL}[[:space:]]"; then
-    ok "[model] ${MODEL} already present — skipping download."
-else
-    # Sizes for reference: gemma4:e2b is 5.12B parameters at Q4_K_M, about
-    # 7.2 GB on disk. The "e2b" is an on-device/effective label, NOT a
-    # 2-billion-parameter model, and it is a reasoning model that emits a
-    # thinking trace by default. Both facts matter for how long a note takes.
-    log "[model] pulling ${MODEL} into ${MODELS_DIR} ..."
-    log "        Expect several GB. An interrupted pull resumes where it stopped."
-    run apptainer_ollama ollama pull "$MODEL"
-    ok "[model] downloaded."
-fi
-
-log "Models available:"
-apptainer_ollama ollama list | sed 's/^/         /'
-log "Model store size: $(du -sh "$MODELS_DIR" | cut -f1)"
-
-# =============================================================================
-# 8. Preflight
-# =============================================================================
-section "8. Preflight: will app.py actually produce LLM results?"
-
-write_preflight_script
-
-PREFLIGHT_TIER=0
-PREFLIGHT_WHY=""
-
-if [[ -n "${SKIP_SMOKE_TEST:-}" ]]; then
-    PREFLIGHT_TIER=-1; PREFLIGHT_WHY="SKIP_SMOKE_TEST is set"
-elif [[ -n "${FORCE_SMOKE_TEST:-}" ]]; then
-    PREFLIGHT_TIER=1;  PREFLIGHT_WHY="FORCE_SMOKE_TEST is set"
-elif [[ "$NODE_KIND" == "login" ]]; then
-    PREFLIGHT_TIER=0;  PREFLIGHT_WHY="login node"
-else
-    PREFLIGHT_TIER=1;  PREFLIGHT_WHY="${NODE_KIND} node"
-fi
-
-log "Tier ${PREFLIGHT_TIER} selected (${PREFLIGHT_WHY})."
-
-if [[ "$PREFLIGHT_TIER" -lt 0 ]]; then
-    warn "Preflight skipped entirely. Nothing has verified that the LLM works."
-    warn "Run this before submitting anything:"
-    warn "    qlogin -q ${JOB_QUEUE} -pe smp 8"
-    warn "    $0 --preflight"
-else
-    if [[ "$PREFLIGHT_TIER" -eq 0 ]]; then
-        printf '\n'
-        warn "Tier 1 (real inference) is refused here on purpose."
-        warn ""
-        warn "Argon caps each user on a login node at 100% of ONE logical CPU"
-        warn "and 16G of memory, and kills the largest process past that limit."
-        warn "${MODEL} is a multi-billion-parameter reasoning model whose weights"
-        warn "alone are several GB. Asking it for one sentence under that cap is"
-        warn "what wedged the previous version of this script."
-        warn ""
-        warn "Everything that can be checked without generating a token will be."
-        printf '\n'
-    fi
-
-    PREFLIGHT_RC=0
-    run_preflight "$PREFLIGHT_TIER" || PREFLIGHT_RC=$?
-
-    if [[ "$PREFLIGHT_TIER" -ge 1 ]]; then
-        report_model_placement
-    fi
-
-    if [[ "$PREFLIGHT_RC" -ne 0 ]]; then
-        stop_ollama
-        printf '\n'
-        err "Preflight failed. The build is fine, but the pipeline would not"
-        err "produce usable LLM output, and data_worker.py would not tell you:"
-        err "it records llm_failed=1 per note and keeps going to the end."
-        err ""
-        err "Fix the failures above, then re-run. Nothing needs rebuilding;"
-        err "healthy resources are skipped."
-        exit 1
-    fi
-fi
-
-stop_ollama
-
-# =============================================================================
-# 9. Runtime scripts
-# =============================================================================
-section "9. Generating runtime scripts in \$HOME"
-
-write_generated() {
-    local target="$1" tmp="$1.tmp.$$"
-    cat > "$tmp"
-    if [[ -f "$target" ]] && ! cmp -s "$tmp" "$target"; then
-        local backup="${target}.bak.$(date +%Y%m%d-%H%M%S)"
-        cp "$target" "$backup"
-        warn "$(basename "$target") differed from the generated version."
-        warn "Your copy was backed up to $(basename "$backup")"
-    fi
-    mv "$tmp" "$target"
-    chmod +x "$target"
-    ok "Wrote ${target}"
-}
-
-write_generated "$ENV_SCRIPT" <<EOF
+    {
+        cat <<EOF
 #!/bin/bash
-# Generated by setup_nlp_study.sh on $(date)
-# Source in a qlogin session:  source ~/nlp-study-env.sh
-
+# Generated by setup.sh on $(date); regenerated on every setup run, do not hand-edit.
+# In a qlogin session:  source ${ENV_SCRIPT}
+export NLP_ENV_VERSION=${ENV_VERSION}
 export NLP_REPO_DIR="${REPO_DIR}"
 export NLP_VENV_DIR="${VENV_DIR}"
 export NLP_SIF="${SIF_PATH}"
 export NLP_MODELS_DIR="${MODELS_DIR}"
 export NLP_MODEL="${MODEL}"
+export NLP_MODELS="${MODELS[*]:-}"
 export NLP_PREFLIGHT="${PREFLIGHT_PY}"
-export APPTAINER_CACHEDIR="${APPT_CACHE}"
-export APPTAINER_TMPDIR="${APPT_TMP}"
+export NLP_LOG_DIR="${LOG_DIR}"
+export APPTAINER_CACHEDIR="${APPT_CACHE}" APPTAINER_TMPDIR="${APPT_TMP}"
+EOF
+        cat <<'EOF'
 
-export OLLAMA_HOST="127.0.0.1:\$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()' 2>/dev/null || echo 11434)"
+nlp_has_gpu() { command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; }
 
-nlp_gpu_flag() {
-    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-        echo "--nv"
-    fi
-}
-
+# Start a private Ollama server for this shell or job on a random port.
+# Refuses to run where the login-node limiter would kill it.
 nlp_start_ollama() {
-    apptainer exec \$(nlp_gpu_flag) \\
-        --bind "\${NLP_MODELS_DIR}:/models" \\
-        --env OLLAMA_MODELS=/models \\
-        --env OLLAMA_HOST="\$OLLAMA_HOST" \\
-        --env OLLAMA_KEEP_ALIVE=-1 \\
-        "\$NLP_SIF" ollama serve > "\${TMPDIR:-/tmp}/ollama-\$\$.log" 2>&1 &
-    export NLP_OLLAMA_PID=\$!
-    echo "Ollama starting on \$OLLAMA_HOST (pid \$NLP_OLLAMA_PID)"
-    for i in \$(seq 1 60); do
-        curl -sf --max-time 3 "http://\$OLLAMA_HOST/api/tags" >/dev/null 2>&1 && {
-            echo "Ollama ready."; return 0; }
+    case "$(hostname)" in
+        *login*) echo "nlp_start_ollama: refusing on a login node (1 CPU / 16 GB cap). Use qlogin." >&2; return 1 ;;
+    esac
+    if [ -z "${JOB_ID:-}${PE_HOSTFILE:-}${NLP_ALLOW_INFERENCE:-}" ]; then
+        echo "nlp_start_ollama: not inside an SGE job. Use qlogin/qsub, or NLP_ALLOW_INFERENCE=1 off-cluster." >&2
+        return 1
+    fi
+    if [ -n "${NLP_OLLAMA_PID:-}" ] && kill -0 "$NLP_OLLAMA_PID" 2>/dev/null; then
+        echo "Ollama already running on ${OLLAMA_HOST} (pid ${NLP_OLLAMA_PID})"; return 0
+    fi
+    local nv="" port
+    nlp_has_gpu && nv="--nv"
+    port="$(python -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')" || return 1
+    export OLLAMA_HOST="127.0.0.1:${port}"
+    NLP_OLLAMA_LOG="${NLP_LOG_DIR}/ollama-${JOB_ID:-$$}.log"
+    mkdir -p "$NLP_LOG_DIR"
+    apptainer exec ${nv:+--nv} --bind "${NLP_MODELS_DIR}:/models" \
+        --env OLLAMA_MODELS=/models --env OLLAMA_HOST="$OLLAMA_HOST" \
+        --env OLLAMA_KEEP_ALIVE=-1 --env OLLAMA_MAX_LOADED_MODELS=1 \
+        --env OLLAMA_CONTEXT_LENGTH="${NLP_CONTEXT_LENGTH:-8192}" \
+        "$NLP_SIF" ollama serve >"$NLP_OLLAMA_LOG" 2>&1 &
+    NLP_OLLAMA_PID=$!
+    echo "Ollama starting on ${OLLAMA_HOST} (pid ${NLP_OLLAMA_PID}, gpu: ${nv:-none}, context ${NLP_CONTEXT_LENGTH:-8192}, log ${NLP_OLLAMA_LOG})"
+    for _ in $(seq 1 90); do
+        if ! kill -0 "$NLP_OLLAMA_PID" 2>/dev/null; then
+            echo "Ollama died on startup; log follows:" >&2; cat "$NLP_OLLAMA_LOG" >&2; unset NLP_OLLAMA_PID; return 1
+        fi
+        if curl -sf --max-time 3 "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then echo "Ollama ready."; return 0; fi
         sleep 2
     done
-    echo "Ollama did not start. See \${TMPDIR:-/tmp}/ollama-\$\$.log" >&2
-    return 1
+    echo "Ollama not answering after 180 s; log tail:" >&2; tail -n 30 "$NLP_OLLAMA_LOG" >&2
+    nlp_stop_ollama; return 1
 }
 
 nlp_stop_ollama() {
-    [ -n "\${NLP_OLLAMA_PID:-}" ] && kill "\$NLP_OLLAMA_PID" 2>/dev/null
+    [ -n "${NLP_OLLAMA_PID:-}" ] || return 0
+    kill "$NLP_OLLAMA_PID" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$NLP_OLLAMA_PID" 2>/dev/null || break; sleep 1; done
+    kill -9 "$NLP_OLLAMA_PID" 2>/dev/null || true
+    wait "$NLP_OLLAMA_PID" 2>/dev/null || true
     unset NLP_OLLAMA_PID
 }
 
-# Prove the LLM path works before burning a real run on it.
+# nlp_preflight [0|1]: tier 1 (default) needs nlp_start_ollama first. Checks every model in NLP_MODELS.
 nlp_preflight() {
-    python "\$NLP_PREFLIGHT" --repo "\$NLP_REPO_DIR" --model "\$NLP_MODEL" --tier "\${1:-1}"
+    local m; local -a args=()
+    for m in $NLP_MODELS; do args+=(--model "$m"); done
+    python "$NLP_PREFLIGHT" --repo "$NLP_REPO_DIR" ${args[@]+"${args[@]}"} --models-dir "$NLP_MODELS_DIR" --tier "${1:-1}"
 }
 
-cd "\$NLP_REPO_DIR"
-source "\${NLP_VENV_DIR}/bin/activate"
-echo "Ready. Repo: \$NLP_REPO_DIR   Model: \$NLP_MODEL"
-echo "Run 'nlp_start_ollama', then 'nlp_preflight', then"
-echo "'python app.py --analyze --csv ./notes.csv'"
-EOF
-
-# GPU directives are opt-in because UI-GPU has its own queue wait. Requesting a
-# *-GPU queue sets ngpus=1 automatically, but pinning a card type matters here:
-# the weights need roughly 8-10 GB of VRAM once the KV cache is allocated, so a
-# K80 would silently fall back to CPU.
-JOB_GPU_DIRECTIVES=""
-if [[ -n "${NLP_JOB_GPU:-}" ]]; then
-    JOB_GPU_DIRECTIVES="#\$ -l ngpus=1
-#\$ -l gpu_p100"
-    log "Baking GPU directives into the job script (queue ${JOB_QUEUE})."
-    if [[ "$JOB_QUEUE" != *GPU* && "$JOB_QUEUE" != "all.q" ]]; then
-        warn "NLP_JOB_GPU=1 but the queue is '${JOB_QUEUE}', which has no GPU nodes."
-        warn "This job will sit pending forever. Regenerate with:"
-        warn "    NLP_JOB_QUEUE=UI-GPU NLP_JOB_GPU=1 $0"
-    fi
-else
-    JOB_GPU_DIRECTIVES="# No GPU requested. To use one, regenerate with:
-#     NLP_JOB_QUEUE=UI-GPU NLP_JOB_GPU=1 $0
-# or add by hand:   #\$ -l ngpus=1    and    #\$ -l gpu_p100"
+cd "$NLP_REPO_DIR" && . "${NLP_VENV_DIR}/bin/activate"
+if [ -z "${NLP_QUIET:-}" ]; then
+    echo "nlp-study ready: repo ${NLP_REPO_DIR}, models ${NLP_MODELS}"
+    echo "  nlp_start_ollama   then   nlp_preflight   then   python app.py --analyze --csv ./notes.csv"
 fi
+EOF
+    } | atomic_write "$ENV_SCRIPT"
+    ok "Wrote ${ENV_SCRIPT}"
 
-write_generated "$JOB_SCRIPT" <<EOF
+    {
+        cat <<EOF
 #!/bin/bash
-# Generated by setup_nlp_study.sh on $(date)
-# Submit from anywhere; arguments are forwarded to app.py:
-#     qsub ~/nlp-study.job --analyze --csv ./notes.csv
-#
-# This job runs the preflight BEFORE app.py and exits immediately if it
-# fails. That matters because data_worker.py swallows LLM errors per note:
-# without the gate, a broken endpoint or model produces a full-length run
-# whose LLM columns are all null, with a zero exit status.
-#
-# Set NLP_SKIP_PREFLIGHT=1 to bypass the gate (not recommended).
-#
+# Generated by setup.sh on $(date); regenerated on every setup run. Tune the directives
+# through NLP_JOB_QUEUE / NLP_JOB_SLOTS / NLP_JOB_HRT / NLP_JOB_GPU and re-run setup.sh.
+# Submit:  qsub ${JOB_SCRIPT} --analyze --csv ./notes.csv     (arguments go to app.py)
 #\$ -N nlp-study
 #\$ -q ${JOB_QUEUE}
-#\$ -pe smp 8
-#\$ -l h_rt=24:00:00
+#\$ -pe smp ${JOB_SLOTS}
+#\$ -l h_rt=${JOB_HRT}
 #\$ -j y
 #\$ -o ${LOG_DIR}/
 #\$ -m ea
-${JOB_GPU_DIRECTIVES}
+${gpu_directives}
+set -eo pipefail
+export NLP_QUIET=1
+. "${ENV_SCRIPT}"
+JOB_HRT_DEFAULT="${JOB_HRT}"
+EOF
+        cat <<'EOF'
+set -u
+job_started=$(date +%s)
+echo "nlp-study job ${JOB_ID:-?} on $(hostname), $(date); slots ${NSLOTS:-?}; models ${NLP_MODELS}; args: $*"
 
-set -euo pipefail
+# A job in a chain of resubmissions (qsub -hold_jid) that finds nothing left to do ends here,
+# before Ollama and the preflight. Skipped when the job ingests or cleans, or with NLP_ALWAYS_RUN=1.
+case " $* " in
+    *" --csv"*|*" --clean "*) ;;
+    *)
+        if [ -z "${NLP_ALWAYS_RUN:-}" ]; then
+            left=0; python app.py "$@" --work-left || left=$?
+            if [ "$left" -eq 4 ]; then echo "Nothing left to do; the job ends without starting Ollama."; exit 0; fi
+        fi ;;
+esac
 
-REPO_DIR="${REPO_DIR}"
-VENV_DIR="${VENV_DIR}"
-SIF="${SIF_PATH}"
-MODELS_DIR="${MODELS_DIR}"
-MODEL="${MODEL}"
-PREFLIGHT="${PREFLIGHT_PY}"
+# The walltime in seconds: this job's own h_rt (qstat, so a qsub -l h_rt=... override counts),
+# else the one setup.sh wrote into this script.
+nlp_hrt_seconds() {
+    local v h m s
+    v="$(qstat -j "${JOB_ID:-0}" 2>/dev/null | grep -o 'h_rt=[0-9:]*' | head -1 | cut -d= -f2)" || true
+    [ -n "$v" ] || v="$JOB_HRT_DEFAULT"
+    case "$v" in
+        *:*:*) IFS=: read -r h m s <<<"$v"; echo $(( 10#$h * 3600 + 10#$m * 60 + 10#$s )) ;;
+        *) echo "$v" ;;
+    esac
+}
 
-echo "=============================================================="
-echo " nlp-study job \${JOB_ID:-interactive}"
-echo " Node    : \$(hostname)"
-echo " Started : \$(date)"
-echo " Slots   : \${NSLOTS:-unknown}"
-echo " Model   : \$MODEL"
-echo " Args    : \$*"
-echo "=============================================================="
-
-cd "\$REPO_DIR"
-source "\${VENV_DIR}/bin/activate"
-echo "Python: \$(command -v python) (\$(python --version 2>&1))"
-
-PORT=\$(python -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
-export OLLAMA_HOST="127.0.0.1:\${PORT}"
-echo "Ollama endpoint: \$OLLAMA_HOST"
-
-GPU_FLAG=""
-if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-    GPU_FLAG="--nv"; echo "GPU detected:"; nvidia-smi -L
-else
-    echo "No GPU on this node; running \$MODEL on CPU."
+nlp_start_ollama
+trap nlp_stop_ollama EXIT
+if [ -z "${NLP_SKIP_PREFLIGHT:-}" ]; then
+    # Gate: one synthetic, PHI-free note through llm_analysis(). Without it a dead
+    # endpoint or wrong model produces a full-length run with every LLM column null.
+    NLP_PREFLIGHT_REPS="${NLP_PREFLIGHT_REPS:-1}" nlp_preflight 1 \
+        || { echo "Preflight failed; not starting app.py." >&2; exit 1; }
 fi
 
-apptainer exec \$GPU_FLAG \\
-    --bind "\${MODELS_DIR}:/models" \\
-    --env OLLAMA_MODELS=/models \\
-    --env OLLAMA_HOST="\$OLLAMA_HOST" \\
-    --env OLLAMA_KEEP_ALIVE=-1 \\
-    "\$SIF" ollama serve > "ollama-\${JOB_ID:-local}.log" 2>&1 &
-OLLAMA_PID=\$!
-trap 'kill \$OLLAMA_PID 2>/dev/null || true' EXIT
+# Stop starting notes NLP_STOP_MARGIN_MINUTES (default 45) before SGE's h_rt kill, so the job
+# finishes its note, rebuilds the consensus and releases the database cleanly. An exported
+# NLP_STOP_AFTER (app.py reads it) or a --stop-after argument (it comes later) takes precedence.
+stop_args=()
+if [ -z "${NLP_STOP_AFTER:-}" ]; then
+    left_s=$(( $(nlp_hrt_seconds) - ${NLP_STOP_MARGIN_MINUTES:-45} * 60 - ($(date +%s) - job_started) ))
+    [ "$left_s" -gt 60 ] || left_s=60
+    stop_args=(--stop-after "${left_s}s")
+fi
 
-echo "Waiting for Ollama (pid \$OLLAMA_PID) ..."
-READY=0
-for i in \$(seq 1 90); do
-    if ! kill -0 \$OLLAMA_PID 2>/dev/null; then
-        echo "Ollama died on startup:" >&2
-        cat "ollama-\${JOB_ID:-local}.log" >&2
+# app.py runs in the background so a TERM (eviction, qdel) reaching this script is passed on
+# and the script waits for app.py to stop cleanly instead of exiting under it.
+python app.py ${stop_args[@]+"${stop_args[@]}"} "$@" &
+app_pid=$!
+trap 'kill -TERM "$app_pid" 2>/dev/null || true' TERM HUP USR1 USR2
+rc=0; wait "$app_pid" || rc=$?
+while kill -0 "$app_pid" 2>/dev/null; do rc=0; wait "$app_pid" || rc=$?; done
+trap - TERM HUP USR1 USR2
+case "$rc" in
+    0) echo "app.py finished at $(date): every note analysed, consensus built, exports written unless they existed" ;;
+    2) echo "app.py stopped at $(date) with work left (time limit, or stopped early: see above); every stored result is kept. Resume: qsub ~/nlp-study.job --analyze" >&2 ;;
+    3) echo "app.py did not start: another run holds data.db (see above)" >&2 ;;
+    *) echo "app.py exited ${rc} at $(date) (143: stopped by TERM, or the memory limit outside all.q; 137: killed). Every stored result is kept; resume: qsub ~/nlp-study.job --analyze" >&2 ;;
+esac
+exit "$rc"
+EOF
+    } | atomic_write "$JOB_SCRIPT"
+    ok "Wrote ${JOB_SCRIPT}"
+}
+
+# ----------------------------------------------------------------------------- preflight runner
+# Runs the generated preflight at the highest tier this node allows and sets
+# PREFLIGHT_TIER. Ollama is started only inside an SGE allocation (or with
+# NLP_ALLOW_INFERENCE=1 off-cluster), never on a login node.
+PREFLIGHT_TIER=0
+run_preflight_here() {
+    local rc=0
+    export NLP_QUIET=1
+    set +u; . "$ENV_SCRIPT"; set -u
+    PREFLIGHT_TIER=0
+    if is_login_node; then
+        log "Login node: static checks only; inference waits for a compute node."
+    elif in_sge_job || [[ -n "${NLP_ALLOW_INFERENCE:-}" ]]; then
+        nlp_start_ollama || { err "Ollama did not start; see the log above."; return 1; }
+        PREFLIGHT_TIER=1
+    else
+        warn "Not inside an SGE job: static checks only (NLP_ALLOW_INFERENCE=1 overrides this off-cluster)."
+    fi
+    NLP_COLOR="${IS_TTY:+1}" nlp_preflight "$PREFLIGHT_TIER" || rc=$?
+    nlp_stop_ollama
+    return "$rc"
+}
+preflight_next_steps() {
+    if [[ "$PREFLIGHT_TIER" -eq 1 ]]; then
+        ok "LLM path works end to end on $(hostname). Submit from a login node:  qsub ${JOB_SCRIPT} --analyze --csv ./notes.csv"
+    else
+        log "Static checks passed. Prove inference on a compute node:  qlogin -q ${JOB_QUEUE} -pe smp ${JOB_SLOTS}   then   ${SELF}"
+    fi
+}
+
+# Sourcing with NLP_SETUP_LIB_ONLY=1 loads the functions above and stops here (used by tests).
+[[ -z "${NLP_SETUP_LIB_ONLY:-}" ]] || return 0 2>/dev/null || exit 0
+
+# ============================================================================= main
+mkdir -p "$LOG_DIR"
+find "$LOG_DIR" -maxdepth 1 -name 'setup-*.log' -mtime +30 -delete 2>/dev/null || true
+exec > >(tee -a "$SETUP_LOG") 2>&1
+cleanup() {
+    [[ -z "$CURL_PID" ]] || kill "$CURL_PID" 2>/dev/null || true
+    if declare -F nlp_stop_ollama >/dev/null 2>&1; then nlp_stop_ollama; fi
+    release_lock
+}
+on_error() {
+    local rc=$1 line=$2
+    err "Failed at line ${line} (exit ${rc}). Transcript: ${SETUP_LOG}"
+    err "Re-running is safe: healthy resources are skipped and half-built ones rebuilt. --status shows the state."
+    exit "$rc"
+}
+trap cleanup EXIT
+trap 'on_error $? $LINENO' ERR
+trap 'printf "\n"; err "Interrupted. Re-run to resume; partial downloads continue where they stopped."; exit 130' INT TERM
+
+section "Environment"
+log "$(date)  mode=${MODE}  force='${FORCE_LIST#,}'  host=$(hostname)  user=${HAWKID}  sge_job=${JOB_ID:-none}"
+for cmd in git curl apptainer sha256sum; do command -v "$cmd" >/dev/null 2>&1 || die "'${cmd}' not on PATH."; done
+log "git $(git --version | awk '{print $3}'), apptainer $(apptainer --version | awk '{print $NF}'), bash ${BASH_VERSION}"
+if [[ "$MODE" == "setup" ]]; then
+    if is_login_node; then ok "Login node: downloads happen here; inference waits for a compute node."
+    elif in_sge_job; then ok "Inside SGE job ${JOB_ID:-?}: inference is allowed here."
+    fi
+    if curl -sfI --max-time 15 https://github.com >/dev/null 2>&1; then
+        HAVE_NET=1; ok "Outbound HTTPS works: anything missing can be built on this node."
+    else
+        HAVE_NET=0; warn "No outbound HTTPS from this node: existing resources are used as they are; nothing can be downloaded."
+    fi
+fi
+
+section "Scratch layout"
+probe_writable() { mkdir -p "$1" 2>/dev/null && touch "$1/.probe.$$" 2>/dev/null && rm -f "$1/.probe.$$"; }
+resolve_scratch_roots() {
+    local c
+    local -a fast=("/scratch/Users/${HAWKID}" "/nfsscratch/Users/${HAWKID}")
+    local -a bulk=("/nfsscratch/Users/${HAWKID}" "/scratch/Users/${HAWKID}")
+    [[ -z "${NLP_FAST_ROOT:-}" ]] || fast=("$NLP_FAST_ROOT")
+    [[ -z "${NLP_BULK_ROOT:-}" ]] || bulk=("$NLP_BULK_ROOT")
+    for c in "${fast[@]}"; do if probe_writable "$c"; then PROJECT_ROOT="${c}/nlp-study"; break; fi; done
+    for c in "${bulk[@]}"; do if probe_writable "$c"; then ASSET_ROOT="${c}/nlp-study-assets"; break; fi; done
+    [[ -n "$PROJECT_ROOT" && -n "$ASSET_ROOT" ]] \
+        || die "No writable scratch dir for ${HAWKID} under /scratch/Users or /nfsscratch/Users. Ask research-computing@uiowa.edu, or set NLP_FAST_ROOT and NLP_BULK_ROOT."
+}
+resolve_scratch_roots
+REPO_DIR="${PROJECT_ROOT}/repo"; VENV_DIR="${PROJECT_ROOT}/venv"; PREFLIGHT_PY="${PROJECT_ROOT}/nlp-preflight.py"
+SIF_PATH="${ASSET_ROOT}/ollama.sif"; SIF_PARTIAL="${ASSET_ROOT}/ollama.partial.sif"; SIF_IMAGE_STAMP="${ASSET_ROOT}/ollama.sif.image"
+MODELS_DIR="${ASSET_ROOT}/ollama-models"
+APPT_CACHE="${ASSET_ROOT}/apptainer-cache"; APPT_TMP="${ASSET_ROOT}/apptainer-tmp"
+mkdir -p "$PROJECT_ROOT" "$ASSET_ROOT" "$MODELS_DIR" "$APPT_CACHE" "$APPT_TMP"   # not REPO_DIR/VENV_DIR: clone and venv own those
+if [[ "$MODE" == "setup" || "$MODE" == "clean" ]]; then acquire_lock; fi
+export APPTAINER_CACHEDIR="$APPT_CACHE" APPTAINER_TMPDIR="$APPT_TMP"
+ok "repo + venv   -> ${PROJECT_ROOT}"
+ok "image + model -> ${ASSET_ROOT}"
+# Leftovers of an interrupted pull can be several GB; only touch entries older than an hour.
+find "$APPT_TMP" -mindepth 1 -maxdepth 1 -mmin +60 -exec rm -rf {} + 2>/dev/null || true
+# Servers left behind by older versions of this script eat the login-node memory budget.
+if is_login_node; then
+    orphans="$(pgrep -u "$HAWKID" -f "${SIF_PATH}.*ollama serve" || true)"
+    if [[ -n "$orphans" ]]; then
+        warn "Killing orphaned Ollama server(s) on this login node: ${orphans//$'\n'/ }"
+        # shellcheck disable=SC2086
+        kill $orphans 2>/dev/null || true
+    fi
+fi
+detect_repo_models
+log "Models: ${MODELS[*]:-<unknown until the repo is cloned>} (${MODEL_SOURCE})"
+
+# ----------------------------------------------------------------------------- --status
+if [[ "$MODE" == "status" ]]; then
+    section "Status"
+    refresh_sif_ollama
+    for r in repo venv sif model; do
+        V_STATE="absent"; V_REASON=""; if [[ "$r" == model ]]; then verify_models; else "verify_$r"; fi
+        case "$r" in repo) p="$REPO_DIR" ;; venv) p="$VENV_DIR" ;; sif) p="$SIF_PATH" ;; model) p="$MODELS_DIR" ;; esac
+        case "$V_STATE" in healthy) col="$C_GREEN" ;; broken) col="$C_RED" ;; *) col="$C_YELLOW" ;; esac
+        printf '  %-6s %s%-8s%s %s%s\n' "$r" "$col" "$V_STATE" "$C_RESET" "$p" "${V_REASON:+  ($V_REASON)}"
+    done
+    for f in "$PREFLIGHT_PY" "$ENV_SCRIPT" "$JOB_SCRIPT"; do
+        if [[ -f "$f" ]]; then printf '  %-6s %spresent%s  %s\n' file "$C_GREEN" "$C_RESET" "$f"
+        else printf '  %-6s %sabsent%s   %s\n' file "$C_YELLOW" "$C_RESET" "$f"; fi
+    done
+    [[ ! -f "${PROJECT_ROOT}/.setup.lock/owner" ]] || warn "a setup run holds the lock (host pid epoch): $(cat "${PROJECT_ROOT}/.setup.lock/owner")"
+    [[ -z "$(ls -A "${PROJECT_ROOT}/preserved" 2>/dev/null)" ]] || warn "user data from earlier rebuilds sits in ${PROJECT_ROOT}/preserved/"
+    exit 0
+fi
+
+# ----------------------------------------------------------------------------- --clean
+if [[ "$MODE" == "clean" ]]; then
+    section "Clean"
+    warn "About to delete ${PROJECT_ROOT} and ${ASSET_ROOT} (csv/db/output are moved to ${PROJECT_ROOT}/preserved first)."
+    if [[ -z "$ASSUME_YES" ]]; then
+        [[ -t 0 ]] || die "Non-interactive; pass --yes to confirm."
+        read -r -p "Type 'yes' to continue: " reply
+        [[ "$reply" == "yes" ]] || die "Aborted."
+    fi
+    preserve_user_data "$REPO_DIR"
+    run rm -rf "$REPO_DIR" "$VENV_DIR" "$PREFLIGHT_PY" "$SIF_PATH" "$SIF_PARTIAL" "$SIF_IMAGE_STAMP" "$MODELS_DIR" "$APPT_CACHE" "$APPT_TMP"
+    apptainer cache clean --force >/dev/null 2>&1 || true
+    ok "Removed. Left alone: ${JOB_SCRIPT}, ${ENV_SCRIPT}, ${LOG_DIR}, ${PROJECT_ROOT}/preserved"
+    exit 0
+fi
+
+# ----------------------------------------------------------------------------- --preflight
+if [[ "$MODE" == "preflight" ]]; then
+    section "Preflight on the existing install"
+    for r in repo venv sif model; do
+        V_STATE="absent"; V_REASON=""; if [[ "$r" == model ]]; then verify_models; else "verify_$r"; fi
+        [[ "$V_STATE" == "healthy" ]] || die "[${r}] is ${V_STATE}${V_REASON:+ (${V_REASON})}. Repair it from a login node: ${SELF}"
+        ok "[${r}] healthy"
+    done
+    grep -q "^export NLP_ENV_VERSION=${ENV_VERSION}\$" "$ENV_SCRIPT" 2>/dev/null \
+        || die "${ENV_SCRIPT} is missing or from an older setup.sh. Re-run ${SELF} first (on a login node if anything needs downloading)."
+    write_preflight_script
+    run_preflight_here || die "Preflight failed. Do not submit the job."
+    preflight_next_steps
+    exit 0
+fi
+
+# ============================================================================= 1. repository
+section "Repository"
+ensure_resource repo
+if [[ "$V_STATE" == "healthy" ]] && ! force_requested repo; then
+    if [[ "$HAVE_NET" -eq 1 ]]; then update_repo; else log "[repo] offline: using the current checkout without pulling"; fi
+fi
+[[ -z "$(ls -A "${PROJECT_ROOT}/preserved" 2>/dev/null)" ]] \
+    || warn "Earlier runs left user data under ${PROJECT_ROOT}/preserved/ (from --clean or an interrupted rebuild); review it."
+log "HEAD: $(git_in "$REPO_DIR" log -1 --format='%h %ad %s' --date=short)"
+detect_repo_models
+[[ -n "$MODEL" ]] || die "LOCAL_MODEL not found in llm_analysis.py; set MODEL=name:tag and re-run."
+ok "Models requested by the repo: ${MODELS[*]} (${MODEL_SOURCE})"
+
+# ============================================================================= 2. python
+section "Python interpreter"
+WANTED="$(tr -d '[:space:]' < "${REPO_DIR}/.python-version" 2>/dev/null | cut -d. -f1,2 || true)"
+WANTED="${WANTED:-3.12}"
+if ! command -v module >/dev/null 2>&1; then
+    for init in /etc/profile.d/modules.sh /etc/profile.d/lmod.sh /usr/share/Modules/init/bash /usr/share/lmod/lmod/init/bash; do
+        if [[ -r "$init" ]]; then set +u; . "$init" 2>/dev/null || true; set -u; break; fi
+    done
+fi
+if command -v module >/dev/null 2>&1; then
+    set +u
+    for m in "python/${WANTED}" "py-${WANTED}" "python${WANTED}" python/3.12 python3; do
+        if module load "$m" >/dev/null 2>&1; then log "module load ${m}"; break; fi
+    done
+    set -u
+fi
+check_python() {   # sets PYTHON_BIN/PYTHON_VER when $1 is a Python >= 3.10
+    local v
+    v="$("$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)" || return 1
+    [[ "${v%%.*}" -eq 3 && "${v##*.}" -ge 10 ]] || return 1
+    PYTHON_BIN="$(command -v "$1")"; PYTHON_VER="$v"
+}
+venv_base_python() {   # the interpreter an existing venv was built from, so re-runs need no NLP_PYTHON
+    local cfg="${VENV_DIR}/pyvenv.cfg"
+    [[ -r "$cfg" ]] || return 0
+    sed -n 's/^executable *= *//p; s/^home *= *\(.*\)/\1\/python3/p' "$cfg"
+}
+# shellcheck disable=SC2086,SC2046
+for cand in ${NLP_PYTHON:-} $(venv_base_python) "python${WANTED}" python3.13 python3.12 python3.11 python3.10 python3; do
+    if check_python "$cand"; then break; fi
+done
+[[ -n "$PYTHON_BIN" ]] || die "No Python >= 3.10 found (Argon's modules stop at 3.8). Point at a user-built one: NLP_PYTHON=/path/to/bin/python3.12 ${SELF}"
+ok "Python ${PYTHON_VER} at ${PYTHON_BIN}"
+[[ "$PYTHON_VER" == "$WANTED" ]] || warn "Repo pins ${WANTED}; ${PYTHON_VER} will probably work."
+
+# ============================================================================= 3. venv + dependencies
+section "Virtual environment"
+ensure_resource venv
+set +u; . "${VENV_DIR}/bin/activate"; set -u
+REQ_FILE="${REPO_DIR}/requirements.txt"; REQ_STAMP="${VENV_DIR}/.requirements.sha256"
+req_hash="$(sha256sum "$REQ_FILE" | cut -d' ' -f1)"
+# The stamp holds the requirements.txt hash plus "check" or "nocheck": whether importing
+# each requirement by name is a valid health test (it is for this repo; a package whose
+# module name differs from its package name would otherwise force a rebuild every run).
+deps_importable() {
+    local names
+    names="$(sed -E '/^[[:space:]]*(#|-|$)/d; s/[#;].*//; s/[][<>=!~ ].*//; s/-/_/g' "$REQ_FILE" \
+             | tr '[:upper:]' '[:lower:]' | grep -E '^[a-z0-9_.]+$' | paste -sd, - || true)"
+    [[ -z "$names" ]] || python -c "import ${names}" >/dev/null 2>&1
+}
+stamp_hash=""; stamp_mode=""
+read -r stamp_hash stamp_mode < "$REQ_STAMP" 2>/dev/null || true
+DEPS_OK=0
+if [[ "$stamp_hash" == "$req_hash" ]] && ! force_requested deps; then
+    if [[ "$stamp_mode" == "nocheck" ]] || deps_importable; then
+        DEPS_OK=1
+    else
+        warn "[deps] were installed earlier but no longer import (scratch purge?); rebuilding the venv"
+        destroy_venv; create_venv
+        set +u; . "${VENV_DIR}/bin/activate"; set -u
+    fi
+fi
+if [[ "$DEPS_OK" -eq 1 ]]; then
+    ok "[deps] installed and importable, skipping pip"
+else
+    require_net deps
+    read -r -a PIP_ARGS <<< "${PIP_INSTALL_ARGS-$PIP_ARGS_DEFAULT}"
+    python -m pip install -q --upgrade pip || warn "[deps] pip self-upgrade failed; continuing with the current pip"
+    if ! run python -m pip install ${PIP_ARGS[@]+"${PIP_ARGS[@]}"} -r "$REQ_FILE"; then
+        err "pip failed. With --only-binary this means no wheel exists for this platform and Python;"
+        err "pin an older release of the package named above, or allow a source build for it with"
+        err "PIP_INSTALL_ARGS='' (slow, and it usually fails on old compilers)."
         exit 1
     fi
-    if curl -sf --max-time 3 "http://\$OLLAMA_HOST/api/tags" >/dev/null 2>&1; then
-        READY=1; break
-    fi
-    sleep 2
-done
-if [ "\$READY" -ne 1 ]; then
-    echo "Ollama never became ready:" >&2
-    cat "ollama-\${JOB_ID:-local}.log" >&2
-    exit 1
-fi
-echo "Ollama ready."
-
-# ---------------------------------------------------------------------------
-# Fail-fast gate. One synthetic, PHI-free note through llm_analysis().
-# ---------------------------------------------------------------------------
-if [ -z "\${NLP_SKIP_PREFLIGHT:-}" ]; then
-    echo "--------------------------------------------------------------"
-    echo "Preflight (set NLP_SKIP_PREFLIGHT=1 to bypass)"
-    if [ -f "\$PREFLIGHT" ]; then
-        set +e
-        NLP_PREFLIGHT_REPS="\${NLP_PREFLIGHT_REPS:-1}" \\
-        NLP_PREFLIGHT_BUDGET="\${NLP_PREFLIGHT_BUDGET:-900}" \\
-        python "\$PREFLIGHT" --repo "\$REPO_DIR" --model "\$MODEL" --tier 1
-        PF_RC=\$?
-        set -e
-        if [ \$PF_RC -ne 0 ]; then
-            echo "Preflight failed; aborting before app.py." >&2
-            echo "Without this gate the run would finish normally with every" >&2
-            echo "LLM column null, because data_worker.py records llm_failed=1" >&2
-            echo "per note instead of raising." >&2
-            exit \$PF_RC
-        fi
+    if deps_importable; then
+        printf '%s check\n' "$req_hash" > "$REQ_STAMP"
     else
-        echo "WARNING: \$PREFLIGHT missing; re-run setup_nlp_study.sh." >&2
+        printf '%s nocheck\n' "$req_hash" > "$REQ_STAMP"
+        warn "[deps] installed, but some module name differs from its package name; later runs trust pip instead of importing"
     fi
-    echo "Model placement:"
-    apptainer exec \$GPU_FLAG \\
-        --bind "\${MODELS_DIR}:/models" \\
-        --env OLLAMA_MODELS=/models \\
-        --env OLLAMA_HOST="\$OLLAMA_HOST" \\
-        "\$SIF" ollama ps 2>/dev/null || true
+    ok "[deps] installed"
+fi
+# ============================================================================= 4. container image
+section "Ollama container image"
+ensure_resource sif
+refresh_sif_ollama
+log "[sif] $(du -h "$SIF_PATH" | cut -f1) at ${SIF_PATH}, Ollama ${SIF_OLLAMA:-version unknown}"
+if [[ -z "$SIF_OLLAMA" ]]; then
+    warn "[sif] cannot tell the image's Ollama version; GPUs on NVIDIA driver 535 need ${OLLAMA_DRIVER535_MAX} or older"
+elif version_gt "$SIF_OLLAMA" "$OLLAMA_DRIVER535_MAX"; then
+    warn "[sif] Ollama ${SIF_OLLAMA} needs NVIDIA driver 550+; on Argon's driver-535 GPUs it falls back to CPU"
 fi
 
-echo "--------------------------------------------------------------"
-set +e
-python app.py "\$@"
-RC=\$?
-set -e
-echo "--------------------------------------------------------------"
-echo "app.py exited with \$RC at \$(date)"
-echo "Reminder: exit 143 outside all.q usually means the memory limit, not a bug."
-exit \$RC
-EOF
+# ============================================================================= 5. model
+section "Models: ${MODELS[*]}"
+remove_incompatible_models
+prune_model_store
+if force_requested model; then run rm -rf "${MODELS_DIR:?}/blobs"; fi   # once, not per model: they share the blob store
+for MODEL in "${MODELS[@]}"; do
+    log "[model] ${MODEL}"
+    ensure_resource model
+done
+MODEL="${MODELS[0]}"
+prune_model_store
+log "[model] store size: $(du -sh "$MODELS_DIR" | cut -f1)"
 
-# =============================================================================
-# 10. Summary
-# =============================================================================
-section "10. Setup complete"
+# ============================================================================= 6. runtime scripts
+section "Runtime scripts"
+write_preflight_script
+write_runtime_scripts
 
+# ============================================================================= 7. preflight
+section "Preflight"
+run_preflight_here || die "Preflight failed; the build itself is intact. Fix the finding above and re-run."
+preflight_next_steps
+
+section "Done"
+if [[ "$PREFLIGHT_TIER" -eq 1 ]]; then
+    NEXT_STEP="(done on $(hostname): the live LLM check passed)"
+else
+    NEXT_STEP="qlogin -q ${JOB_QUEUE} -pe smp ${JOB_SLOTS}   then   ${SELF}      # live LLM check on a compute node; do not skip"
+fi
 cat <<EOF
+  repo        ${REPO_DIR}
+  venv        ${VENV_DIR}
+  image       ${SIF_PATH}
+  models      ${MODELS[*]}  in ${MODELS_DIR}
+  job script  ${JOB_SCRIPT}
+  env script  ${ENV_SCRIPT}
+  logs        ${LOG_DIR}/
 
-  Repo          ${REPO_DIR}
-  Virtualenv    ${VENV_DIR}
-  Container     ${SIF_PATH}
-  Model         ${MODEL}  (from ${MODEL_SOURCE})
-  Model store   ${MODELS_DIR}  ($(du -sh "$MODELS_DIR" 2>/dev/null | cut -f1))
-  Preflight     ${PREFLIGHT_PY}
-  Job script    ${JOB_SCRIPT}
-  Job logs      ${LOG_DIR}/
-  This log      ${SETUP_LOG}
+  Put notes.csv at ${REPO_DIR}/notes.csv, then:
+    1. ${NEXT_STEP}
+    2. qsub ${JOB_SCRIPT} --analyze --csv ./notes.csv   # from a login node
+       qstat -u ${HAWKID}    /    tail -f ${LOG_DIR}/nlp-study.o<JOB_ID>
 
-  ${C_BOLD}${C_YELLOW}Put your notes.csv here first:${C_RESET}
-      ${REPO_DIR}/notes.csv
-
-  ${C_BOLD}${C_GREEN}1. Prove the LLM works, on a compute node:${C_RESET}
-
-      qlogin -q ${JOB_QUEUE} -pe smp 8
-      $0 --preflight
-      exit
-
-  ${C_BOLD}${C_GREEN}2. Then submit, from \$HOME on a login node:${C_RESET}
-
-      qsub ~/nlp-study.job --analyze --csv ./notes.csv
-
-  Monitor:
-      qstat -u ${HAWKID}
-      tail -f ${LOG_DIR}/nlp-study.o\<JOB_ID\>
-
-  Interactive instead:
-      qlogin -q ${JOB_QUEUE} -pe smp 8
-      source ~/nlp-study-env.sh
-      nlp_start_ollama
-      nlp_preflight
-      python app.py --analyze --csv ./notes.csv
-
-  ${C_DIM}Step 1 is not optional busywork. data_worker.py catches LLM errors per
-  note, writes llm_failed=1 and continues, so a misconfigured model does not
-  crash the job -- it returns a complete-looking table with no LLM data in it.
-  The preflight is the only thing that turns that into a loud failure.
-
-  Re-running this script is always safe: healthy resources are skipped,
-  damaged ones rebuilt. Use --status to inspect, --force <name> to rebuild
-  one thing, --clean to start over. Scratch is purged on a schedule, so copy
-  results out of ${REPO_DIR}/output to durable storage.${C_RESET}
-
+  Interactive instead:  source ${ENV_SCRIPT}; nlp_start_ollama; nlp_preflight; python app.py --analyze --csv ./notes.csv
+  Scratch is purged on a schedule: copy ${REPO_DIR}/output somewhere durable when done.
 EOF
-ok "Done."
