@@ -127,7 +127,7 @@ notes.csv ──> SQLite notes table
                      results (the consensus block: the fields the models agree on, its review flag)
                  │
                  ▼  export.py (write-once; plain-words titles, TRUE/FALSE flags)
-                     output/results.csv
+                     output/results.csv + output/results-review.csv
 ```
 
 ### 2.1 Command-line interface (`cli.py`)
@@ -138,7 +138,7 @@ notes.csv ──> SQLite notes table
 | `python app.py --csv FILE` | Ingests the CSV (duplicates skipped) and reports rows read, notes added and duplicates skipped |
 | `python app.py --analyze --csv FILE` | Ingests, runs each of the three models on every note that lacks its result, rebuilds the consensus block for every note, writes `output/results.csv` |
 | `python app.py --analyze` | Same, without ingesting. Resumes an interrupted run |
-| `python app.py --clean` | Deletes `data.db` (with any `-journal`/`-wal`/`-shm` file) and `output/results.csv`, and `output/` if that leaves it empty. No prompt. Combined with `--csv`/`--analyze` it runs first, giving a fresh run; a missing `--csv` file aborts before anything is deleted |
+| `python app.py --clean` | Deletes `data.db` (with any `-journal`/`-wal`/`-shm` file) and both exports (`output/results.csv`, `output/results-review.csv`), and `output/` if that leaves it empty. No prompt. Combined with `--csv`/`--analyze` it runs first, giving a fresh run; a missing `--csv` file aborts before anything is deleted |
 
 `--clean` runs first if given, then `--csv` ingests; `--analyze` then runs if given. The database file is always `data.db` in the current working directory and `output/` is created there too, so run the program from the repository directory. There is no command that prints notes or results; use `output/results.csv` or `sqlite3` (7.3).
 
@@ -173,7 +173,7 @@ What the researcher actually needs from these fields is in [15.5](#155-study-req
 - Ingest skips a row only if all six fields match an existing row exactly.
 - `data_worker` runs one model at a time and skips any note that already has a result under that model's label (its `LLM_Failed` column is not null).
 - The consensus block (`consensus.py`) is rebuilt for every note on every `--analyze`, from the stored answers of the run's models, so it never goes stale after a resume.
-- The export is skipped if `output/results.csv` already exists.
+- The export is skipped if `output/results.csv` or `output/results-review.csv` already exists; the two are written together.
 
 ---
 
@@ -501,7 +501,7 @@ The export is write-once. If `output/results.csv` exists it is skipped with a me
 
 ### 7.5 Collecting results
 
-One file, `repo/output/results.csv` (columns in Appendix D; `results-csv-guide.md` in the repository explains them to the researcher, with the steps to highlight the review queue in Google Sheets or Excel). It contains PHI and already includes the raw LLM responses. Copy it, and `data.db`, to durable storage. Scratch is purged on a schedule and `preserved/` is still scratch.
+Two files: `repo/output/results.csv` (columns in Appendix D; `results-csv-guide.md` in the repository explains them to the researcher, with the steps to highlight the review queue in Google Sheets or Excel), and `repo/output/results-review.csv`, the same rows with only the identifiers, the consensus block and the note length (columns A to X as in `results.csv`), about 4% of the size and the one to open in Google Sheets. Both contain PHI; `results.csv` already includes the raw LLM responses. Copy it, and `data.db`, to durable storage. Scratch is purged on a schedule and `preserved/` is still scratch.
 
 ### 7.6 Compute nodes without internet
 
@@ -707,12 +707,9 @@ Bug-level items are tracked in `BACKLOG.md` (B1 to B26) with proposed fixes; thi
 
 5. **GPU nodes with driver 535 run on CPU.** The A10 node seen on 2026-09-14 could not be used by `ollama/ollama:latest`. `setup.sh` now pins `ollama/ollama:0.24.0`, which uses the A10 on driver 535; the next `./setup.sh` on a login node replaces the old `latest` image automatically (unconfirmed on Argon until a GPU job's placement line says GPU). Always read the placement line the preflight prints.
 
-6. **Sample CSVs in the local `samples/` folder will not ingest as-is.** Verified on 2026-10-13:
-   - `samples/notes.csv` header is `id,mrn,encounter,note_csn_id,note_date,note_type,note` (lower-case, underscores). Required names are case-sensitive. It also has a note-boundary error: note 9's CPT line sits at the head of note 10 (BACKLOG B8).
-   - `samples/sample_5000_deidentified.csv` starts with a UTF-8 byte-order mark (`EF BB BF`) and names the second column `EncounterID`. With `encoding="utf-8"` the first header parses as `\ufeffMRN`, and `EncounterID` is not `Encounter`. Two failures (BACKLOG B7).
-   Fixes are in [Troubleshooting](#csv-must-contain-columns). `samples/` and `environment-notes/` are in `.gitignore` and must stay out of git (names and MRNs).
+6. **Sample CSVs in the local `samples/` folder ingest as they are since 2026-10-15** (BACKLOG B7 fixed): the ingest skips a byte-order mark, matches header names in any case with spaces, underscores and dashes ignored, and accepts the usual other spellings (`EncounterID`, `note_csn_id`), logging which name it read as which column. Before that, `samples/notes.csv` (header `id,mrn,encounter,note_csn_id,note_date,note_type,note`) and `samples/sample_5000_deidentified.csv` (byte-order mark `EF BB BF`, second column `EncounterID`) were both refused; verified ingesting as-is on 2026-10-15 (5,000 rows in 0.3 s). `samples/notes.csv` still has a note-boundary error: note 9's CPT line sits at the head of note 10 (BACKLOG B8). `samples/` and `environment-notes/` are in `.gitignore` and must stay out of git (names and MRNs).
 
-7. **Runtime versus walltime.** 5000 notes at 24 h walltime allows about 17 s per note for all three models together, including retries; the tier 1 preflight prints each model's per-note time and their sum. CPU inference on a 27 B model (medgemma:27b decodes at about 3 tokens per second on CPU) cannot meet that on its own. Plan on multiple resubmissions (resume is automatic) or set `NLP_JOB_HRT` higher, and read the tier 1 projection, which counts the real rows in `notes.csv`. Most of the 5000-note corpus is not procedure notes, so a relevance gate before the LLM (BACKLOG F3) would cut the work by roughly ten times.
+7. **Runtime versus walltime.** 5000 notes at 24 h walltime allows about 17 s per note for all three models together, including retries; the tier 1 preflight prints each model's per-note time and their sum. CPU inference on a 27 B model (medgemma:27b decodes at about 3 tokens per second on CPU) cannot meet that on its own. Plan on multiple resubmissions (resume is automatic) or set `NLP_JOB_HRT` higher, and read the tier 1 projection, which counts the real rows in `notes.csv`. Most of the 5000-note corpus is not procedure notes, so a relevance gate before the LLM (BACKLOG F3) would cut the work by roughly ten times. At the full study corpus of about 100,000 notes the arithmetic is 300,000 model calls: at the local stand-ins' measured 3 to 5 s per call about 13 days of continuous model time, at the 17 s per note budget above about 20 days, so plan on that many 24 h resubmissions (resume is automatic and keeps every stored result) or on the gate. The program itself scales: the ingest, the analysis pass, the consensus and the export all stream, measured on 2026-10-15 at a flat 50 to 76 MB peak memory and seconds per phase from 20,000 to 100,000 synthetic notes (at 100,000: ingest 3.6 s, consensus 2.7 s, export 3.3 s; the real notes are about 2.4 times longer, which scales the seconds, not the memory; `tests/test_robustness.py` covers the streaming paths). What needs planning is the output: `results.csv` is about 6.7 KB per row (71% the note text, 19% the raw model responses and rejected attempts, 4% the identifiers and the consensus), so about 670 MB at 100,000 rows, beyond Google Sheets' 100 MB import limit and slow in Excel, while `results-review.csv` (the identifiers, the consensus block and the note length) is about 4% of that, some 30 MB, and is the file to open in Sheets; `data.db` about 0.8 GB; and the export is written only by a complete run, so nothing is visible until the last resubmission (BACKLOG B17).
 
 8. **Container tag pinned to 0.24.0.** Before 2026-10-13 the default was `latest` (0.32.14 when pulled), which needs driver 550+. Do not move the default past 0.24.x until Argon's GPU nodes run driver 550 or newer (BACKLOG B25).
 
@@ -756,7 +753,7 @@ Expected. Both generated scripts are rewritten on every setup run (the September
 ### Data
 
 **Q: What must `notes.csv` look like?**
-UTF-8 without a byte-order mark, header row containing exactly `MRN, Encounter, NoteCsnID, NoteDate, NoteType, Note` (extra columns such as `id` are ignored). Notes may contain embedded newlines if quoted. CRLF line endings are fine.
+UTF-8 (a byte-order mark is skipped; a byte that is not UTF-8 is replaced and counted in the log), header row containing `MRN, Encounter, NoteCsnID, NoteDate, NoteType, Note` in any case, spaces, underscores and dashes ignored, the usual other spellings accepted (`EncounterID`, `note_csn_id`, `note_text`); extra columns such as `id` are ignored. Notes may contain embedded newlines if quoted and may be any length (the csv field limit is raised). CRLF line endings are fine.
 
 **Q: Where do I put it?**
 `/nfsscratch/Users/apkane/nlp-study/repo/notes.csv`, then refer to it as `./notes.csv` because the job `cd`s into the repo.
@@ -768,7 +765,7 @@ Rows identical in all six fields are skipped with a count message. Any change to
 Yes: `python app.py --csv ./notes.csv` ingests and reports how many notes were added. This is cheap and safe on a login node since no model is involved.
 
 **Q: Where do results go?**
-`data.db` (both tables, including raw LLM text) and `output/results.csv` in the repo directory. All are PHI. Copy them off scratch.
+`data.db` (both tables, including raw LLM text), `output/results.csv` and `output/results-review.csv` in the repo directory. All are PHI. Copy them off scratch.
 
 **Q: Which notes did the LLM fail on?**
 The job log ends with `Failed note id(s): ...`, and every note has `Failed`, `Attempts` and `Failure reason` per model in `results.csv` (the database columns `LLM_Failed`, `LLM_Attempts` and `LLM_Error`; or `sqlite3 data.db 'select id, "LLM_Error (medgemma:27b@8192)" from results where "LLM_Failed (medgemma:27b@8192)" = 1;'`; the result columns carry the model label and need double quotes in SQL). Those rows keep every extracted field null and are not retried on resume; see 14, "Job finished quickly, exit 0, LLM columns all empty" for reprocessing them.
@@ -862,36 +859,14 @@ Symptoms are grouped by where they appear. Each entry gives the cause and the fi
 #### CSV must contain columns
 
 ```
-Error: CSV is missing the column(s) MRN, Encounter. Required (case-sensitive): MRN, Encounter, NoteCsnID, NoteDate, NoteType, Note. Header found: \ufeffMRN, EncounterID, NoteCsnID, NoteDate, NoteType, Note
+Error: CSV is missing the column(s) NoteDate. Required: MRN, Encounter, NoteCsnID, NoteDate, NoteType, Note (any case; spaces, underscores and dashes are ignored; EncounterID, note_csn_id and the like are accepted). Header found: MRN, EncounterID, NoteCsnID, NoteType, Note
 ```
 
-Cause: the header does not contain the six names exactly. The message lists the names it could not find and the header it did find (`REQUIRED_CSV_COLUMNS` in `database.py`). Three variants seen:
-
-1. Lower-case snake_case header from a database export: `id,mrn,encounter,note_csn_id,note_date,note_type,note`.
-
-   ```bash
-   sed -i '1s/.*/id,MRN,Encounter,NoteCsnID,NoteDate,NoteType,Note/' notes.csv
-   ```
-
-2. UTF-8 byte-order mark at the start of the file (Excel "CSV UTF-8" export). The first header becomes `\ufeffMRN`.
-
-   ```bash
-   sed -i '1s/^\xEF\xBB\xBF//' notes.csv
-   ```
-
-3. `EncounterID` instead of `Encounter`.
-
-   ```bash
-   sed -i '1s/EncounterID/Encounter/' notes.csv
-   ```
-
-Check the header bytes before and after:
+Cause: a required column is absent from the header. The message lists the names it could not find and the header it did find (`REQUIRED_CSV_COLUMNS` and `CSV_COLUMN_ALIASES` in `database.py`). Since 2026-10-15 the three variants that used to need a `sed` on the file ingest as they are: a lower-case snake_case header from a database export (`id,mrn,encounter,note_csn_id,note_date,note_type,note`), a UTF-8 byte-order mark at the start of the file (Excel "CSV UTF-8" export), and `EncounterID` for `Encounter`. The ingest log says what it did (`byte-order mark skipped; 'EncounterID' read as Encounter`). If the file really lacks a column, add it. To see the header bytes:
 
 ```bash
 head -c 80 notes.csv | xxd
 ```
-
-The code-side fix (open with `utf-8-sig`, normalise and alias headers) is BACKLOG B7.
 
 #### `Error: CSV file not found`
 
@@ -1218,9 +1193,9 @@ Things to hold in mind while changing the code, grouped by the layer they affect
 25. **`CREATE TABLE IF NOT EXISTS` does not migrate.** `create_db` adds any `results` column missing from an existing `data.db` (`ALTER TABLE ... ADD COLUMN`; existing rows get null), which covers adding a field. Anything else (renaming or retyping a column, changing `notes`) still needs a fresh database or a hand-written migration (BACKLOG B19).
 26. **Resume logic keys on row existence, not freshness.** Changing the prompt or model does not reprocess notes that already have a `results` row. Delete those rows to recompute.
 27. **Relative paths everywhere.** `data.db` and `output/` are resolved from the current directory. Run from the repo directory, or refactor to pass a path (BACKLOG B18).
-28. **The export is write-once.** `output/results.csv` is skipped if it already exists. After a resume the file on disk is stale (BACKLOG B17).
-29. **Ingest dedup is whole-row equality and quadratic.** A trailing space in one field creates a second note; identical notes under different CSN ids are analysed twice (BACKLOG B16).
-30. **CSV contract is strict and case-sensitive** (`REQUIRED_CSV_COLUMNS` in `database.py`; the error names the missing columns and the header found), opened with `encoding="utf-8"`. Switching to `encoding="utf-8-sig"` would make BOM-prefixed exports work. `EncounterID` would still need renaming unless the required set is widened (BACKLOG B7).
+28. **The export is write-once.** `output/results.csv` and `output/results-review.csv` are written together and skipped together if either exists. After a resume the file on disk is stale (BACKLOG B17).
+29. **Ingest dedup is whole-row equality**, against the database and within the file, on an index of MRN, encounter and CSN since 2026-10-15 (5,000 rows in 0.3 s). A trailing space in one field creates a second note; identical notes under different CSN ids are analysed twice (BACKLOG B16).
+30. **CSV contract** (`REQUIRED_CSV_COLUMNS` and `CSV_COLUMN_ALIASES` in `database.py`): header names are matched in any case with spaces, underscores, dashes and a byte-order mark ignored, and the usual other spellings are accepted; the error names the missing columns and the header found. Bytes that are not UTF-8 are replaced with U+FFFD and NUL bytes dropped, each counted in the log; the csv field limit is raised for long notes; a row with fewer cells than the header is stored with the rest empty (BACKLOG B7, fixed 2026-10-15; `tests/test_robustness.py`).
 31. **The consensus block is derived, never edited.** `consensus.py` rebuilds it for every note from the model blocks on each `--analyze`, over the models of that run (`--location`), so a hand edit in `data.db` is lost on the next run, and a run with a different model set replaces the consensus with that set's; `Models (consensus)` records which labels built each row. A consensus value needs two agreeing models, so a one-model run leaves the block empty with `Outcome` `none`. If you add a field, add it to the vote (`VOTED_FIELDS`) or to the evidence rule (`EVIDENCE_FOR_FLAG`) as well.
 
 ### 15.4 Operations and HIPAA
@@ -1301,6 +1276,7 @@ September-only variables, no longer read: `SKIP_SMOKE_TEST`, `FORCE_SMOKE_TEST`,
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `NLP_CONTEXT_LENGTH` | `8192` | `OLLAMA_CONTEXT_LENGTH` passed into the container |
+| `NLP_LLM_TIMEOUT` | `1800` | Longest silence (seconds) from Ollama during one model call or model load before it counts as a failed call; the answer is streamed, so a slow model is never cut off while producing |
 | `NLP_PREFLIGHT_REPS` | 3 (job forces 1 unless set) | Tier 1 repetitions |
 | `NLP_PREFLIGHT_BUDGET` | 600 | Per-call timeout in seconds |
 | `NLP_SKIP_PREFLIGHT` | unset | Bypass the gate in the job |
@@ -1424,5 +1400,6 @@ Until 2026-10-13 the tables were `working_results` (NLP and LLM answers side by 
 | File | Content |
 | --- | --- |
 | `results.csv` | One row per note, under plain-words titles (`export.py`; `results-csv-guide.md` explains them): `Note id`, `MRN`, `Encounter`, `NoteCsnID`, `NoteDate`, `NoteType` (columns A to F); the consensus block, each column titled `<what> (consensus)` (columns G to X): `Needs human review` (TRUE/FALSE, the review queue), `Review reasons`, `Outcome`, `Models answered`, `Summary`, the ten fields (`Upper endoscopy performed`, `Scope type`, `Upper endoscopy evidence quote`, `Duodenal biopsies taken`, `Number of duodenal biopsies`, `Duodenal biopsies evidence quote`, `Colonoscopy performed`, `Colonoscopy evidence quote`, `Fellow present`, `Fellow evidence quote`), `Models consulted`, `Disputed fields`, `How the models voted`; then one block of 16 columns per model, each titled `<what> (<model>@<context>)`: `Failed`, the ten fields, `Needs review`, `Review reasons`, `Attempts`, `Seconds`, `Failure reason`; then every model's `Rejected attempts` and `Raw model response`; then `Note length (characters)` and `Note`. Yes/no values are TRUE or FALSE; a cell is empty where the database holds NULL |
+| `results-review.csv` | The same rows with only the identifiers (A to F), the consensus block (G to X) and `Note length (characters)` (Y), written from the same pass as `results.csv` and write-once together with it; about 4% of its size, for Google Sheets. |
 
 It is written once and never overwritten. It contains PHI.

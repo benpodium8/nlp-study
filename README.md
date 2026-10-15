@@ -40,7 +40,7 @@ SQLite Database (notes)
 └───────────────────────────────┘
         │
         ▼
-CSV Export (output/results.csv)
+CSV Export (output/results.csv + results-review.csv)
 ```
 
 ---
@@ -192,8 +192,8 @@ With no options it prints what the program needs (the packages, Ollama and the m
 | Option         | Effect                                                                                   |
 | -------------- | ---------------------------------------------------------------------------------------- |
 | `--csv FILE`   | Ingest the notes in `FILE` into `data.db` (duplicates skipped); reports how many were added |
-| `--analyze`    | Run each model on every note that has no result for it yet, rebuild the consensus of the models for every note, then write `output/results.csv` |
-| `--clean`      | Delete `data.db` (and any SQLite journal files) and `output/results.csv` from earlier runs, before anything else. Discards every stored result |
+| `--analyze`    | Run each model on every note that has no result for it yet, rebuild the consensus of the models for every note, then write `output/results.csv` and its review-sized copy `output/results-review.csv` |
+| `--clean`      | Delete `data.db` (and any SQLite journal files) and the two exports (`output/results.csv`, `output/results-review.csv`) from earlier runs, before anything else. Discards every stored result |
 | `--location`   | Which model set to run: `server` (the default) is the three study models; `local` is three small stand-ins (`gemma3:4b`, `gemma4:e2b`, `qwen3.5:4b`) for a workstation test. Either way each model gets its own labelled columns |
 
 ---
@@ -239,7 +239,7 @@ This will:
 2. Run the LLM extraction on every note without a result, one model at a time
 3. Store each result, with the raw model response and per-note debugging columns, in the database
 4. Build the consensus of the models for every note (see `consensus.py` below)
-5. Export `output/results.csv`
+5. Export `output/results.csv` and its review-sized copy `output/results-review.csv`
 
 Running `python app.py --analyze` again resumes: notes that already have a result for a model are skipped for that model. The consensus is rebuilt for every note on each run, so it always reflects every model's stored answers.
 
@@ -309,7 +309,8 @@ The resumed run (`python app.py --analyze --location local`) continues with note
 [11:00:10] Review reasons: a model failed on the note 2.
 [11:00:10] == Step 3 of 3: Write output/results.csv ==
 [11:00:10] Wrote 3 row(s) and 80 columns to output/results.csv (0.0 MB) in 0.0s.
-[11:00:10] The review queue is the 2 row(s) with "Needs human review (consensus)" TRUE (column G); results-csv-guide.md explains the columns.
+[11:00:10] Wrote the review-sized copy, 3 row(s) and 25 columns, to output/results-review.csv (0.0 MB): the identifiers, the consensus block and the note length, columns A to X as in results.csv.
+[11:00:10] The review queue is the 2 row(s) with "Needs human review (consensus)" TRUE (column G of both files); results-csv-guide.md explains the columns.
 Results stored per model (every run so far)
 model           | analysed | ok | failed | flagged | rejected attempts | s/note | median | model time
 ----------------+----------+----+--------+---------+-------------------+--------+--------+-----------
@@ -326,7 +327,7 @@ qwen3.5:4b@8192 |   2 |           0 |                 2 |            2 |      0 
 
 [11:00:10] elapsed   0:02:16
 [11:00:10] outcome   complete: 8 notes analysed in this run
-[11:00:10] export    output/results.csv (write-once; move it aside to regenerate it)
+[11:00:10] export    output/results.csv and output/results-review.csv (write-once; move both aside to regenerate them)
 [11:00:10] next      the review queue is every row with "Needs human review (consensus)" TRUE (column G); "Outcome (consensus)" unanimous marks the rows every model agreed on; results-csv-guide.md explains the columns
 ```
 
@@ -350,19 +351,13 @@ sqlite3 data.db 'select count(*) notes, (select count(*) from results where "LLM
 
 ### Troubleshooting:
 
-The `notes.csv` file may replace column names with underscores or dashes depending on client export/import differences in platforms. The program then stops with a message that names the columns it could not find and the header it did find, for example:
+Header names are matched without regard to case, spaces, underscores or dashes, a UTF-8 byte-order mark is skipped, and the usual other spellings are accepted (`EncounterID` or `encounter_id` for `Encounter`, `note_csn_id` or `CSN` for `NoteCsnID`, `note_text` for `Note`; `CSV_COLUMN_ALIASES` in `database.py`), so a database export with a header such as `id,mrn,encounter,note_csn_id,note_date,note_type,note` ingests as it is (extra columns such as `id` are ignored). The run log says which header name was read as which column. The program stops only when a column is really absent, with a message that names the columns it could not find and the header it did find, for example:
 
 ```
-Error: CSV is missing the column(s) MRN, Encounter, NoteCsnID, NoteDate, NoteType, Note. Required (case-sensitive): MRN, Encounter, NoteCsnID, NoteDate, NoteType, Note. Header found: id, mrn, encounter, note_csn_id, note_date, note_type, note
+Error: CSV is missing the column(s) NoteDate. Required: MRN, Encounter, NoteCsnID, NoteDate, NoteType, Note (any case; spaces, underscores and dashes are ignored; EncounterID, note_csn_id and the like are accepted). Header found: MRN, EncounterID, NoteCsnID, NoteType, Note
 ```
 
-Rename the header so the six required names match exactly (extra columns such as `id` are ignored):
-
-```
-id,MRN,Encounter,NoteCsnID,NoteDate,NoteType,Note
-```
-
-A header found as `\ufeffMRN` means the file starts with a UTF-8 byte-order mark; save it as plain UTF-8.
+Bytes that are not valid UTF-8 are replaced with U+FFFD and NUL bytes are dropped, each with a log line that says how many; a row with fewer cells than the header is stored with the missing cells empty, also with a log line; a note may be any length (the csv module's field limit is raised); a row identical to a stored note or to an earlier row of the same file is skipped. `tests/test_robustness.py` exercises each case (`python -m unittest discover -s tests`).
 
 ---
 
@@ -446,7 +441,7 @@ Features:
 
 HIPAA:
 
-- Processes one note at a time in memory
+- Processes one note at a time in memory: the ingest, the analysis pass, the consensus and the export all stream, measured at a flat 50 to 76 MB peak memory from 20,000 to 100,000 notes
 - No caching outside DB
 - Raw LLM output retained for audit
 
@@ -474,7 +469,7 @@ HIPAA:
 - the answer was accepted only after an attempt was rejected for its content (a quote not in the note, an invented scope name, an unsupported count). A retry after a repetition loop is not counted: the model repeating itself says nothing about the answer it then gave
 - an upper endoscopy is documented but no scope name was found
 - duodenal biopsies were taken but the note states no count
-- the note was too long for the context window and was not sent to the model (see below)
+- the note was too long for the context window: not sent to the model, or sent and cut by the server, which its own token counts revealed (see below)
 
 Everything else is `false`. The flag never changes an answer; it only says where to look.
 
@@ -488,29 +483,29 @@ After every model has run, `consolidate` builds a consensus for every note from 
 
 - A field gets a value only when at least two models gave an answer the note supports (`LLM_Failed` 0) and they agree on it. The models vote on `Endoscopy`, `Colonoscopy`, `ScopeType`, `DuodenalBiopsiesTaken`, `NumberOfDuodenalBiopsies` and `FellowPresent`; a null count ("taken, number not stated") and a null scope are answers the models can agree on.
 - A strict majority (2 of 3) settles a disagreement, and the note is flagged for manual review. A field with no majority (one against one, or three different answers) is left empty, and the note is flagged.
-- Scope names that differ only in form (`Olympus GIF-H190`, `GIF-H190`, `GIF-H 190`) count as the same scope: the form most models gave is kept (the fullest on a tie) and the difference is noted in `Agreement` without a flag. `Olympus gastroscope` against `Olympus GIF-H190` is a disagreement.
+- Scope names that differ only in form (`Olympus GIF-H190`, `GIF-H190`, `GIF-H 190`) count as the same scope, and the difference is noted in `Agreement` without a flag; `Olympus gastroscope` against `Olympus GIF-H190` is a disagreement. The vote settles on the form most models gave (the fullest on a tie), and the consensus then writes that name as the note spells it: `llm_analysis.scope_as_stated` finds the first place the agreed name occurs in the note as given (`squash(scope) in squash(note)`, the test the verifier applies) and copies the note's text there, from its first alphanumeric character to its last, so `GIF-H 190` stays `GIF-H 190` whatever the models typed; each model's own spelling stays in its columns as the evidence. A name the note states only in parts (`Olympus endoscope (GIF-H190)`, which the verifier accepts when each part occurs somewhere in the note) has no one span to copy, so the models' joined form is kept and `Agreement` says `ScopeType: 'Olympus GIF-H190' is the models' form, joined from parts the note states apart`. The value is therefore always the note's own text or the models' joined form; no list of scope names is consulted.
 - The agreed fields must agree with each other, as one model's answer must: `FellowPresent` 1 without a procedure, duodenal biopsies without an upper endoscopy, or a scope name without one, is left empty.
 - Each `...Information` column is the quote of a model that gave the agreed answer: the quote most of them gave, the first model's on a tie, and for the biopsy sentence one from a model that also gave the agreed count. It is null when the flag is not 1.
 - `ManualReviewRequired (consensus)` is `true`, with every trigger in `ManualReviewReason (consensus)`, where a human must look:
   - the models disagreed on a field (a majority answer given, or no majority and the field left empty);
   - the agreed answer leaves a study field open: an upper endoscopy without a scope name. A null count two models agree on is "taken, count not stated", which the study accepts, and is not flagged;
   - the agreed duodenal count is the sum of two counts the quoted sentence gives for different parts of the duodenum ("4 biopsies of the duodenum and 2 from the bulb" is written as 6). The verifier reads such a sentence as its sum, as prompt rule 5 says, but the researcher's examples confirm only the part-of form ("6 including 2 from the bulb" is 6), so the row is raised until that reading is confirmed; the value stays;
-  - the note's own attestation contradicts the agreed `FellowPresent`: a teaching attestation (`Teaching Statement`, `Teaching Physician Statement`, "was present and actively participated", "I ... was present for the entire procedure") with `FellowPresent` 0 or empty, or a `Staff Only`, `Fellow: None` or `RESIDENT/FELLOW: None` line with `FellowPresent` 1 or empty. The check only reads the note and never sets the value, and it runs only when the consensus has a procedure, since a teaching statement in a progress note is about the visit;
+  - the note's own attestation contradicts the agreed `FellowPresent`: a teaching attestation (`Teaching Statement`, `Teaching Physician Statement`, "was present and actively participated", "I ... was present for the entire procedure", a `RES/FEL Staff Procedure Presence Statement`, or "was present for the entire procedure" right after a fellow's signature) with `FellowPresent` 0 or empty, or a `Staff Only`, `Fellow: None` or `RESIDENT/FELLOW: None` line with `FellowPresent` 1 or empty. The check only reads the note and never sets the value, and it runs only when the consensus has a procedure, since a teaching statement in a progress note is about the visit;
   - a model has not analysed the note (run `--analyze` again);
-  - fewer than two models answered, so there is no consensus and every field is empty, unless the row is a true empty: every model read the note and nothing suggests it documents a procedure. A note a model never read (too long to send to any model, or the model call failed) is flagged whatever its type, since it may hold study data nobody has checked and a human must read it. A note every model read is flagged when it could document a procedure: its type is a procedure type (`Procedures`, the `Upper Endoscopy` / `PED Endoscopy` / `PEG Placement` family, `Brief Op Note`, `OR PostOp`, `OR Nursing`), its text has upper endoscopy wording (the esophagus intubated, the endoscope or gastroscope advanced or passed, an Olympus, Pentax or Fuji scope, `GIF-`, `H190`, `Q180`, `XP190`, esophagoscopy), or the one model that answered found a procedure (a flag 1 or a scope name; one answer is not a consensus, and the reason points at that model's columns). A note of another type that every model read, with no upper endoscopy wording, where no model found a procedure, is released unflagged: the models were asked and the note refuted every claim, so the empty row is the answer for a note about something else, and `Agreement` says so. The reason says how the models came to give no answer (`llm_analysis.failure_kind` reads it from each model's `LLM_Error`), and `Agreement` names what suggests a procedure, so a reviewer can take the likely ones first;
+  - fewer than two models answered, so there is no consensus and every field is empty, unless the row is a true empty: every model read the note and nothing suggests it documents a procedure. A note a model never read (too long to send to any model, or the model call failed) is flagged whatever its type, since it may hold study data nobody has checked and a human must read it. A note every model read is flagged when it could document a procedure: its type is a procedure type (`Procedures`, the `Upper Endoscopy` / `PED Endoscopy` / `PEG Placement` family, `Brief Op Note` and other operative notes, `OR PostOp`, `OR Nursing`), its text has upper endoscopy wording (the esophagus intubated, the endoscope or gastroscope advanced or passed, an Olympus, Pentax or Fuji scope, `GIF-`, `H190`, `Q180`, `XP190`, esophagoscopy), or the one model that answered found a procedure (a flag 1 or a scope name; one answer is not a consensus, and the reason points at that model's columns). A note of another type that every model read, with no upper endoscopy wording, where no model found a procedure, is released unflagged: the models were asked and the note refuted every claim, so the empty row is the answer for a note about something else, and `Agreement` says so. The reason says how the models came to give no answer (`llm_analysis.failure_kind` reads it from each model's `LLM_Error`), and `Agreement` names what suggests a procedure, so a reviewer can take the likely ones first;
   - an agreed answer of 1 with no evidence quote behind it, which only a result stored before the verifier required the quote can produce.
 - A model that failed is an abstention, not a dissent. When the models that answered agree on every field, the row is not flagged; the failure stays on record in `Models` (`(failed)`), in `Agreement` and in `Outcome` (`agreed`). The reason "X failed on this note; the consensus rests on the other N models" is added only to a row flagged for another reason, so the reviewer knows how many models the answer rests on. A model's own `ManualReviewRequired` does not carry over: it describes how that model reached its answer, and the consensus is judged on whether the models agree.
-- `Outcome` is `unanimous` (every model answered and they agree on every field), `agreed` (every model that answered agrees on every field, but a model failed: the consensus rests on the others), `majority` (every field has a value, but one was settled by a strict majority), `partial` (a field was left empty) or `none` (no consensus). `Models` lists the models consulted, marking those that failed or have not run; `Agreement` says how many answered and how they voted on every field they did not simply agree on. `Summary` says in one line what the consensus found (`Upper endoscopy with Olympus H190; 4 duodenal biopsies; fellow present`, `No procedure documented`, `No consensus: 1 of 3 models answered`), `Answered` counts the models that answered, and `Disputed` lists the fields the answering models split on, each marked `(majority answer given)` or `(no majority, left empty)`. None of them holds note text, only scope names, counts and model labels. Where a review reason points at another column it uses that column's title in the export (`see Failure reason`, `see How the models voted`).
+- `Outcome` is `unanimous` (every model answered and they agree on every field), `agreed` (every model that answered agrees on every field, but a model failed: the consensus rests on the others), `majority` (every field has a value, but one was settled by a strict majority), `partial` (a field was left empty) or `none` (no consensus). `Models` lists the models consulted, marking those that failed or have not run; `Agreement` says how many answered and how they voted on every field they did not simply agree on, and says so when the scope name is the models' joined form. `Summary` says in one line what the consensus found (`Upper endoscopy with Olympus H190; 4 duodenal biopsies; fellow present`, `No procedure documented`, `No consensus: 1 of 3 models answered`), `Answered` counts the models that answered, and `Disputed` lists the fields the answering models split on, each marked `(majority answer given)` or `(no majority, left empty)`. None of them holds note text, only scope names, counts and model labels. Where a review reason points at another column it uses that column's title in the export (`see Failure reason`, `see How the models voted`).
 
 The consensus needs at least two models: a run with one model gets an empty block with `Outcome` `none` on every note.
 
-**Notes too long for the context window are not sent to the model.** Ollama does not refuse an over-long prompt: it keeps a few leading tokens and the tail that fits, silently dropping the instructions and the start of the note, so any answer would be a guess. `data_worker` checks the length first (`llm_analysis.note_fits_context`, a conservative estimate of 3 characters per token plus the prompt overhead) and records such a note with `LLM_Failed = 1`, `LLM_Attempts = 0` and the reason in `LLM_Error`, without a model call. At the default 8192-token window the cut is about 18,000 characters of note; 7 of the 275 sample notes and 111 of the 5,000 corpus notes (about 2%) are longer and are recorded as failed. 8192 is the window at which medgemma:27b and its KV cache fit on Argon's A10; a larger `NLP_CONTEXT_LENGTH` raises the cut but spills the model to the CPU there.
+**Notes too long for the context window are not sent to the model.** Ollama does not refuse an over-long prompt: it keeps a few leading tokens and the tail that fits, silently dropping the instructions and the start of the note, so any answer would be a guess. `data_worker` checks the length first (`llm_analysis.note_fits_context`, a conservative estimate of 3 characters per token plus the prompt overhead) and records such a note with `LLM_Failed = 1`, `LLM_Attempts = 0` and the reason in `LLM_Error`, without a model call. At the default 8192-token window the cut is about 18,000 characters of note; 7 of the 275 sample notes and 111 of the 5,000 corpus notes (about 2%) are longer and are recorded as failed. 8192 is the window at which medgemma:27b and its KV cache fit on Argon's A10; a larger `NLP_CONTEXT_LENGTH` raises the cut but spills the model to the CPU there. The estimate is one tokenizer's ratio, and the study runs three models with different tokenizers, so the server's own counts are checked as well: when the last chunk of a call reports more prompt and answer tokens than the window holds, the model answered from a shifted or cut context, and `llm_analysis` discards that answer and records the note as too long (`PromptCutError`; `LLM_Error` begins the same way as for a note not sent; no retry, since the same prompt would be cut again). A count below the window proves nothing, because a cached prefix may be left out of it, so this never fails a note the server did not count as over.
 
 ---
 
 ### `export.py`
 
-**Purpose:** Writes `output/results.csv`, the human-readable view of the database
+**Purpose:** Writes `output/results.csv`, the human-readable view of the database, and `output/results-review.csv`, its review-sized copy: the same rows with only the identifiers, the consensus block and the note length (columns A to X as in `results.csv`, then the length), about 4% of the size, written from the same pass over the database and write-once together with it, so the full study corpus still opens in Google Sheets
 
 The database keeps machine names (`Endoscopy (medgemma:27b@8192)`, 0/1 flags, `"true"`/`"false"` review flags). `export_results` presents the same data for a researcher in Google Sheets or Excel: every column gets a title in plain words with its source in parentheses (`Upper endoscopy performed (consensus)`, `Scope type (medgemma:27b@8192)`); every yes/no value is written `TRUE` or `FALSE`, which both spreadsheets read as a boolean, so the review queue is highlighted with one rule; the consensus block comes first with its review flag in a fixed position (column G); each model's block follows in the same field order; the bulky audit text (rejected attempts, raw responses) sits at the far right, before the note. Nothing is changed: a cell is empty exactly where the database holds NULL. The layout is three tables at the top of the module (`CONSENSUS_LAYOUT`, `MODEL_LAYOUT`, `AUDIT_LAYOUT`), checked against the database columns on import so a new column cannot go missing from the export. The export line reports the rows, columns and size, and how many rows the review flag marks. `results-csv-guide.md` explains the file to its readers; keep it in step with the layout.
 
@@ -564,6 +559,7 @@ Key Safeguards:
   0.8 with a repeat penalty of 1.1 and the attempt number as the seed, since a greedy retry
   would repeat the loop
 - Output capped at 2048 tokens (`num_predict`); context window `NLP_CONTEXT_LENGTH` tokens
+- Each call and the model load use an HTTP timeout of `NLP_LLM_TIMEOUT` seconds (default 1800): the answer is streamed, so this is the longest silence from the server before the call counts as failed, never a cap on a slow but working model. A failed call is recorded for the note and three in a row stop the pass
   (default 8192, `num_ctx`) on every call, the same as an Argon job. 8192 is what medgemma:27b
   fits in on the A10 with its KV cache; anything larger spills to the CPU. Notes that do not
   fit the window are failed without a model call rather than silently truncated
@@ -604,6 +600,7 @@ HIPAA:
 Generated in `/output`:
 
 - `results.csv` – one row per note, laid out for Google Sheets or Excel. **[results-csv-guide.md](results-csv-guide.md) explains every column to a researcher**, with the steps to highlight the review queue; this section is the short version.
+- `results-review.csv` – the same rows with only the identifiers, the consensus block (columns A to X, as in `results.csv`) and the note length: about 4% of the size (some 30 MB at 100,000 notes), so the whole corpus opens in Google Sheets. Open it for the review queue and the study values; open `results.csv` for each model's own answers, the rejected attempts and the note text.
 
 Columns, in order (`export.py`):
 
@@ -642,7 +639,7 @@ Within each model's block:
 
 Expect failures. Many notes in a mixed pool are not procedure notes, and a small model will try to answer them anyway; the checks turn those guesses into failures with a stated reason instead of wrong rows.
 
-The export is **write-once**: an existing `results.csv` is never overwritten. Move it aside and run `--analyze` again to regenerate it from the database.
+The export is **write-once**: the two files are written only when neither exists, and an existing one is never overwritten. Move both aside and run `--analyze` again to regenerate them from the database.
 
 ---
 

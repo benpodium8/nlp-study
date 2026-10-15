@@ -1,6 +1,8 @@
 import csv
+import hashlib
 import re
 import sqlite3
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -125,8 +127,57 @@ WHERE mrn = ? AND encounter = ? AND note_csn_id = ?
   AND note_date = ? AND note_type = ? AND note = ?;
 """
 
-# The header names a notes CSV must carry (case-sensitive; extra columns are ignored).
+# The csv module refuses a field longer than its default limit (128 KiB). A note can be
+# longer than that, so the limit is raised as far as the platform allows.
+_field_limit = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(_field_limit)
+        break
+    except OverflowError:
+        _field_limit //= 10
+
+# The columns a notes CSV must carry. A header name is matched without regard to case,
+# spaces, underscores, dashes or a byte-order mark, and the other spellings each column
+# goes by in exports are accepted too (CSV_COLUMN_ALIASES, tried in order after the name
+# itself); extra columns are ignored. So "EncounterID", "encounter_id" and "Encounter" all
+# serve as Encounter, and a file need not be edited before it is ingested.
 REQUIRED_CSV_COLUMNS = ("MRN", "Encounter", "NoteCsnID", "NoteDate", "NoteType", "Note")
+CSV_COLUMN_ALIASES = {
+    "MRN": ("patientmrn", "medicalrecordnumber"),
+    "Encounter": ("encounterid", "encountercsn", "encountercsnid", "encid"),
+    "NoteCsnID": ("notecsn", "csnid", "csn"),
+    "NoteDate": ("dateofservice", "servicedate", "date"),
+    "NoteType": ("type",),
+    "Note": ("notetext", "text"),
+}
+
+
+def _normalize_header(name: str | None) -> str:
+    """A header name with its case, spaces, underscores, dashes and any byte-order mark dropped."""
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def match_csv_columns(header) -> tuple[dict, list]:
+    """
+    Which column of a CSV header serves each of REQUIRED_CSV_COLUMNS: the name itself in any
+    spelling first, then its CSV_COLUMN_ALIASES in order; a header column serves one required
+    column at most. Returns ({required: header column}, [required columns not found]).
+    """
+    normalized = {}
+    for name in header or []:
+        normalized.setdefault(_normalize_header(name), name)  # the first column wins a repeated spelling
+    mapping, missing, taken = {}, [], set()
+    for required in REQUIRED_CSV_COLUMNS:
+        for candidate in (_normalize_header(required), *CSV_COLUMN_ALIASES[required]):
+            found = normalized.get(candidate)
+            if found is not None and found not in taken:
+                mapping[required] = found
+                taken.add(found)
+                break
+        else:
+            missing.append(required)
+    return mapping, missing
 
 COUNT_NOTES_SQL = "SELECT COUNT(*) FROM notes;"
 
@@ -178,6 +229,9 @@ def create_db(db_path: Path, labels=(), legacy_label: str | None = None):
     conn = sqlite3.connect(db_path)
     with conn:
         conn.execute(NOTES_TABLE_SCHEMA)
+        # The ingest checks every row of a file against the stored notes; without the index
+        # each check scans the whole table, and a large corpus takes hours to load.
+        conn.execute("CREATE INDEX IF NOT EXISTS notes_identity ON notes (mrn, encounter, note_csn_id);")
         conn.execute(RESULTS_TABLE_SCHEMA)
         # A converted legacy block gets its review columns filled even when this run does not
         # use that model (the loop below only covers labels); a fresh database has no such block.
@@ -311,85 +365,148 @@ class IngestSummary(NamedTuple):
     seconds: float
 
 
+# Rows are written in transactions of this many: an ingest holds one batch in memory, and an
+# ingest that is interrupted keeps the batches it stored (the next run skips them as duplicates).
+INGEST_BATCH = 1000
+
+
+def _csv_lines(csv_path: Path, counts: dict):
+    """
+    The lines of csv_path for the csv module, read as they are needed, never the whole file
+    at once: UTF-8 with a byte-order mark skipped, a byte that is not UTF-8 replaced with
+    U+FFFD and a NUL byte dropped, each counted in counts ("undecodable", "nuls").
+    """
+    with csv_path.open(newline="", encoding="utf-8-sig", errors="replace") as f:
+        for line in f:
+            if "\ufffd" in line:
+                counts["undecodable"] += line.count("\ufffd")
+            if "\x00" in line:
+                counts["nuls"] += line.count("\x00")
+                line = line.replace("\x00", "")
+            yield line
+
+
+def _count_csv_rows(csv_path: Path) -> int:
+    """The data rows in csv_path (a quoted note that spans lines is one row): a first pass, so progress can say how many are left."""
+    reader = csv.reader(_csv_lines(csv_path, {"undecodable": 0, "nuls": 0}))
+    next(reader, None)
+    return sum(1 for _ in reader)
+
+
 def ingest_csv(csv_path: Path, conn: sqlite3.Connection, report=print, progress=None) -> IngestSummary:
     """
-    Ingests CSV data into the database, skipping duplicate rows.
-    Raises ValueError, naming the headers found, when a REQUIRED_CSV_COLUMNS entry is missing.
-    Calls report with one summary line at the end and, when given, progress(checked, total,
-    new, duplicates) every INGEST_PROGRESS_EVERY rows while the rows are checked against the
-    database (the slow part of a large file).
+    Ingests CSV data into the database, skipping every row identical to a stored note or to
+    an earlier row of the same file. The file is read twice, row by row, never whole: once
+    to count the rows, then to store them in batches of INGEST_BATCH, so a corpus of any
+    size takes the memory of one batch. It is read as UTF-8, skipping a byte-order mark; a
+    byte that is not valid UTF-8 is replaced with U+FFFD and a NUL byte is dropped, each
+    counted and reported, so a file from another system is read rather than refused (a quote
+    that spans a replaced character may then not match the note, which the verifier reports
+    on that note). The header is matched by match_csv_columns; a row with fewer cells than
+    the header is stored with the missing cells empty. Raises ValueError, naming the header
+    found, when a required column has no match. Calls report with a line for the header
+    (when any name was taken for another or a byte-order mark skipped), a warning per
+    problem found in the file, and one summary line at the end; and, when given,
+    progress(checked, total, new, duplicates) every INGEST_PROGRESS_EVERY rows.
 
     Parameters:
         csv_path: Path to the CSV file to ingest.
         conn: Database connection object.
     """
     started = time.perf_counter()
-    with csv_path.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+    total = _count_csv_rows(csv_path)
+    counts = {"undecodable": 0, "nuls": 0}
+    reader = csv.DictReader(_csv_lines(csv_path, counts))
+    found = reader.fieldnames or []
+    mapping, missing = match_csv_columns(found)
+    if missing:
+        raise ValueError(
+            f"CSV is missing the column(s) {', '.join(missing)}. "
+            f"Required: {', '.join(REQUIRED_CSV_COLUMNS)} (any case; spaces, underscores and dashes are "
+            f"ignored; EncounterID, note_csn_id and the like are accepted). "
+            f"Header found: {', '.join(found) or '(empty)'}"
+        )
+    columns = [mapping[name] for name in REQUIRED_CSV_COLUMNS]
 
-        found = reader.fieldnames or []
-        missing = [name for name in REQUIRED_CSV_COLUMNS if name not in found]
-        if missing:
-            raise ValueError(
-                f"CSV is missing the column(s) {', '.join(missing)}. "
-                f"Required (case-sensitive): {', '.join(REQUIRED_CSV_COLUMNS)}. "
-                f"Header found: {', '.join(found) or '(empty)'}"
-            )
+    checked = new = duplicates = short = empty = 0
+    note_types = Counter()
+    new_lengths = []
+    seen = set()    # a digest of every row stored from this file: a row the file repeats is a duplicate too
+    batch = []
+    if progress is not None:
+        progress(0, total, 0, 0)
+    for row in reader:
+        checked += 1
+        values = [row.get(column) for column in columns]
+        if any(value is None for value in values):
+            short += 1  # fewer cells than the header: DictReader gives None for the rest
+        values = tuple("" if value is None else value for value in values)
+        note_types[values[4]] += 1
+        digest = hashlib.sha256("\x1f".join(values).encode("utf-8")).digest()
+        if digest in seen or conn.execute(CHECK_DUPLICATE_NOTE_SQL, values).fetchone()[0]:
+            duplicates += 1
+        else:
+            seen.add(digest)
+            batch.append(values)
+            new += 1
+            new_lengths.append(len(values[5]))
+            empty += not values[5].strip()
+            if len(batch) >= INGEST_BATCH:
+                with conn:
+                    conn.executemany(INSERT_NOTE_SQL, batch)
+                batch.clear()
+        if progress is not None and (checked % INGEST_PROGRESS_EVERY == 0 or checked == total):
+            progress(checked, total, new, duplicates)
+    if batch:
+        with conn:
+            conn.executemany(INSERT_NOTE_SQL, batch)
 
-        rows = [
-            (
-                row["MRN"],
-                row["Encounter"],
-                row["NoteCsnID"],
-                row["NoteDate"],
-                row["NoteType"],
-                row["Note"],
-            )
-            for row in reader
-        ]
-
-    with conn:
-        new_rows = []
-        duplicates_count = 0
-
-        if progress is not None:
-            progress(0, len(rows), 0, 0)
-        for checked, row in enumerate(rows, start=1):
-            cursor = conn.execute(CHECK_DUPLICATE_NOTE_SQL, row)
-            count = cursor.fetchone()[0]
-
-            if count == 0:
-                new_rows.append(row)
-            else:
-                duplicates_count += 1
-            if progress is not None and (checked % INGEST_PROGRESS_EVERY == 0 or checked == len(rows)):
-                progress(checked, len(rows), len(new_rows), duplicates_count)
-
-        if new_rows:
-            conn.executemany(INSERT_NOTE_SQL, new_rows)
+    aliased = [f"{name!r} read as {required}" for required, name in mapping.items() if name != required]
+    bom = csv_path.open("rb").read(3) == b"\xef\xbb\xbf"
+    if bom or aliased:
+        parts = (["byte-order mark skipped"] if bom else []) + aliased
+        report(f"Header of {csv_path}: {'; '.join(parts)}.")
+    if counts["undecodable"]:
+        report(
+            f"Warning: {counts['undecodable']} byte(s) in {csv_path} were not valid UTF-8 and were replaced with U+FFFD; "
+            f"a quote that spans such a character will not match its note."
+        )
+    if counts["nuls"]:
+        report(f"Warning: {counts['nuls']} NUL byte(s) in {csv_path} were dropped.")
+    if short:
+        report(f"Warning: {short} row(s) in {csv_path} had fewer cells than the header; the missing cells are stored empty.")
+    if empty:
+        report(f"Note: {empty} new note(s) are empty; each will be analysed and come out as no procedure documented.")
 
     seconds = time.perf_counter() - started
     report(
-        f"Read {len(rows)} row(s) from {csv_path} in {seconds:.1f}s: "
-        f"{len(new_rows)} new note(s) added, {duplicates_count} duplicate(s) skipped."
+        f"Read {checked} row(s) from {csv_path} in {seconds:.1f}s: "
+        f"{new} new note(s) added, {duplicates} duplicate(s) skipped."
     )
-    return IngestSummary(
-        len(rows), len(new_rows), duplicates_count,
-        Counter(row[4] for row in rows), [len(row[5]) for row in new_rows], seconds,
-    )
+    return IngestSummary(checked, new, duplicates, note_types, new_lengths, seconds)
 
 
-def pending_notes(conn: sqlite3.Connection, label: str) -> list[tuple[int, str]]:
-    """(id, note) of every note that has no result under label yet, in id order."""
+def pending_notes(conn: sqlite3.Connection, label: str) -> list[tuple[int, int]]:
+    """
+    (id, length of the note in characters) of every note that has no result under label
+    yet, in id order. The text is not loaded here: a pass over a large corpus fetches each
+    note when its turn comes (note_text), so the list costs a few bytes per note.
+    """
     return conn.execute(
         f"""
-        SELECT notes.id, notes.note
+        SELECT notes.id, LENGTH(notes.note)
         FROM notes
         LEFT JOIN results ON notes.id = results.id
         WHERE results.id IS NULL OR results.{_col("LLM_Failed", label)} IS NULL
         ORDER BY notes.id;
         """
     ).fetchall()
+
+
+def note_text(conn: sqlite3.Connection, note_id: int) -> str:
+    """The text of one note ("" for a note stored without text)."""
+    row = conn.execute("SELECT note FROM notes WHERE id = ?;", (note_id,)).fetchone()
+    return row[0] if row and row[0] is not None else ""
 
 
 class ModelStatistics(NamedTuple):
@@ -565,15 +682,22 @@ def _write_block(conn: sqlite3.Connection, id: int, label: str, columns, values)
     conn.execute(f"UPDATE results SET {assignments} WHERE id = ?;", (*values, id))
 
 
-def model_answers(conn: sqlite3.Connection, labels) -> list[tuple[int, str, str, list[tuple]]]:
+# How many notes model_answers reads from the database at a time.
+ANSWERS_PAGE = 500
+
+
+def model_answers(conn: sqlite3.Connection, labels):
     """
-    Every note's answers from the models with the given labels, for the consensus: a list of
-    (note id, note_type, note text, [(label, LLM_Failed, LLM_Error, fields), ...]) in id and
-    label order, where fields is the dict of RESULT_FIELDS values. LLM_Failed is None (and the
-    fields null) for a model that has not analysed the note, or whose block the table lacks.
-    The note's type and text are there for the consensus to say what suggests a note without
-    a consensus documents a procedure, and to check the agreed FellowPresent against the
-    note's attestation (consensus.consensus).
+    Every note's answers from the models with the given labels, for the consensus, yielded
+    one note at a time in id order as (note id, note_type, note text, [(label, LLM_Failed,
+    LLM_Error, fields), ...]), with the models in label order and fields the dict of
+    RESULT_FIELDS values. LLM_Failed is None (and the fields null) for a model that has not
+    analysed the note, or whose block the table lacks. The note's type and text are there for
+    the consensus to say what suggests a note without a consensus documents a procedure, and
+    to check the agreed FellowPresent against the note's attestation (consensus.consensus).
+    The notes are read in pages of ANSWERS_PAGE, each page fetched whole before any of it is
+    yielded, so a corpus of any size takes the memory of one page and the caller may write
+    to the results table between notes (no cursor is open while it does).
     """
     existing = {name for name, _ in _table_columns(conn, "results")}
     wanted = [(label, field) for label in labels for field in ("LLM_Failed", "LLM_Error", *(f for f, _ in RESULT_FIELDS))]
@@ -581,21 +705,25 @@ def model_answers(conn: sqlite3.Connection, labels) -> list[tuple[int, str, str,
         f"results.{_col(field, label)}" if column_name(field, label) in existing else "NULL"
         for label, field in wanted
     )
-    rows = conn.execute(
-        f"SELECT notes.id, notes.note_type, notes.note, {select} "
-        f"FROM notes LEFT JOIN results ON notes.id = results.id ORDER BY notes.id;"
-    ).fetchall()
-
     width = 2 + len(RESULT_FIELDS)
-    answers = []
-    for row in rows:
-        per_model = []
-        for index, label in enumerate(labels):
-            llm_failed, error, *values = row[3 + index * width : 3 + (index + 1) * width]
-            fields = dict(zip((f for f, _ in RESULT_FIELDS), values))
-            per_model.append((label, llm_failed, error, fields))
-        answers.append((row[0], row[1], row[2], per_model))
-    return answers
+    last_id = 0
+    while True:
+        page = conn.execute(
+            f"SELECT notes.id, notes.note_type, notes.note, {select} "
+            f"FROM notes LEFT JOIN results ON notes.id = results.id "
+            f"WHERE notes.id > ? ORDER BY notes.id LIMIT ?;",
+            (last_id, ANSWERS_PAGE),
+        ).fetchall()
+        if not page:
+            return
+        for row in page:
+            per_model = []
+            for index, label in enumerate(labels):
+                llm_failed, error, *values = row[3 + index * width : 3 + (index + 1) * width]
+                fields = dict(zip((f for f, _ in RESULT_FIELDS), values))
+                per_model.append((label, llm_failed, error, fields))
+            yield (row[0], row[1], row[2], per_model)
+        last_id = page[-1][0]
 
 
 def store_consensus(conn: sqlite3.Connection, rows: dict[int, dict]):

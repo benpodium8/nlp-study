@@ -1,7 +1,7 @@
 import time
 from typing import NamedTuple, Sequence
 
-from database import COUNT_NOTES_SQL, insert_result, pending_notes
+from database import COUNT_NOTES_SQL, insert_result, note_text, pending_notes
 from llm_analysis import (
     CALL_FAILED_PREFIX, MODELS, ModelSpec, llm_analysis, LLMAnalysisError, RetryableLLMError, estimated_prompt_tokens,
     load_model, model_served, note_fits_context, ollama_status, too_long_error,
@@ -143,9 +143,9 @@ def _run_model(conn, model: ModelSpec, index: int, count: int, total_notes: int,
     Analyses every note that has no result under model's label yet, and stores each one.
     Returns (notes processed, why the pass stopped early or None).
     """
-    rows = pending_notes(conn, model.label)
+    rows = pending_notes(conn, model.label)   # (id, length): the text is fetched note by note below
     pending = len(rows)
-    too_long = sum(not note_fits_context(note, model.num_ctx) for _, note in rows)
+    too_long = sum(not note_fits_context(length, model.num_ctx) for _, length in rows)
     run = reporter.begin_model(model, index, count, total_notes, total_notes - pending, pending, too_long)
 
     details = f"{model.name}: {info.describe()}" if info else model.name
@@ -172,8 +172,9 @@ def _run_model(conn, model: ModelSpec, index: int, count: int, total_notes: int,
         else:
             reporter.model_loaded(loaded.seconds, loaded.placement, loaded.context_length)
 
-    for position, (note_id, note) in enumerate(rows, start=1):
-        call = run.begin_note(note_id, position, estimated_prompt_tokens(note), MAX_ATTEMPTS)
+    for position, (note_id, length) in enumerate(rows, start=1):
+        note = note_text(conn, note_id)
+        call = run.begin_note(note_id, position, estimated_prompt_tokens(length), MAX_ATTEMPTS)
         note_started = time.perf_counter()
         analysis = analyze_note(note_id, note, model, call, reporter)
         seconds = round(time.perf_counter() - note_started, 2)

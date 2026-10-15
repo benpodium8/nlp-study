@@ -10,7 +10,7 @@ from database import (
     COUNT_NOTES_SQL, REQUIRED_CSV_COLUMNS, create_db, database_status, ingest_csv, model_statistics, pending_notes,
 )
 from data_worker import SUMMARY_EVERY, WorkerOutcome, data_worker
-from export import EXPORT_NAME, export_results
+from export import EXPORT_NAME, REVIEW_EXPORT_NAME, export_results
 from llm_analysis import LOCATIONS, MODELS, ModelSpec, max_note_chars, model_served, note_fits_context, ollama_status
 from reporter import FIELD_TALLIES, HEARTBEAT_SECONDS, ModelPlan, Reporter, duration, plural
 
@@ -19,6 +19,7 @@ STORED_RATE_MIN_NOTES = 5
 
 DB_PATH = Path("data.db")
 EXPORT_PATH = Path("output") / EXPORT_NAME
+REVIEW_EXPORT_PATH = Path("output") / REVIEW_EXPORT_NAME
 GUIDE_PATH = Path("results-csv-guide.md")
 
 # Result columns from before they were labelled belong to the first default model, whatever
@@ -37,7 +38,7 @@ each of the study models, one model at a time:
 through Ollama, stores every model's answers next to the note in columns labelled with the
 model name and context window, for example "ScopeType ({MODELS[0].label})", consolidates
 the models' answers into a cautious consensus block labelled "(consensus)", and writes
-{EXPORT_PATH}. Nothing leaves this machine. --location local runs the same pipeline with
+{EXPORT_PATH} and its review-sized copy {REVIEW_EXPORT_PATH}. Nothing leaves this machine. --location local runs the same pipeline with
 small stand-in models ({LOCAL_MODEL_NAMES}) for a workstation test.
 
 Run with no options to see this text plus a check of what is in place right now."""
@@ -51,8 +52,9 @@ What the program needs
        {PULL_COMMANDS}
      (for --location local: {LOCAL_MODEL_NAMES}).
      Only --analyze talks to the models; ingesting with --csv alone does not.
-  3. A CSV of notes, UTF-8 without a byte-order mark, whose header row contains
-     exactly these column names (case-sensitive; extra columns are ignored):
+  3. A CSV of notes, UTF-8 (a byte-order mark is skipped), whose header row contains
+     these columns, in any case, spaces, underscores and dashes ignored, the usual
+     other spellings accepted (EncounterID, note_csn_id, ...), extra columns ignored:
        {", ".join(REQUIRED_CSV_COLUMNS)}
      Notes may span lines if the field is quoted. Rows identical to an existing note
      are skipped on ingest.
@@ -67,7 +69,7 @@ Typical use
                                             then rebuild the consensus
   python app.py --analyze --location local  workstation test: the same run with the small
                                             models, each stored under its own label
-  python app.py --clean                     delete {DB_PATH} and {EXPORT_PATH} from earlier runs
+  python app.py --clean                     delete {DB_PATH} and the exports from earlier runs
   python app.py --clean --analyze --csv notes.csv   start over from scratch
 
 While it runs
@@ -120,8 +122,14 @@ Output
                        the note text does not support is recorded with "Failed" TRUE, empty
                        fields and the reason in "Failure reason".
                        Write-once: move it aside to regenerate it from the database.
+  {REVIEW_EXPORT_PATH}   the same rows with the identifiers, the consensus block and the
+                       note length only (columns A to X as in results.csv, then the
+                       length): about 4% of the size, so the full corpus opens in Google
+                       Sheets. Open it for the review queue and the study values, and
+                       results.csv for the evidence, the model blocks and the note text.
+                       Written with results.csv, and write-once together with it.
   {DB_PATH}              the same data, kept for audit and for resuming.
-  Both contain PHI; treat them accordingly."""
+  All contain PHI; treat them accordingly."""
 
 
 def setup_parser():
@@ -172,7 +180,7 @@ def setup_parser():
         action="store_true",
         help=(
             f"Delete the files earlier runs generated ({DB_PATH} and its journal files, "
-            f"{EXPORT_PATH}) before doing anything else. This discards every stored result"
+            f"{EXPORT_PATH}, {REVIEW_EXPORT_PATH}) before doing anything else. This discards every stored result"
         ),
     )
 
@@ -185,7 +193,7 @@ def clean():
     and the export. Removes the export folder too if that leaves it empty.
     """
     generated = [DB_PATH] + [DB_PATH.with_name(DB_PATH.name + s) for s in ("-journal", "-wal", "-shm")]
-    generated.append(EXPORT_PATH)
+    generated += [EXPORT_PATH, REVIEW_EXPORT_PATH]
 
     removed = False
     for path in generated:
@@ -233,10 +241,11 @@ def print_status(models: tuple[ModelSpec, ...]):
     for line in lines[1:]:
         print(f"             {line}")
 
-    if EXPORT_PATH.exists():
-        print(f"  Export     {EXPORT_PATH} exists (write-once; move it aside to regenerate it)")
-    else:
-        print(f"  Export     {EXPORT_PATH} not written yet")
+    for path in (EXPORT_PATH, REVIEW_EXPORT_PATH):
+        if path.exists():
+            print(f"  Export     {path} exists (write-once; move both exports aside to regenerate them)")
+        else:
+            print(f"  Export     {path} not written yet")
 
 
 def run_header(reporter: Reporter, conn, args, models: tuple[ModelSpec, ...], steps: list[str]):
@@ -275,7 +284,7 @@ def work_plan(reporter: Reporter, conn, models: tuple[ModelSpec, ...]) -> dict:
     plan = {}
     for model in models:
         rows = pending_notes(conn, model.label)
-        too_long = sum(not note_fits_context(note, model.num_ctx) for _, note in rows)
+        too_long = sum(not note_fits_context(length, model.num_ctx) for _, length in rows)
         stats = model_statistics(conn, model.label)
         stored = stats.mean_seconds if stats and len(stats.seconds) >= STORED_RATE_MIN_NOTES else None
         plan[model.label] = ModelPlan(len(rows), too_long, stored)
@@ -349,11 +358,11 @@ def run_summary(reporter: Reporter, conn, models: tuple[ModelSpec, ...], outcome
     else:
         items.append(("outcome", f"complete: {plural(outcome.processed, 'note')} analysed in this run"))
         if exported:
-            items.append(("export", f"{exported} (write-once; move it aside to regenerate it)"))
+            items.append(("export", f"{exported} and {REVIEW_EXPORT_PATH} (write-once; move both aside to regenerate them)"))
             items.append(("next", 'the review queue is every row with "Needs human review (consensus)" TRUE (column G); '
                                   f'"Outcome (consensus)" unanimous marks the rows every model agreed on; {GUIDE_PATH} explains the columns'))
         else:
-            items.append(("export", f"{EXPORT_PATH} already existed and was left alone; move it aside and run {resume} to regenerate it"))
+            items.append(("export", f"{EXPORT_PATH} or {REVIEW_EXPORT_PATH} already existed and both were left alone; move them aside and run {resume} to regenerate them"))
     reporter.header(items)
 
 

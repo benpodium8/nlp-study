@@ -41,9 +41,10 @@ def manual_review(
         model repeating itself says nothing about the answer it then gave
       - an upper endoscopy is documented but no scope name was found
       - duodenal biopsies were taken but the note states no count
-      - the note was too long for the context window and was not sent to the model
-        (results stored before that rule existed were sent, and may rest on a prompt that
-        Ollama silently cut, so they are flagged by length)
+      - the note was too long for the context window: not sent to the model, or sent and
+        cut by the server, which its own token counts revealed (llm_analysis.PromptCutError);
+        results stored before those rules existed were sent, and may rest on a prompt that
+        Ollama silently cut, so they are flagged by length
     """
     reasons = []
     kind = failure_kind(error) if llm_failed else None
@@ -51,7 +52,7 @@ def manual_review(
 
     if llm_failed:
         if kind == NOT_SENT:
-            reasons.append("note too long for the context window, not sent to the model; see Failure reason")
+            reasons.append("note too long for the context window, so the model did not read it in full; see Failure reason")
         elif kind == CALL_FAILED:
             reasons.append("the model call failed; see Failure reason")
         else:

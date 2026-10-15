@@ -34,6 +34,13 @@ none (export.py puts these columns under their export titles).
 A model's own ManualReviewRequired flag (review.py) does not carry over: it describes how
 that model reached its answer; the consensus is judged on whether the models agree.
 
+The agreed scope name is written as the note spells it: the consensus copies the note's text
+at the place it states the name (llm_analysis.scope_as_stated), so "GIF-H 190" stays
+"GIF-H 190" whatever the models typed, while each model's own spelling stays in its columns
+as the evidence. A name the note states only in parts (the brand here, the model number
+there) has no one span to copy: the models' joined form is kept and Agreement says so. No
+list of scope names is consulted; the value is always the note's text or the models' form.
+
 The reasons are written for the reader of results.csv: where one points at another column
 ("see Failure reason", "see How the models voted") it uses that column's export title
 (export.py), and it names the fields by their short names (FellowPresent), which
@@ -45,10 +52,10 @@ import time
 from collections import Counter
 from typing import NamedTuple, Sequence
 
-from database import CONSENSUS_COLUMNS, RESULT_FIELDS, model_answers, store_consensus
+from database import CONSENSUS_COLUMNS, COUNT_NOTES_SQL, RESULT_FIELDS, model_answers, store_consensus
 from llm_analysis import (
-    CALL_FAILED, EVIDENCE_FOR_FLAG, MODELS, NOT_SENT, REJECTED, ModelSpec, failure_kind, squash, summed_count_quote,
-    supported_counts,
+    CALL_FAILED, EVIDENCE_FOR_FLAG, MODELS, NOT_SENT, REJECTED, ModelSpec, failure_kind, scope_as_stated, squash,
+    summed_count_quote, supported_counts,
 )
 
 
@@ -86,25 +93,28 @@ MIN_SCOPE_KEY_CHARS = 3
 # FellowPresent and never used to set it. The teaching-physician wording means a trainee
 # performed under supervision (FellowPresent 1, prompt rule 7); a Staff Only or "Fellow:
 # None" line means no trainee took part (0). "Was present for the entire procedure" needs a
-# first-person subject ("I was present", "I, Dr X, was present"): the same words describe the
-# sedation monitor in some notes.
+# first-person subject ("I was present", "I, Dr X, was present") or a trainee context (the
+# "RES/FEL Staff Procedure Presence Statement" heading, or a fellow's signature just before
+# it): the same words describe the sedation monitor in some notes.
 TEACHING_ATTESTATION_RE = re.compile(
     r"teaching (physician )?statement|was present and actively participated"
-    r"|\bi\b[^\n]{0,60}?\bwas present for the entire procedure",
+    r"|\bi\b[^\n]{0,60}?\bwas present for the entire procedure"
+    r"|\bres\s*/\s*fel\b|fellow\b[^\n]{0,80}?\bwas present for the entire procedure",
     re.I,
 )
 NO_TRAINEE_LINE_RE = re.compile(r"staff only|(resident/)?fellows?\s*:?\s*none\b", re.I)
 
 # What suggests a note documents a procedure, so that a row without a consensus on it is
 # flagged rather than released as a true empty: a procedure note type (Procedures, the Upper
-# Endoscopy / PED Endoscopy / PEG Placement family, Brief Op Note, OR PostOp, OR Nursing), or
+# Endoscopy / PED Endoscopy / PEG Placement family, Brief Op Note and other operative notes,
+# OR PostOp, OR Nursing), or
 # upper endoscopy wording in the text (the scope passed or the esophagus intubated, an upper
 # endoscope's brand or model). In the 5,000-note corpus that wording occurs in 353 of the 609
 # Procedures notes and in about twenty notes of other types; every note too long for the
 # window is of another type, which is why a note a model never read is flagged before these
 # marks are looked at. The marks never decide a value.
 PROCEDURE_NOTE_TYPE_RE = re.compile(
-    r"procedure|endoscop|colonoscop|peg placement|brief op note|\bor (postop|nursing)\b", re.I
+    r"procedure|endoscop|colonoscop|peg placement|op note|operative|\bor (postop|nursing)\b", re.I
 )
 EGD_LANGUAGE_RE = re.compile(
     r"o?esophagus (was )?intubated|(endoscope|gastroscope) (was )?(advanced|passed)"
@@ -248,7 +258,7 @@ def procedure_marks(note_type: str | None, note: str | None, answered: Sequence[
 
 # How the reasons word each kind of failure (llm_analysis.failure_kind).
 FAILURE_WORDING = {
-    NOT_SENT: "not sent the note, too long for the context window",
+    NOT_SENT: "the note was too long for the context window",
     CALL_FAILED: "the model call failed",
     REJECTED: "no answer the note supports",
 }
@@ -283,8 +293,8 @@ def _no_answer(failed: Sequence[ModelAnswer], total: int) -> tuple[str, str]:
     kinds = {failure_kind(a.error) for a in failed}
     if kinds == {NOT_SENT}:
         return (
-            "note too long for the context window, not sent to any model; see each model's Failure reason",
-            "No consensus: the note was too long to send to any model",
+            "note too long for the context window, so no model read it in full; see each model's Failure reason",
+            "No consensus: the note was too long for the context window",
         )
     if kinds == {CALL_FAILED}:
         return (
@@ -335,8 +345,10 @@ def consensus(
     that gave the winning value), for the run's agreement tally.
     note_type and note, when given, let Agreement say what suggests a note without a
     consensus documents a procedure (procedure_marks) and let the agreed FellowPresent be
-    checked against the note's own attestation (attestation_conflicts). Without them the
-    attestation is not checked; a note without a consensus is flagged either way.
+    checked against the note's own attestation (attestation_conflicts). The note also lets the
+    agreed scope name be written as the note spells it (scope_as_stated); without it the
+    models' form is kept. Without them the attestation is not checked; a note without a
+    consensus is flagged either way.
     """
     values = {field: None for field, _ in RESULT_FIELDS}
     answered = [a for a in answers if a.answered]
@@ -431,6 +443,19 @@ def consensus(
             undecided.add("ScopeType")
             conflicts.append("ScopeType left empty: the consensus has no upper endoscopy")
 
+        # The agreed scope name is written as the note spells it, copied from the note where
+        # it states the name (scope_as_stated); each model's own spelling stays in its columns
+        # as the evidence. A name the note states only in parts (the brand here, the model
+        # number there) has no one span to copy, so the models' joined form is kept and
+        # Agreement says so. No list of scope names is consulted.
+        joined = None
+        if values["ScopeType"] is not None and note is not None:
+            stated = scope_as_stated(values["ScopeType"], note)
+            if stated is None:
+                joined = f"ScopeType: {_show(values['ScopeType'])} is the models' form, joined from parts the note states apart"
+            else:
+                values["ScopeType"] = stated
+
         disputed = [
             f"{field} ({'no majority, left empty' if field in empty else 'majority answer given'})"
             for field in VOTED_FIELDS if field in empty or field in by_majority
@@ -482,6 +507,8 @@ def consensus(
             )
 
         agreement = f"{header}; " + ("; ".join(lines) if lines else "they agree on every field")
+        if joined:
+            agreement += f"; {joined}"
         if empty or conflicts:
             outcome = "partial"
         elif by_majority:
@@ -568,13 +595,15 @@ def _agreeing(field: str, vote: _Vote, answered: Sequence[ModelAnswer]) -> list:
     return [a.label for a in answered if a.fields[field] == vote.value]
 
 
-# How often consolidate reports its progress (notes consolidated).
+# How often consolidate reports its progress (notes consolidated), and how many consensus
+# rows it holds before writing them: a corpus of any size takes the memory of one batch.
 CONSENSUS_PROGRESS_EVERY = 100
+CONSENSUS_BATCH = 1000
 
 # How a consensus review reason is counted in the summary: the first marker found in it.
 REASON_KEYS = (
     ("has not analysed this note", "a model has not analysed the note"),
-    ("not sent to any model", "note too long for the window, not sent to any model"),
+    ("so no model read it in full", "note too long for the window, no model read it in full"),
     ("call failed for every model", "the model call failed for every model"),
     ("no model gave an answer", "no model gave an answer the note supports"),
     ("no model answered:", "no model answered, each failing differently"),
@@ -611,18 +640,23 @@ def consolidate(conn, models: Sequence[ModelSpec] = MODELS, report=print, progre
     """
     started = time.perf_counter()
     labels = [model.label for model in models]
-    answers = model_answers(conn, labels)
-    rows = {}
+    total = conn.execute(COUNT_NOTES_SQL).fetchone()[0]
+    rows = {}       # the consensus rows not yet written (at most CONSENSUS_BATCH)
+    notes = 0
     outcomes = Counter()
     disputed = Counter()
     reasons = Counter()
     agreement = {label: [0, 0] for label in labels}
     flagged = 0
     unflagged_none = 0
-    for done, (note_id, note_type, note, per_model) in enumerate(answers, start=1):
+    for done, (note_id, note_type, note, per_model) in enumerate(model_answers(conn, labels), start=1):
         votes = {}
         row = consensus([ModelAnswer(*answer) for answer in per_model], votes, note_type, note)
         rows[note_id] = row
+        notes += 1
+        if len(rows) >= CONSENSUS_BATCH:
+            store_consensus(conn, rows)   # safe between notes: model_answers holds no open cursor
+            rows = {}
         outcomes[row["Outcome"]] += 1
         flagged += row["ManualReviewRequired"] == "true"
         unflagged_none += row["Outcome"] == "none" and row["ManualReviewRequired"] == "false"
@@ -638,13 +672,14 @@ def consolidate(conn, models: Sequence[ModelSpec] = MODELS, report=print, progre
                 if marker in reason:
                     reasons[key] += 1
                     break
-        if progress is not None and (done % CONSENSUS_PROGRESS_EVERY == 0 or done == len(answers)):
-            progress(done, len(answers))
-    store_consensus(conn, rows)
+        if progress is not None and (done % CONSENSUS_PROGRESS_EVERY == 0 or done == total):
+            progress(done, total)
+    if rows:
+        store_consensus(conn, rows)
     seconds = time.perf_counter() - started
 
     report(
-        f"Consensus of {len(labels)} model(s) built for {len(rows)} note(s) in {seconds:.1f}s: "
+        f"Consensus of {len(labels)} model(s) built for {notes} note(s) in {seconds:.1f}s: "
         f"{outcomes['unanimous']} unanimous, {outcomes['agreed']} agreed with a model failed, "
         f"{outcomes['majority']} by majority, {outcomes['partial']} partial, {outcomes['none']} without consensus; "
         f"{flagged} flagged for manual review."
@@ -665,6 +700,6 @@ def consolidate(conn, models: Sequence[ModelSpec] = MODELS, report=print, progre
     if reasons:
         report("Review reasons: " + ", ".join(f"{key} {n}" for key, n in reasons.most_common()) + ".")
     return ConsensusSummary(
-        len(rows), outcomes, flagged, unflagged_none, disputed,
+        notes, outcomes, flagged, unflagged_none, disputed,
         {label: tuple(pair) for label, pair in agreement.items()}, reasons, seconds,
     )

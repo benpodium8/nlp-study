@@ -12,7 +12,16 @@ same field order as the consensus; the bulky audit text (rejected attempts, raw 
 responses) is kept to the far right, before the note itself. results-csv-guide.md explains
 the file to its readers: keep the two in step when a column changes.
 
-Nothing here changes a value: a cell is empty exactly where the database holds NULL.
+Nothing here changes a value: a cell is empty exactly where the database holds NULL, and the
+one presentation change, a leading space before text that a spreadsheet would read as a
+formula (cell), leaves the database text as it was.
+
+A second file, results-review.csv, is written with results.csv from the same pass: the same
+rows with only the identifiers, the consensus block and the note length (columns A to X as in
+results.csv, then the length). It is about 4% of the size, so the full study corpus still
+opens in Google Sheets; the researcher reads the review queue and the study values there and
+opens results.csv for the evidence, the per-model blocks and the note text. The two files are
+write-once together.
 """
 
 import csv
@@ -27,6 +36,8 @@ from database import (
 from llm_analysis import BOOL_FIELDS
 
 EXPORT_NAME = "results.csv"
+REVIEW_EXPORT_NAME = "results-review.csv"
+NOTE_LENGTH_TITLE = "Note length (characters)"
 
 # The note identifiers that open every row (columns A to F), titled as the ingest CSV names
 # them (database.REQUIRED_CSV_COLUMNS), after the database id, which the run log and
@@ -110,14 +121,26 @@ class Column(NamedTuple):
     field: str | None   # a result field name, for the value format; None for a notes column
 
 
+# A spreadsheet reads a cell that starts with one of these as a formula: a quote that begins
+# "- 4 biopsies were taken" shows as an error in Excel, and "=" or "@" can run as one. Such
+# text is written with one leading space, which both spreadsheets show as text; the database
+# holds the text as it was.
+FORMULA_STARTS = ("=", "+", "-", "@", "\t", "\r")
+
+
 def cell(field: str | None, value):
-    """The value as the export writes it: TRUE/FALSE for a flag, empty for NULL, else as stored."""
+    """
+    The value as the export writes it: TRUE/FALSE for a flag, empty for NULL, text that a
+    spreadsheet would take for a formula with a leading space (FORMULA_STARTS), else as stored.
+    """
     if value is None:
         return ""
     if field in FLAG_FIELDS:
         return "TRUE" if value == 1 else "FALSE"
     if field in TEXT_FLAG_FIELDS:
         return "TRUE" if value == "true" else "FALSE"
+    if isinstance(value, str) and value.startswith(FORMULA_STARTS):
+        return " " + value
     return value
 
 
@@ -153,7 +176,7 @@ def export_columns(conn) -> list[Column]:
         block(label, MODEL_LAYOUT)
     for label in labels:
         block(label, AUDIT_LAYOUT)
-    columns.append(Column("Note length (characters)", "LENGTH(notes.note)", None))
+    columns.append(Column(NOTE_LENGTH_TITLE, "LENGTH(notes.note)", None))
     columns.append(Column("Note", "notes.note", None))
 
     titles = [column.title for column in columns]
@@ -161,24 +184,38 @@ def export_columns(conn) -> list[Column]:
     return columns
 
 
+def review_columns(columns: list[Column]) -> list[Column]:
+    """
+    The columns of the review-sized file (REVIEW_EXPORT_NAME): the identifiers, the consensus
+    block and the note length, in the order results.csv has them, so columns A to X are the
+    same in both files and the note length follows.
+    """
+    keep = {title for title, _ in ID_COLUMNS} | {NOTE_LENGTH_TITLE}
+    return [column for column in columns if column.title in keep or column.title.endswith(f" ({CONSENSUS_LABEL})")]
+
+
 def export_results(conn, output_folder="output", report=print) -> Path | None:
     """
     Writes every note with its consensus block and each model's results to
-    output_folder/results.csv, creating the folder if needed, in the layout export_columns
-    gives. The file is written only if it does not already exist (write-once); an existing
-    file is left alone and a message is reported. Reports what was written, where the review
-    flag sits and how many rows it marks (and how many rows have no consensus block at all,
-    should there be any). Returns the path written, or None when it was not.
+    output_folder/results.csv, and the review-sized copy (review_columns) to
+    output_folder/results-review.csv, from one pass over the database, creating the folder if
+    needed. The pair is written only if neither file exists (write-once); otherwise both are
+    left alone and a message names the file(s) in the way. Reports what was written, where the
+    review flag sits and how many rows it marks (and how many rows have no consensus block at
+    all, should there be any). Returns the path of results.csv, or None when nothing was written.
     """
     started = time.perf_counter()
     output_path = Path(output_folder)
     output_path.mkdir(parents=True, exist_ok=True)
 
     output_file = output_path / EXPORT_NAME
-    if output_file.exists():
+    review_file = output_path / REVIEW_EXPORT_NAME
+    existing = [path for path in (output_file, review_file) if path.exists()]
+    if existing:
         report(
-            f"File '{output_file}' already exists. Export skipped; "
-            "move it aside and run --analyze again to regenerate it from the database."
+            f"File(s) {', '.join(repr(str(path)) for path in existing)} already exist. Export skipped; "
+            f"move {EXPORT_NAME} and {REVIEW_EXPORT_NAME} aside and run --analyze again to regenerate "
+            f"both from the database."
         )
         return None
 
@@ -189,14 +226,22 @@ def export_results(conn, output_folder="output", report=print) -> Path | None:
     )
     titles = [column.title for column in columns]
     review = titles.index(REVIEW_COLUMN) if REVIEW_COLUMN in titles else None
+    lean = review_columns(columns)
+    lean_indexes = [titles.index(column.title) for column in lean]
 
     row_count = flagged = unbuilt = 0
-    with output_file.open(mode="w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile)
+    with (
+        output_file.open(mode="w", newline="", encoding="utf-8") as full,
+        review_file.open(mode="w", newline="", encoding="utf-8") as small,
+    ):
+        writer = csv.writer(full)
+        lean_writer = csv.writer(small)
         writer.writerow(titles)
+        lean_writer.writerow([column.title for column in lean])
         for row in cursor:
             values = [cell(column.field, value) for column, value in zip(columns, row)]
             writer.writerow(values)
+            lean_writer.writerow([values[index] for index in lean_indexes])
             row_count += 1
             if review is not None:
                 if values[review] == "TRUE":
@@ -205,14 +250,20 @@ def export_results(conn, output_folder="output", report=print) -> Path | None:
                     unbuilt += 1
 
     size = output_file.stat().st_size
+    lean_size = review_file.stat().st_size
     report(
         f"Wrote {row_count} row(s) and {len(titles)} columns to {output_file} "
         f"({size / 1e6:.1f} MB) in {time.perf_counter() - started:.1f}s."
     )
+    report(
+        f"Wrote the review-sized copy, {row_count} row(s) and {len(lean)} columns, to {review_file} "
+        f"({lean_size / 1e6:.1f} MB): the identifiers, the consensus block and the note length, "
+        f"columns A to {column_letter(len(lean) - 2)} as in {EXPORT_NAME}."
+    )
     if review is not None:
         report(
             f'The review queue is the {flagged} row(s) with "{REVIEW_COLUMN}" TRUE '
-            f"(column {column_letter(review)}); results-csv-guide.md explains the columns."
+            f"(column {column_letter(review)} of both files); results-csv-guide.md explains the columns."
         )
         if unbuilt:
             report(

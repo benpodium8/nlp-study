@@ -117,9 +117,14 @@ def failure_kind(error: str | None) -> str:
     return REJECTED
 
 
-def estimated_prompt_tokens(note: str) -> int:
-    """A conservative (high) estimate of the tokens the prompt for note takes."""
-    return PROMPT_OVERHEAD_TOKENS + int(len(note) / NOTE_CHARS_PER_TOKEN)
+def estimated_prompt_tokens(note) -> int:
+    """
+    A conservative (high) estimate of the tokens the prompt for note takes. note is the text,
+    or its length in characters (what the estimate rests on), so a pass over a large corpus
+    can plan from the stored lengths without loading every note.
+    """
+    length = note if isinstance(note, int) else len(note)
+    return PROMPT_OVERHEAD_TOKENS + int(length / NOTE_CHARS_PER_TOKEN)
 
 
 def max_note_chars(context_length: int = CONTEXT_LENGTH) -> int:
@@ -127,8 +132,8 @@ def max_note_chars(context_length: int = CONTEXT_LENGTH) -> int:
     return int((context_length - ANSWER_RESERVE_TOKENS - PROMPT_OVERHEAD_TOKENS) * NOTE_CHARS_PER_TOKEN)
 
 
-def note_fits_context(note: str, context_length: int = CONTEXT_LENGTH) -> bool:
-    """Whether the prompt for note, plus a normal answer, fits a context window of context_length."""
+def note_fits_context(note, context_length: int = CONTEXT_LENGTH) -> bool:
+    """Whether the prompt for note (the text, or its length in characters), plus a normal answer, fits a context window of context_length."""
     return estimated_prompt_tokens(note) + ANSWER_RESERVE_TOKENS <= context_length
 
 
@@ -140,6 +145,29 @@ def too_long_error(note: str, context_length: int = CONTEXT_LENGTH) -> str:
         f"(NLP_CONTEXT_LENGTH); no model call was made."
     )
 
+
+def prompt_cut_error(prompt_tokens: int, answer_tokens: int, note: str, context_length: int = CONTEXT_LENGTH) -> str:
+    """
+    The LLM_Error text for a note whose prompt the server counted as too long after all: the
+    estimate (note_fits_context) let it through, but the model's own tokenizer needed more
+    tokens than the window holds together with the answer, so the server dropped the start
+    of the prompt (the instructions) and the answer cannot be trusted.
+    """
+    return (
+        f"{TOO_LONG_PREFIX}: the server counted {prompt_tokens} prompt tokens and {answer_tokens} answer "
+        f"tokens, more than the {context_length}-token context window holds (the note is {len(note)} "
+        f"characters, estimated at {estimated_prompt_tokens(note)} prompt tokens), so the model lost the "
+        f"start of the prompt; the answer was discarded."
+    )
+
+
+# How long one model call may go without a byte from the server before it is treated as a
+# failed call (seconds; NLP_LLM_TIMEOUT). The answer is streamed, so the clock restarts with
+# every token, and a slow model is never cut off while it is producing; only a server that has
+# stopped answering is. Without a limit a wedged server holds the run until the job's walltime
+# kills it, with nothing stored for the note. The failed call is recorded like any other, and
+# three in a row stop the pass (data_worker.CALL_FAILURES_BEFORE_STOP).
+LLM_TIMEOUT = float(os.environ.get("NLP_LLM_TIMEOUT", "1800"))
 
 # Generation settings. Temperature 0 makes decoding greedy, so the same note gives the
 # same answer on every run, which a study needs; Ollama's server default is 0.8.
@@ -335,6 +363,14 @@ class LLMAnalysisError(Exception):
     pass
 
 
+class PromptCutError(LLMAnalysisError):
+    """
+    The server reported more prompt and answer tokens than the context window holds, so the
+    model answered from a cut prompt (see prompt_cut_error). Not retried: the same prompt
+    would be cut the same way. Recorded like a note too long to send, which it is.
+    """
+
+
 class RetryableLLMError(LLMAnalysisError):
     """
     The model's answer was rejected in a way another attempt may fix: invalid JSON, a runaway
@@ -426,7 +462,7 @@ class LoadResult(NamedTuple):
     context_length: int | None  # the window the server loaded it with, when it says
 
 
-def load_model(spec: ModelSpec, timeout: float | None = None) -> LoadResult:
+def load_model(spec: ModelSpec, timeout: float | None = LLM_TIMEOUT) -> LoadResult:
     """
     Loads spec's model into memory with the window and think setting the notes are sent
     with (a chat call with no messages, which Ollama answers once the model is loaded), and
@@ -656,22 +692,37 @@ OTHER_SITE_RE = re.compile(
 # A sentence quoted as evidence of a fellow must mention a trainee or an attestation, and must
 # not be the attestation that rules a trainee out (prompt rule 7). "Was present and actively
 # participated" is the teaching-physician attestation wording in these notes (the attending
-# attesting to a procedure a trainee performed), so it counts even without a heading.
+# attesting to a procedure a trainee performed), so it counts even without a heading; so does
+# the other attestation form the corpus uses, "RES/FEL Staff Procedure Presence Statement:
+# Dr X was present for the entire procedure", with or without its heading (the line follows
+# a fellow's signature when the heading is absent).
 TRAINEE_TERMS_RE = re.compile(
     r"fellow|resident|trainee|teaching|supervis|assist|attest|\bpgy|house officer|in training"
-    r"|student|\bintern\b|actively participated",
+    r"|student|\bintern\b|actively participated|\bres\s*/\s*fel\b|presence statement"
+    r"|was present (for|during) the (entire|whole|key)",
     re.I,
 )
 NO_TRAINEE_RE = re.compile(
     r"staff only|(fellow|resident|trainee)s?\s*:?\s*none\b|no (fellow|resident|trainee)", re.I
 )
 
-# A scope name is short, looks like a brand or model, and is not a colonoscope (prompt rule 3).
+# A scope name is short, looks like a brand or model, is not a colonoscope (prompt rule 3) and
+# is not an instrument of another kind. No list of upper endoscopes is kept: any name the note
+# states passes, so a model the corpus has never shown is accepted as it is written. The
+# exclusions are what can never be the upper endoscope: a colonoscope or sigmoidoscope by
+# name or by model prefix (PCF and CF are Olympus colonoscope prefixes, EC the Pentax and
+# Fujifilm one), and scopes of other specialties (a laryngoscope, bronchoscope or microscope
+# named in an airway or ENT note that also passed through the esophagus).
 MAX_SCOPE_CHARS = 80
 SCOPE_NAME_RE = re.compile(
     r"\d|olympus|pentax|fuji|storz|boston|ambu|hoya|scope|endoscop|gastroscop", re.I
 )
-COLONOSCOPE_RE = re.compile(r"colonoscop|sigmoidoscop|\bpcf|\bcf[- ]?[a-z]?\d", re.I)
+COLONOSCOPE_RE = re.compile(r"colonoscop|sigmoidoscop|\bpcf|\bcf[- ]?[a-z]?\d|\bec[- ]?\d", re.I)
+OTHER_INSTRUMENT_RE = re.compile(
+    r"laryngoscop|bronchoscop|microscop|cystoscop|arthroscop|hysteroscop|laparoscop|thoracoscop"
+    r"|ureteroscop|nephroscop|otoscop|ophthalmoscop|rhinoscop|nasopharyngoscop|stethoscop",
+    re.I,
+)
 
 # More duodenal biopsies than this in one procedure is not a count but some other number from
 # the note (an eosinophil count, a CPT code, a date).
@@ -686,9 +737,10 @@ NUMBER_WORDS = {
 }
 NUMBER_WORDS["single"] = 1
 # A quote with one of these contains a number that is part of another ("6 ... including 2
-# from the bulb", "4 biopsies (one from the bulb)", "5 biopsies with 2 from the bulb"), so its
-# numbers must not be added up. Either parenthesis counts: a quote may hold only the closing one.
-NO_SUM_RE = re.compile(r"includ|of which|total|[()]|\bwith\s+\w+\s+from\b", re.I)
+# from the bulb", "4 biopsies (one from the bulb)", "5 biopsies with 2 from the bulb") or a
+# range ("4-6 biopsies", either end a count the sentence states), so its numbers must not be
+# added up. Either parenthesis counts: a quote may hold only the closing one.
+NO_SUM_RE = re.compile(r"includ|of which|total|[()]|\bwith\s+\w+\s+from\b|\d\s*(-|\u2013|to)\s*\d", re.I)
 # Numbers in a biopsy sentence that are not counts: a duodenal site (D1 to D3, "D2-3", "D2-D3",
 # the 1st to 3rd portion).
 SITE_NUMBER_RE = re.compile(r"\bd\s?[123](\s?-\s?d?[123])?\b|\b[123](st|nd|rd)\b", re.I)
@@ -761,6 +813,38 @@ def _scope_in_note(scope: str, squashed_note: str) -> bool:
         return True
     parts = re.findall(r"[a-z0-9]+", scope.lower())
     return bool(parts) and all(part in squashed_note for part in parts)
+
+
+# The characters squash keeps: the complement of _NOT_ALNUM_RE.
+_ALNUM_RE = re.compile(r"[a-z0-9]")
+
+
+def _squash_offsets(note: str) -> list[int]:
+    """For each character of squash(note), in order, the index in note of the character it came from."""
+    lowered = note.lower()
+    if len(lowered) == len(note):
+        return [m.start() for m in _ALNUM_RE.finditer(lowered)]
+    # A character whose lower-case form is longer than itself (none in ASCII): character by character.
+    return [i for i, ch in enumerate(note) for _ in squash(ch)]
+
+
+def scope_as_stated(scope: str, note: str) -> str | None:
+    """
+    The note's own spelling of a scope name: the note's text at the first place the name
+    occurs as given (squash(scope) in squash(note), the test _scope_in_note applies first),
+    from its first alphanumeric character to its last, so that "GIF-H190" comes back as
+    "GIF-H 190" when that is how the note writes it. None when the name does not occur as
+    given, which _scope_in_note accepts when the note states the brand and the model apart
+    ("Olympus endoscope (GIF-H180)"): there is then no one span to copy. No list of names is
+    consulted: the result is always a substring of the note.
+    """
+    target = squash(scope)
+    squashed = squash(note)
+    offsets = _squash_offsets(note)
+    at = squashed.find(target) if target else -1
+    if at == -1 or len(offsets) != len(squashed):
+        return None
+    return note[offsets[at]:offsets[at + len(target) - 1] + 1]
 
 
 def _check_procedure_evidence(field: str, quote: str, terms: re.Pattern, what: str):
@@ -902,6 +986,13 @@ def verify_against_note(result: dict, note: str):
                 "null when the note names no upper endoscope.",
                 scope,
             )
+        if OTHER_INSTRUMENT_RE.search(scope):
+            raise RetryableLLMError(
+                "ScopeType names an instrument that is not an upper endoscope (a laryngoscope, "
+                "bronchoscope, microscope or the like). Give the upper endoscope's brand and "
+                "model, or null when the note names none.",
+                scope,
+            )
         if not SCOPE_NAME_RE.search(scope):
             raise RetryableLLMError(
                 "ScopeType does not look like an endoscope brand or model. Give the brand and "
@@ -975,11 +1066,13 @@ def llm_analysis(
     # is closed when the call returns instead of being held open between notes. The answer
     # is streamed token by token and joined here; the text is the same as an unstreamed call's.
     content = []
+    final = None
     try:
-        with ollama.Client() as client:
+        with ollama.Client(timeout=LLM_TIMEOUT) as client:
             stream = client.chat(model=spec.name, messages=messages, think=spec.think, stream=True,
                                  format=RESPONSE_SCHEMA, options=generation_options(attempt, spec.num_ctx))
             for chunk in stream:
+                final = chunk
                 if chunk.message.content:
                     content.append(chunk.message.content)
                 if observer is not None:
@@ -990,6 +1083,18 @@ def llm_analysis(
         if "repeat limit" in str(e).lower():
             raise RetryableLLMError(f"the model repeated itself until Ollama stopped it ({e}).")
         raise LLMAnalysisError(f"{CALL_FAILED_PREFIX}: {e}")
+
+    # The server's own token counts (the last chunk of the stream) are the one sure test that
+    # the prompt fit: note_fits_context estimates with one tokenizer's ratio, and a model with
+    # a denser tokenizer, or a note full of numbers, can need more. When prompt and answer
+    # together exceed the window, Ollama has shifted or cut the context and the model
+    # answered without the start of the prompt; that answer is discarded and the note is
+    # recorded as too long. A count below the window proves nothing (a cached prefix may be
+    # left out of it), so this never fails a note the server did not count as over.
+    prompt_tokens = getattr(final, "prompt_eval_count", None) if final is not None else None
+    answer_tokens = getattr(final, "eval_count", None) if final is not None else None
+    if prompt_tokens and prompt_tokens + (answer_tokens or 0) > spec.num_ctx:
+        raise PromptCutError(prompt_cut_error(prompt_tokens, answer_tokens or 0, note, spec.num_ctx))
 
     raw = "".join(content)
     try:

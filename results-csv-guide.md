@@ -1,4 +1,4 @@
-# Reading results.csv
+# Reading results.csv and results-review.csv
 
 This guide is for the researcher reading `output/results.csv`, the file the extraction program
 writes. It explains what each column means, how to find the rows that need a human decision,
@@ -34,10 +34,20 @@ A row then holds three kinds of information, from left to right:
 3. **Audit text** (each model's rejected attempts and raw response), the length of the note,
    and the note itself, in the last column.
 
-The file is written once per run and never overwritten; a new run with the same output folder
-leaves the existing file alone until it is moved aside.
+A second file, `results-review.csv`, is written with it from the same pass: the same rows
+with only the identifiers, the consensus block and the note length (columns A to X exactly as
+in this file, then the length in column Y), about 4% of the size, so the whole study corpus
+opens in Google Sheets. Read the review queue and the study values there, including the
+evidence quotes behind each consensus value; open `results.csv` when you need a model's own
+answers, the rejected attempts or the note text.
 
-## 2. Open the file and highlight the review queue
+Both files are written once per run and never overwritten; a new run with the same output
+folder leaves them alone until both are moved aside.
+
+## 2. Open a file and highlight the review queue
+
+Start with `results-review.csv`: it opens quickly whatever the size of the study, and columns A
+to X are the same in both files, so everything below applies to either.
 
 The one column to know is **G, "Needs human review (consensus)"**: TRUE on every row a human
 should look at, FALSE on every other row. Both Google Sheets and Excel read TRUE and FALSE as
@@ -50,7 +60,7 @@ real yes/no values, so one formatting rule highlights the whole queue.
 2. Freeze the header and the identifiers: View, Freeze, 1 row; then click the letter F, View,
    Freeze, Up to column F.
 3. Highlight the queue: Format, Conditional formatting. In "Apply to range" type `A2:CB`
-   (every column, from row 2 down). Under "Format rules" choose "Custom formula is" and enter
+   (every column, from row 2 down; `A2:Y` in results-review.csv). Under "Format rules" choose "Custom formula is" and enter
    `=$G2=TRUE`. Pick a fill colour. Done.
 4. Filter or sort: Data, Create a filter; on column G keep only TRUE. Or sort column G from Z to
    A, which puts TRUE first.
@@ -71,7 +81,8 @@ rule `=$G2="TRUE"` works instead; `=OR($G2=TRUE,$G2="TRUE")` works either way.
 
 Two habits that keep the file usable:
 
-- Record your decisions in **new columns at the far right**, after "Note" (column CB), for
+- Record your decisions in **new columns at the far right**, after the last column ("Note",
+  CB, in results.csv; the note length, Y, in results-review.csv), for
   example "Reviewer decision" and "Reviewer notes". Inserting or deleting columns in the middle
   changes the column letters this guide uses.
 - A cell in Excel holds at most 32,767 characters, and a few notes are longer than that (the
@@ -104,7 +115,7 @@ Every title in this block ends in "(consensus)".
 | J | Models answered | How many of the models gave an answer the note supports: 0 to 3. A consensus needs at least 2. |
 | K | Summary | One line, in words, of what the consensus found, built from the consensus fields only: "No procedure documented", "Upper endoscopy with Olympus GIF-H190; 4 duodenal biopsies; fellow present", "Upper endoscopy, scope not named; duodenal biopsies taken, count not stated; no fellow", "No consensus: 1 of 3 models answered". A field the models left empty is called "undecided". |
 | L | Upper endoscopy performed | TRUE, FALSE, or empty when there is no consensus. Section 3.3 has the definitions. |
-| M | Scope type | The upper endoscope as the note names it, or empty. |
+| M | Scope type | The upper endoscope, written as the note spells it (section 3.3), or empty. |
 | N | Upper endoscopy evidence quote | The sentence from the note that documents the upper endoscopy; empty when L is not TRUE. |
 | O | Duodenal biopsies taken | TRUE, FALSE, or empty. |
 | P | Number of duodenal biopsies | A number; 0 when none were taken; empty when biopsies were taken but the note states no count (the Summary then says "count not stated"), or when there is no consensus. |
@@ -115,7 +126,7 @@ Every title in this block ends in "(consensus)".
 | U | Fellow evidence quote | The attestation sentence or the line naming the trainee; empty when T is not TRUE. |
 | V | Models consulted | The models, in run order, separated by "; ", each marked "(failed)" or "(not analysed)" when it gave no answer. |
 | W | Disputed fields | The fields on which the answering models did not all agree, each marked "(majority answer given)" or "(no majority, left empty)". Empty when they agreed on every field. |
-| X | How the models voted | "3 of 3 models answered; they agree on every field", or which models failed and, for every disputed field, each model's value: "FellowPresent: 1 (model A), 0 (model B): no majority, left empty". For a row without consensus it also says which case the row is: flagged because a model never read the note, flagged because something suggests the note documents a procedure (a procedure note type, upper endoscopy wording in the note, a model that found one), or released unflagged because every model read it and nothing does. |
+| X | How the models voted | "3 of 3 models answered; they agree on every field", or which models failed and, for every disputed field, each model's value: "FellowPresent: 1 (model A), 0 (model B): no majority, left empty". For a row without consensus it also says which case the row is: flagged because a model never read the note, flagged because something suggests the note documents a procedure (a procedure note type, upper endoscopy wording in the note, a model that found one), or released unflagged because every model read it and nothing does. When the scope name is the models' joined form rather than the note's own text (section 3.3) it says so: "ScopeType: 'Olympus GIF-H190' is the models' form, joined from parts the note states apart". |
 
 ### 3.3 What the ten fields mean
 
@@ -126,7 +137,7 @@ second column of this table.
 | Title | Short name | Values | Definition the models were given |
 | --- | --- | --- | --- |
 | Upper endoscopy performed | Endoscopy | TRUE, FALSE, empty | TRUE only if an upper endoscopy (EGD, gastroscopy, esophagogastroduodenoscopy) was performed as this note's procedure and the note documents it: the scope passed through the mouth, the esophagus intubated, the stomach or duodenum examined. A PEG tube placed with a gastroscope counts. History ("history of EGD"), recommendations, scheduling and patient instructions ("after your endoscopy") are FALSE. |
-| Scope type | ScopeType | text, empty | The upper endoscope only, named as the note names it: brand and model when both are given ("Olympus GIF-H190"), the model alone ("GIF-H 190") or the brand alone ("Olympus gastroscope") when that is all the note gives. Colonoscopes and sigmoidoscopes are ignored. Empty when the note names no upper endoscope, when no upper endoscopy was performed, or when there is no consensus. Spellings of one scope ("GIF-H190", "Olympus GIF H190") count as agreement; the form most models gave is kept. |
+| Scope type | ScopeType | text, empty | The upper endoscope only, named as the note names it: brand and model when both are given ("Olympus GIF-H190"), the model alone ("GIF-H 190") or the brand alone ("Olympus gastroscope") when that is all the note gives. Colonoscopes and sigmoidoscopes are ignored. Empty when the note names no upper endoscope, when no upper endoscopy was performed, or when there is no consensus. Spellings of one scope ("GIF-H190", "GIF-H 190", "Olympus GIF H190") count as agreement. The value is the note's own spelling: once the models agree on a name, the program copies it from the first place the note states it, so a note that writes "GIF-H 190" gets "GIF-H 190" whatever the models typed, and the models' own spellings stay in their blocks. The one exception is a name the note states in parts, the brand in one place and the model number in another ("Olympus endoscope (GIF-H190)"): there is no single span to copy, so the models' joined form is kept ("Olympus GIF-H190") and column X says so. No list of scope names is used: the value is always the note's text or the models' joined form. |
 | Upper endoscopy evidence quote | EndoscopyInformation | text, empty | The one sentence or line from the note, copied verbatim, that documents the upper endoscopy. Empty when the answer is FALSE. |
 | Duodenal biopsies taken | DuodenalBiopsiesTaken | TRUE, FALSE, empty | TRUE if at least one biopsy was taken from the duodenum during this procedure. The duodenal bulb, D1, D2, D3 and the first to third portion are all the duodenum; biopsies of the esophagus, stomach, antrum, colon, terminal ileum or rectum are not. "Random duodenal biopsies were taken" counts without a number. "BIOPSY: None" or no mention is FALSE. |
 | Number of duodenal biopsies | NumberOfDuodenalBiopsies | number, empty | The total number of biopsies taken from the duodenum when the note states it. 0 when none were taken. Empty when biopsies were taken but no count is stated, or when there is no consensus. The duodenum is counted once: "6 biopsies from the duodenum including 2 from the bulb" is 6; "4 biopsies from the second portion and 2 from the bulb" is 6, and such a sum is flagged for confirmation (section 5). |
@@ -187,7 +198,7 @@ columns Y to AN, the second AO to BD, the third BE to BT.
 | Reason, as written | What it means | What to do |
 | --- | --- | --- |
 | `<model> has not analysed this note; run --analyze again` | The run did not finish, so there is nothing to review yet. | Ask for the run to be completed, then regenerate the file. |
-| `note too long for the context window, not sent to any model; see each model's Failure reason` | The note exceeds what the models can read in one piece (about 18,000 characters), so no model saw it: the row is empty because the note was skipped, not because it holds nothing. | Read the note yourself. |
+| `note too long for the context window, so no model read it in full; see each model's Failure reason` | The note exceeds what the models can read in one piece (about 18,000 characters), so it was not sent, or a model's own token count showed that the server had cut it: the row is empty because no model read the note in full, not because it holds nothing. | Read the note yourself. |
 | `the model call failed for every model, so none read the note; see each model's Failure reason` | The server or a model returned an error for every model, so the note was never analysed. | Ask for the models' results on this note to be cleared and the run resumed, or read the note yourself. |
 | `no model gave an answer the note supports; see each model's Failure reason` | Every model read the note and failed: each answer it gave was contradicted by the note's text. Raised only when something suggests the note documents a procedure (section 4); on a note of another type with no procedure wording the row is released instead. | Read the note; the Failure reason of each model shows what it tried to claim. |
 | `no model answered: <models> failed on this note (<why>) and <models> (<why>); see each model's Failure reason` | The models failed in different ways: not sent the note, a failed call, or an answer the note did not support. | As the three rows above, model by model. |
@@ -214,7 +225,7 @@ These describe how one model reached its answer. They do not flag the row.
 | --- | --- |
 | `no answer the note supports; see Failure reason` | Every attempt was rejected because the note did not support it. |
 | `the model call failed; see Failure reason` | The server or the model returned an error. |
-| `note too long for the context window, not sent to the model; see Failure reason` | The note was not sent at all. |
+| `note too long for the context window, so the model did not read it in full; see Failure reason` | The note was not sent at all, or it was sent and the server's token count showed it had been cut; Failure reason says which. |
 | `accepted on attempt <n> after <k> rejected answer(s), repetition loops not counted; see Rejected attempts` | The model's first answers were rejected (a quote not in the note, an invented scope name, an unsupported count); the accepted answer passed every check, but only after correction. A retry caused by the model repeating itself is not counted. |
 | `upper endoscopy documented but no scope name found` | This model's answer has an upper endoscopy and no scope. |
 | `duodenal biopsies taken but no count stated` | This model's answer has biopsies taken and no count. |
@@ -237,6 +248,7 @@ A model's Failure reason is the message its last answer was rejected with. The c
 | `ScopeType is not stated in the note` | The model named a scope the note does not name (often a brand added to a model number). |
 | `NumberOfDuodenalBiopsies ... is not a number the quoted sentence states` | The count does not match the sentence. |
 | `the note is too long for the model: about <n> prompt tokens ...; no model call was made.` | Not sent. |
+| `the note is too long for the model: the server counted <n> prompt tokens and <m> answer tokens, more than the ... window holds ...; the answer was discarded.` | Sent, but the model's own token count showed the prompt did not fit together with the answer, so the model lost the instructions; the answer was discarded and the note counts as too long. |
 | `the model repeated itself until Ollama stopped it` | A repetition loop on the last attempt. |
 | `LLM call failed: ...` | The server or model failed; nothing about the note. |
 
@@ -272,9 +284,9 @@ wording in the note, gemma4:26b-a4b-it-q4_K_M@8192 found a procedure". Read the 
 block for its answer and the other two models' Failure reason for what they got wrong, then
 decide from the note.
 
-**No consensus, note too long to send.** F `Progress Notes`; G `TRUE`; H "note too long for the
-context window, not sent to any model; see each model's Failure reason"; I `none`; J `0`;
-K "No consensus: the note was too long to send to any model"; L to U empty; X "0 of 3 models
+**No consensus, note too long for the window.** F `Progress Notes`; G `TRUE`; H "note too long for the
+context window, so no model read it in full; see each model's Failure reason"; I `none`; J `0`;
+K "No consensus: the note was too long for the context window"; L to U empty; X "0 of 3 models
 answered (medgemma:27b@8192, gemma4:26b-a4b-it-q4_K_M@8192, gpt-oss:20b@8192 failed); no
 consensus; nothing suggests the note documents a procedure, but medgemma:27b@8192,
 gemma4:26b-a4b-it-q4_K_M@8192, gpt-oss:20b@8192 did not read it, so it is flagged". No model
@@ -295,6 +307,9 @@ progress note with no procedure wording, so the empty row is the answer.
 - **Empty is neither FALSE nor 0.** Empty means no answer: no consensus, a failed model, or a
   count the note does not state. FALSE means the models agreed the thing did not happen; 0 in
   Number of duodenal biopsies means none were taken.
+- **A cell that begins with a space.** Text that starts with =, +, - or @ (a quote such as
+  "- 4 biopsies were taken") is written with one leading space, because a spreadsheet would
+  otherwise read it as a formula. The database holds the text without the space.
 - **An empty consensus row is flagged unless it is a true empty.** A row on which fewer than
   two models answered has every field empty. It is G TRUE when a model never read the note
   (too long to send, or the model call failed): the note may hold study data nobody checked,
@@ -319,8 +334,9 @@ progress note with no procedure wording, so the empty row is the answer.
   different window, never share a column.
 - **The column letters in this guide assume the three study models in their run order and
   no columns inserted.** A run with a different number of models shifts every letter after X.
-- **The file is written once.** To refresh it after a further run, move it aside and run the
-  program's analysis step again; the consensus is rebuilt from every model's stored answers.
+- **The two files are written once, together.** To refresh them after a further run, move
+  both aside and run the program's analysis step again; the consensus is rebuilt from every
+  model's stored answers.
 - **Every row and every cell is protected health information**, including the quotes and the
   raw model responses.
 
