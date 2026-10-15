@@ -571,8 +571,8 @@ def model_answers(conn: sqlite3.Connection, labels) -> list[tuple[int, str, str,
     (note id, note_type, note text, [(label, LLM_Failed, LLM_Error, fields), ...]) in id and
     label order, where fields is the dict of RESULT_FIELDS values. LLM_Failed is None (and the
     fields null) for a model that has not analysed the note, or whose block the table lacks.
-    The note's type and text are there for the consensus to judge whether a note without a
-    consensus could hold a study value, and to check the agreed FellowPresent against the
+    The note's type and text are there for the consensus to say what suggests a note without
+    a consensus documents a procedure, and to check the agreed FellowPresent against the
     note's attestation (consensus.consensus).
     """
     existing = {name for name, _ in _table_columns(conn, "results")}

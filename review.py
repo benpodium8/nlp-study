@@ -8,7 +8,8 @@ open, and a note the model may not have seen in full.
 """
 
 from llm_analysis import (
-    CONTEXT_LENGTH, TOO_LONG_PREFIX, estimated_prompt_tokens, is_loop_rejection, note_fits_context,
+    CALL_FAILED, CONTEXT_LENGTH, NOT_SENT, estimated_prompt_tokens, failure_kind, is_loop_rejection,
+    note_fits_context,
 )
 
 
@@ -32,7 +33,8 @@ def manual_review(
     uses that column's title in results.csv (export.py), the file the reasons are read in.
 
     Triggers:
-      - the note failed (no answer the note supports, or the model call failed)
+      - the note failed: no answer the note supports, the model call failed, or the note was
+        not sent (llm_analysis.failure_kind tells them apart)
       - the answer was accepted only after an attempt was rejected for its content (a
         quote not in the note, a scope name the note does not state, a count the quote
         does not support, and so on). A retry after a repetition loop is not counted: the
@@ -44,12 +46,13 @@ def manual_review(
         Ollama silently cut, so they are flagged by length)
     """
     reasons = []
-    too_long = bool(error) and error.startswith(TOO_LONG_PREFIX)
+    kind = failure_kind(error) if llm_failed else None
+    too_long = kind == NOT_SENT
 
     if llm_failed:
-        if too_long:
+        if kind == NOT_SENT:
             reasons.append("note too long for the context window, not sent to the model; see Failure reason")
-        elif error and error.startswith("LLM call failed"):
+        elif kind == CALL_FAILED:
             reasons.append("the model call failed; see Failure reason")
         else:
             reasons.append("no answer the note supports; see Failure reason")

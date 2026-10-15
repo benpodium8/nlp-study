@@ -96,6 +96,26 @@ NOTE_CHARS_PER_TOKEN = 3.0
 ANSWER_RESERVE_TOKENS = 512
 TOO_LONG_PREFIX = "the note is too long for the model"
 
+# The LLM_Error of a model call that failed (the server, the model, or the program while
+# handling the answer; nothing about the note), as llm_analysis and data_worker record it.
+CALL_FAILED_PREFIX = "LLM call failed"
+
+# Why a model gave no answer for a note, read from its LLM_Error (failure_kind): the note was
+# not sent (too long for the window), the call itself failed, or every answer it gave was
+# rejected (the note does not support it, or the output was unusable). review.py and
+# consensus.py word their reasons by it, since an empty result means something different in
+# each case: nobody read the note, the program could not ask, or the model was asked and refuted.
+NOT_SENT, CALL_FAILED, REJECTED = "not sent", "call failed", "rejected"
+
+
+def failure_kind(error: str | None) -> str:
+    """The kind of failure an LLM_Error records: NOT_SENT, CALL_FAILED, else REJECTED."""
+    if error and error.startswith(TOO_LONG_PREFIX):
+        return NOT_SENT
+    if error and error.startswith(CALL_FAILED_PREFIX):
+        return CALL_FAILED
+    return REJECTED
+
 
 def estimated_prompt_tokens(note: str) -> int:
     """A conservative (high) estimate of the tokens the prompt for note takes."""
@@ -969,7 +989,7 @@ def llm_analysis(
         # limit reached", an error in the stream). That is the repetition loop the retries exist for.
         if "repeat limit" in str(e).lower():
             raise RetryableLLMError(f"the model repeated itself until Ollama stopped it ({e}).")
-        raise LLMAnalysisError(f"LLM call failed: {e}")
+        raise LLMAnalysisError(f"{CALL_FAILED_PREFIX}: {e}")
 
     raw = "".join(content)
     try:

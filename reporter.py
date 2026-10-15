@@ -41,6 +41,8 @@ from rich.progress_bar import ProgressBar
 from rich.table import Table
 from rich.text import Text
 
+from llm_analysis import CALL_FAILED, failure_kind
+
 # Plain mode: a heartbeat line is written when a model call has been running this long
 # since the last line, and again every this many seconds after that.
 HEARTBEAT_SECONDS = float(os.environ.get("NLP_HEARTBEAT_SECONDS", "60"))
@@ -386,7 +388,7 @@ class ModelRun:
         if analysis.llm_failed:
             self.failed += 1
             self.failed_ids.append(analysis.note_id)
-            if analysis.error and analysis.error.startswith("LLM call failed"):
+            if failure_kind(analysis.error) == CALL_FAILED:
                 self.call_failures += 1
                 self.call_failed_ids.append(analysis.note_id)
             else:

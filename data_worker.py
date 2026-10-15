@@ -3,8 +3,8 @@ from typing import NamedTuple, Sequence
 
 from database import COUNT_NOTES_SQL, insert_result, pending_notes
 from llm_analysis import (
-    MODELS, ModelSpec, llm_analysis, LLMAnalysisError, RetryableLLMError, estimated_prompt_tokens, load_model,
-    model_served, note_fits_context, ollama_status, too_long_error,
+    CALL_FAILED_PREFIX, MODELS, ModelSpec, llm_analysis, LLMAnalysisError, RetryableLLMError, estimated_prompt_tokens,
+    load_model, model_served, note_fits_context, ollama_status, too_long_error,
 )
 from reporter import CallProgress, Reporter
 from review import manual_review
@@ -53,7 +53,10 @@ def analyze_note(
     Runs the LLM analysis on one note with the given model.
     Retries when the model's answer is rejected (RetryableLLMError: unusable output, or an
     answer the note does not support), up to MAX_ATTEMPTS attempts in total, telling the
-    model why its previous answer was rejected; any other failure is recorded immediately.
+    model why its previous answer was rejected; any other failure (the call itself,
+    LLMAnalysisError, or an unexpected error in the program) is recorded immediately as a
+    failed call, CALL_FAILED_PREFIX first in its error, so the run's call-failure stop and
+    the review reasons treat the note as one the model never answered.
     Every rejection is kept, so the export shows why an accepted answer needed retries and
     why a failed note failed on each attempt.
     A note too long for the model's context window is not sent at all (Ollama would silently
@@ -95,7 +98,7 @@ def analyze_note(
         except Exception as e:
             if call is not None:
                 call.end_attempt()
-            error = f"{type(e).__name__}: {e}"
+            error = f"{CALL_FAILED_PREFIX}: {type(e).__name__}: {e}"
             return Analysis(None, None, 1, attempt, error, rejections, error, tuple(briefs), note_id)
 
 

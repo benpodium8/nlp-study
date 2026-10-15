@@ -3,24 +3,33 @@ Consolidates the models' answers for each note into one consensus block, stored 
 under the label "consensus" ("ScopeType (consensus)" and so on; database.CONSENSUS_COLUMNS).
 
 The consensus is cautious, the way the study wants it: a wrong value is worse than an empty
-one. A field gets a value only when at least two models gave an answer the note supports and
-they agree on it. A strict majority (2 of 3) settles a disagreement, and the note is then
-flagged for manual review; a field with no majority is left empty. The flag never changes a
-value; it says where a human should look, and it is raised only where a human can improve
-the row: the models disagree on a field; the agreed answer leaves a study field open (an
-upper endoscopy without a scope name); the note's own attestation contradicts the agreed
-FellowPresent; the agreed duodenal count is the sum of two counts in one sentence, a
-reading the researcher has not yet confirmed; or a note that could hold a study value (a
-procedure note type, upper endoscopy wording in the text, or a model's accepted answer that
-a procedure was performed) got no consensus because fewer than two models answered. A model
-that failed is an abstention, not a dissent: when the models that answered agree, the row is
-not flagged, and the failure stays on record in Models, Agreement and Outcome. A note of
-another type with no consensus, where no model found a procedure, is not flagged either,
-since there is no study value to recover, and Agreement says so. Every row records which
-models were consulted and how they voted (Models, Agreement, Outcome), so the consensus can
-be audited against the per-model columns; Answered counts the models that answered, Disputed
-names the fields they split on, and Summary says in one plain-words line what the consensus
-found (export.py puts these columns under their export titles).
+one, and an empty value may stand unflagged only where the empty is a true empty: the agreed
+answer (a count the note does not state, no quote behind an answer of 0, no scope without an
+upper endoscopy), or a row every model read and found nothing in, on a note about something
+else. A field gets a value only when at least two models gave an answer the note supports
+and they agree on it. A strict majority (2 of 3) settles a disagreement, and the note is then
+flagged for manual review; a field with no majority is left empty, and the note is flagged.
+A note on which fewer than two models answered has no consensus: every field is empty, and
+the row is flagged unless every model read the note (none was skipped as too long for the
+window, no call failed) and nothing suggests the note documents a procedure (not a procedure
+note type, no upper endoscopy wording in the text, no model's accepted answer found one), in
+which case the empty row is the answer and Agreement says so. A note a model never read is
+flagged whatever its type: it may hold study data nobody has checked, and a human must read
+it. The reason says how the models came to give no answer (the note too long to send, a
+model call that failed, answers the note did not support), and Agreement says what, if
+anything, suggests the note documents a procedure, so a reviewer can take the likely ones
+first. The flag never changes a value; it says where a human must look: the models disagree
+on a field; a field was left empty; the agreed answer leaves a study field open (an upper
+endoscopy without a scope name) or lacks the quote behind it; the note's own attestation
+contradicts the agreed FellowPresent; the agreed duodenal count is the sum of two counts in
+one sentence, a reading the researcher has not yet confirmed; a model has not run; or there
+is no consensus and the row is not a true empty. A model that failed is an abstention, not a
+dissent: when the models that answered agree, the row is not flagged, and the failure stays
+on record in Models, Agreement and Outcome. Every row records which models were consulted
+and how they voted (Models, Agreement, Outcome), so the consensus can be audited against the
+per-model columns; Answered counts the models that answered, Disputed names the fields they
+split on, and Summary says in one plain-words line what the consensus found, or why there is
+none (export.py puts these columns under their export titles).
 
 A model's own ManualReviewRequired flag (review.py) does not carry over: it describes how
 that model reached its answer; the consensus is judged on whether the models agree.
@@ -37,7 +46,10 @@ from collections import Counter
 from typing import NamedTuple, Sequence
 
 from database import CONSENSUS_COLUMNS, RESULT_FIELDS, model_answers, store_consensus
-from llm_analysis import EVIDENCE_FOR_FLAG, MODELS, ModelSpec, TOO_LONG_PREFIX, squash, summed_count_quote, supported_counts
+from llm_analysis import (
+    CALL_FAILED, EVIDENCE_FOR_FLAG, MODELS, NOT_SENT, REJECTED, ModelSpec, failure_kind, squash, summed_count_quote,
+    supported_counts,
+)
 
 
 class ModelAnswer(NamedTuple):
@@ -83,12 +95,14 @@ TEACHING_ATTESTATION_RE = re.compile(
 )
 NO_TRAINEE_LINE_RE = re.compile(r"staff only|(resident/)?fellows?\s*:?\s*none\b", re.I)
 
-# What marks a note that could hold a study value, so that a missing consensus is worth a
-# human's time: a procedure note type (Procedures, the Upper Endoscopy / PED Endoscopy / PEG
-# Placement family, Brief Op Note, OR PostOp, OR Nursing), or upper endoscopy wording in the
-# text (the scope passed or the esophagus intubated, an upper endoscope's brand or model).
-# In the 5,000-note corpus that wording occurs in 353 of the 609 Procedures notes and in
-# about twenty notes of other types; every note too long for the window is of another type.
+# What suggests a note documents a procedure, so that a row without a consensus on it is
+# flagged rather than released as a true empty: a procedure note type (Procedures, the Upper
+# Endoscopy / PED Endoscopy / PEG Placement family, Brief Op Note, OR PostOp, OR Nursing), or
+# upper endoscopy wording in the text (the scope passed or the esophagus intubated, an upper
+# endoscope's brand or model). In the 5,000-note corpus that wording occurs in 353 of the 609
+# Procedures notes and in about twenty notes of other types; every note too long for the
+# window is of another type, which is why a note a model never read is flagged before these
+# marks are looked at. The marks never decide a value.
 PROCEDURE_NOTE_TYPE_RE = re.compile(
     r"procedure|endoscop|colonoscop|peg placement|brief op note|\bor (postop|nursing)\b", re.I
 )
@@ -206,25 +220,85 @@ def _evidence(flag: str, info: str, answered: Sequence[ModelAnswer], values: dic
     return max(quotes.values(), key=lambda q: q[1])[0] if quotes else None
 
 
-def study_candidate(note_type: str | None, note: str | None) -> bool:
-    """
-    Whether a note could hold a study value, so that a missing consensus on it is worth a
-    human's time: its type is a procedure type, or its text has upper endoscopy wording
-    (PROCEDURE_NOTE_TYPE_RE, EGD_LANGUAGE_RE). True when neither is known, to stay cautious.
-    """
-    if note_type is None and note is None:
-        return True
-    return bool(PROCEDURE_NOTE_TYPE_RE.search(note_type or "")) or bool(EGD_LANGUAGE_RE.search(note or ""))
-
-
 def found_procedure(answer: ModelAnswer) -> bool:
-    """
-    Whether a model's accepted answer says a procedure was performed (any flag 1, or a scope
-    name). One such answer is not a consensus, but a row holding one is worth a human's time
-    whatever the note's type, so it is never released unflagged.
-    """
+    """Whether a model's accepted answer says a procedure was performed (any flag 1, or a scope name)."""
     return answer.answered and (
         any(answer.fields[flag] == 1 for flag in EVIDENCE_FOR_FLAG) or answer.fields["ScopeType"] is not None
+    )
+
+
+def procedure_marks(note_type: str | None, note: str | None, answered: Sequence[ModelAnswer]) -> list[str]:
+    """
+    What suggests a note documents a procedure: its type is a procedure type, its text has
+    upper endoscopy wording (PROCEDURE_NOTE_TYPE_RE, EGD_LANGUAGE_RE), or a model's accepted
+    answer found one (found_procedure). Empty when nothing does. A row without a consensus
+    that every model read is released unflagged only when this is empty; the marks are written
+    into Agreement for the reviewer, hold no note text, and never decide a value.
+    """
+    marks = []
+    if note_type is not None and PROCEDURE_NOTE_TYPE_RE.search(note_type):
+        marks.append("a procedure note type")
+    if note is not None and EGD_LANGUAGE_RE.search(note):
+        marks.append("upper endoscopy wording in the note")
+    found = [a.label for a in answered if found_procedure(a)]
+    if found:
+        marks.append(f"{', '.join(found)} found a procedure")
+    return marks
+
+
+# How the reasons word each kind of failure (llm_analysis.failure_kind).
+FAILURE_WORDING = {
+    NOT_SENT: "not sent the note, too long for the context window",
+    CALL_FAILED: "the model call failed",
+    REJECTED: "no answer the note supports",
+}
+
+
+def _failures(failed: Sequence[ModelAnswer]) -> str:
+    """
+    "A, B failed on this note (no answer the note supports)", the models grouped by the kind
+    of failure when they differ: "... and C (the model call failed)".
+    """
+    groups = []
+    for kind in (NOT_SENT, CALL_FAILED, REJECTED):
+        names = [a.label for a in failed if failure_kind(a.error) == kind]
+        if names:
+            groups.append((", ".join(names), FAILURE_WORDING[kind]))
+    text = f"{groups[0][0]} failed on this note ({groups[0][1]})"
+    return text + "".join(f" and {names} ({why})" for names, why in groups[1:])
+
+
+def _unread(failed: Sequence[ModelAnswer]) -> list[ModelAnswer]:
+    """The failed models that never read the note: it was not sent to them, or their call failed."""
+    return [a for a in failed if failure_kind(a.error) != REJECTED]
+
+
+def _no_answer(failed: Sequence[ModelAnswer], total: int) -> tuple[str, str]:
+    """
+    The review reason and the Summary for a note no model answered, by how the models came
+    to give no answer: one sentence when every model failed the same way, else each model's.
+    """
+    if not failed:
+        return "no model was consulted", "No consensus: no model was consulted"
+    kinds = {failure_kind(a.error) for a in failed}
+    if kinds == {NOT_SENT}:
+        return (
+            "note too long for the context window, not sent to any model; see each model's Failure reason",
+            "No consensus: the note was too long to send to any model",
+        )
+    if kinds == {CALL_FAILED}:
+        return (
+            "the model call failed for every model, so none read the note; see each model's Failure reason",
+            "No consensus: the model call failed for every model",
+        )
+    if kinds == {REJECTED}:
+        return (
+            "no model gave an answer the note supports; see each model's Failure reason",
+            f"No consensus: 0 of {total} models answered",
+        )
+    return (
+        f"no model answered: {_failures(failed)}; see each model's Failure reason",
+        f"No consensus: 0 of {total} models answered",
     )
 
 
@@ -259,11 +333,10 @@ def consensus(
     votes, when a dict is given, receives how each voted field went when at least two models
     answered: field -> (decided, unanimous, labels of the answering models, labels of those
     that gave the winning value), for the run's agreement tally.
-    note_type and note, when given, decide whether a note without a consensus is flagged
-    (study_candidate, unless a model's answer found a procedure: found_procedure) and let the
-    agreed FellowPresent be checked against the note's own attestation
-    (attestation_conflicts). Without them every note without a consensus is flagged and the
-    attestation is not checked.
+    note_type and note, when given, let Agreement say what suggests a note without a
+    consensus documents a procedure (procedure_marks) and let the agreed FellowPresent be
+    checked against the note's own attestation (attestation_conflicts). Without them the
+    attestation is not checked; a note without a consensus is flagged either way.
     """
     values = {field: None for field, _ in RESULT_FIELDS}
     answered = [a for a in answers if a.answered]
@@ -289,27 +362,42 @@ def consensus(
         agreement = f"{header}; no consensus until every model has run"
         summary = "No consensus yet: a model has not analysed this note"
     elif len(answered) < 2:
-        summary = f"No consensus: {len(answered)} of {len(answers)} models answered"
+        # Fewer than two answers is no consensus: every field stays empty. The row is flagged
+        # unless the empty is a true empty: every model read the note (none skipped it as too
+        # long, no call failed) and nothing suggests it documents a procedure (procedure_marks).
+        # A note a model never read may hold study data nobody has checked, so a human must
+        # read it, whatever its type. The reason says how the models came to give no answer;
+        # Agreement says which case the row is.
         if not answered:
-            if failed and all(a.error and a.error.startswith(TOO_LONG_PREFIX) for a in failed):
-                reasons.append("note too long for the context window, not sent to any model; see each model's Failure reason")
-            else:
-                reasons.append("no model gave an answer the note supports; see each model's Failure reason")
+            reason, summary = _no_answer(failed, len(answers))
+            reasons.append(reason)
             agreement = f"{header}; no consensus"
         else:
+            summary = f"No consensus: 1 of {len(answers)} models answered"
             if failed:
-                reasons.append(f"{_names(failed)} failed on this note; see Failure reason")
+                reasons.append(f"{_failures(failed)}; see Failure reason")
             reasons.append(
                 f"only {answered[0].label} gave an answer the note supports, which is not a consensus; "
                 f"its own columns hold that answer"
             )
             agreement = f"{header}; no consensus from one model"
-        if not study_candidate(note_type, note) and not any(found_procedure(a) for a in answered):
-            # An empty row for a note that cannot hold a study value loses the study nothing,
-            # so no human is sent to it; the explanation stays here for the audit.
+        marks = procedure_marks(note_type, note, answered)
+        unread = _unread(failed)
+        if marks:
+            agreement += f"; the note may document a procedure: {', '.join(marks)}"
+        elif unread:
             agreement += (
-                "; not flagged: not a procedure note type, no upper endoscopy wording in the note "
-                "and no model found a procedure, so there is no study value to recover"
+                f"; nothing suggests the note documents a procedure, but {_names(unread)} did not read it, "
+                f"so it is flagged"
+            )
+        elif note_type is not None or note is not None:
+            # A true empty: every model read the note, none found a procedure, and the note is
+            # of another type with no upper endoscopy wording. The empty row is the answer for
+            # a note about something else, so no human is sent to it; the explanation stays
+            # here for the audit. Without the note's type and text the row stays flagged.
+            agreement += (
+                "; not flagged: every model read the note, and nothing suggests it documents a procedure: "
+                "not a procedure note type, no upper endoscopy wording in the note and no model found a procedure"
             )
             reasons = []
     else:
@@ -360,6 +448,10 @@ def consensus(
 
         for flag, info in EVIDENCE_FOR_FLAG.items():
             values[info] = _evidence(flag, info, answered, values)
+            # The verifier makes every 1 carry its quote, so this can only be a result stored
+            # before it did; an answer of 1 with no quote is not an empty the study accepts.
+            if values[flag] == 1 and values[info] is None:
+                reasons.append(f"{flag} is 1 but no model that gave it quoted the note, so {info} is empty")
 
         # The verifier reads "4 biopsies of the duodenum and 2 from the bulb" as 6, the sum,
         # since the bulb is the duodenum (prompt rule 5). The researcher's examples confirm
@@ -386,8 +478,7 @@ def consensus(
             # consensus rests on.
             reasons.insert(
                 0,
-                f"{_names(failed)} failed on this note; the consensus rests on the other "
-                f"{len(answered)} models; see Failure reason",
+                f"{_failures(failed)}; the consensus rests on the other {len(answered)} models; see Failure reason",
             )
 
         agreement = f"{header}; " + ("; ".join(lines) if lines else "they agree on every field")
@@ -483,13 +574,16 @@ CONSENSUS_PROGRESS_EVERY = 100
 # How a consensus review reason is counted in the summary: the first marker found in it.
 REASON_KEYS = (
     ("has not analysed this note", "a model has not analysed the note"),
-    ("not sent to any model", "note too long for the window"),
+    ("not sent to any model", "note too long for the window, not sent to any model"),
+    ("call failed for every model", "the model call failed for every model"),
     ("no model gave an answer", "no model gave an answer the note supports"),
+    ("no model answered:", "no model answered, each failing differently"),
     ("which is not a consensus", "only one model answered"),
     ("failed on this note", "a model failed on the note"),
     ("models disagree", "the models disagree on a field"),
     ("left empty:", "fields in conflict, left empty"),
     ("no scope name found", "upper endoscopy but no scope name"),
+    ("quoted the note", "an answer of 1 without its quote"),
     ("teaching attestation", "teaching attestation but FellowPresent not 1"),
     ("no-trainee line", "Staff Only or no-trainee line but FellowPresent not 0"),
     ("different parts of the duodenum", "duodenal count from a sentence that counts parts of the duodenum"),
@@ -501,7 +595,7 @@ class ConsensusSummary(NamedTuple):
     notes: int
     outcomes: Counter          # Outcome -> notes
     flagged: int               # notes with ManualReviewRequired (consensus) true
-    unflagged_none: int        # notes without consensus not flagged: not a procedure note, no upper endoscopy wording, no model found a procedure
+    unflagged_none: int        # notes without consensus released as true empties: every model read the note, not a procedure note, no upper endoscopy wording, no model found a procedure
     disputed: Counter          # field -> notes where the answering models did not all agree on it
     agreement: dict            # label -> (votes agreeing with the decided consensus value, votes cast)
     reasons: Counter           # review reason category -> notes
@@ -557,8 +651,9 @@ def consolidate(conn, models: Sequence[ModelSpec] = MODELS, report=print, progre
     )
     if unflagged_none:
         report(
-            f"Not flagged although without consensus: {unflagged_none} note(s) of other types with no upper "
-            f"endoscopy wording where no model found a procedure, so an empty row is no loss to the study (see How the models voted)."
+            f"Not flagged although without consensus: {unflagged_none} note(s) every model read, of other types with "
+            f"no upper endoscopy wording, where no model found a procedure: the empty row is the answer there "
+            f"(see How the models voted). Every note a model did not read is flagged."
         )
     if disputed:
         report("Fields the models did not all agree on: " + ", ".join(f"{field} {n}" for field, n in disputed.most_common()) + " note(s).")

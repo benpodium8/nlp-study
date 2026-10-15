@@ -106,15 +106,19 @@ Output
                        needs at least two models that answered and agree, a strict
                        majority settles a disagreement (and flags the note), and a field
                        with no majority stays empty. "Needs human review" is TRUE where a
-                       human can improve the row: the models disagreed, the agreed answer
-                       leaves a study field open, contradicts the note's own attestation
-                       of a trainee or sums two biopsy counts from one sentence, or a note
-                       that could hold a study value (a procedure note, upper endoscopy
-                       wording, or a model's answer that a procedure was performed) got
-                       fewer than two answers. A model's failure alone does not flag a row
-                       the others agree on. A model whose answers the note text does not
-                       support is recorded with "Failed" TRUE, empty fields and the reason
-                       in "Failure reason".
+                       human must look: the models disagreed, the agreed answer leaves a
+                       study field open, contradicts the note's own attestation of a
+                       trainee or sums two biopsy counts from one sentence, a model has not
+                       run, or fewer than two models answered and the row is not a true
+                       empty. A note a model never read (too long to send, or the call
+                       failed) is always flagged: it may hold study data nobody checked. A
+                       note every model read is flagged when it looks like a procedure
+                       note (a procedure note type, upper endoscopy wording, or a model
+                       that found a procedure) and released unflagged otherwise: the empty
+                       row is the answer for a note about something else. A model's failure
+                       alone does not flag a row the others agree on. A model whose answers
+                       the note text does not support is recorded with "Failed" TRUE, empty
+                       fields and the reason in "Failure reason".
                        Write-once: move it aside to regenerate it from the database.
   {DB_PATH}              the same data, kept for audit and for resuming.
   Both contain PHI; treat them accordingly."""

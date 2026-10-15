@@ -26,7 +26,9 @@ A row then holds three kinds of information, from left to right:
 1. **The consensus** (columns G to X): the study's answer, built from the models' answers. A
    field has a value only where at least two models answered and agree. Where the models split,
    a strict majority (2 of 3) is written and the row is flagged for review; where there is no
-   majority the field is left empty.
+   majority the field is left empty. Where fewer than two models answered there is no
+   consensus: every field is empty, and the row is flagged unless every model read the note
+   and nothing in it suggests a procedure (section 4).
 2. **Each model's own answers** (one block of 16 columns per model), with whether it failed,
    how many attempts it needed and why it failed. These are the evidence behind the consensus.
 3. **Audit text** (each model's rejected attempts and raw response), the length of the note,
@@ -113,7 +115,7 @@ Every title in this block ends in "(consensus)".
 | U | Fellow evidence quote | The attestation sentence or the line naming the trainee; empty when T is not TRUE. |
 | V | Models consulted | The models, in run order, separated by "; ", each marked "(failed)" or "(not analysed)" when it gave no answer. |
 | W | Disputed fields | The fields on which the answering models did not all agree, each marked "(majority answer given)" or "(no majority, left empty)". Empty when they agreed on every field. |
-| X | How the models voted | "3 of 3 models answered; they agree on every field", or which models failed and, for every disputed field, each model's value: "FellowPresent: 1 (model A), 0 (model B): no majority, left empty". For a row without consensus it also says whether the row was released unflagged and why. |
+| X | How the models voted | "3 of 3 models answered; they agree on every field", or which models failed and, for every disputed field, each model's value: "FellowPresent: 1 (model A), 0 (model B): no majority, left empty". For a row without consensus it also says which case the row is: flagged because a model never read the note, flagged because something suggests the note documents a procedure (a procedure note type, upper endoscopy wording in the note, a model that found one), or released unflagged because every model read it and nothing does. |
 
 ### 3.3 What the ten fields mean
 
@@ -176,7 +178,7 @@ columns Y to AN, the second AO to BD, the third BE to BT.
 | `agreed` | Every model that answered agrees on every field, but a model failed on this note, so the consensus rests on two models. | Not for the failure alone. A model's failure is treated as an abstention, not a dissent; the failure is recorded in Models consulted and How the models voted. |
 | `majority` | Every field has a value, but at least one was settled 2 against 1. | Always. |
 | `partial` | At least one field was left empty: the models split 1 against 1 (with the third failed), gave three different answers, or the agreed fields contradicted each other (for example a fellow present with no procedure). | Always. |
-| `none` | No consensus: fewer than two models answered, or a model has not run on this note. | Only when the note could hold a study value: its type is a procedure type, its text has upper endoscopy wording, or the one model that answered says a procedure was performed. A progress note, consult or discharge document on which no model found a procedure is released unflagged, and How the models voted says so. |
+| `none` | No consensus: fewer than two models answered, or a model has not run on this note. Every field is empty. | Unless the row is a true empty. A note a model never read (too long to send, or the model call failed) is always flagged, whatever kind of note it is: it may hold study data nobody checked, so read it yourself. A note every model read is flagged when something suggests it documents a procedure (a procedure note type, upper endoscopy wording, or the one model that answered found one), and released unflagged when nothing does: the models were asked and the note refuted every claim, so the empty row is the answer for a note about something else. Review reasons says how the models came to give no answer, and How the models voted says which case the row is. |
 
 ## 5. Every review reason
 
@@ -185,15 +187,18 @@ columns Y to AN, the second AO to BD, the third BE to BT.
 | Reason, as written | What it means | What to do |
 | --- | --- | --- |
 | `<model> has not analysed this note; run --analyze again` | The run did not finish, so there is nothing to review yet. | Ask for the run to be completed, then regenerate the file. |
-| `note too long for the context window, not sent to any model; see each model's Failure reason` | The note exceeds what the models can read in one piece (about 18,000 characters), so no model saw it. | Read the note yourself. |
-| `no model gave an answer the note supports; see each model's Failure reason` | Every model failed: each answer it gave was contradicted by the note's text. Typical of a note that mentions a procedure without documenting one. | Read the note; the Failure reason of each model shows what it tried to claim. |
-| `<models> failed on this note; see Failure reason` together with `only <model> gave an answer the note supports, which is not a consensus; its own columns hold that answer` | One model answered; one answer is never written as consensus, so columns L to U are empty. | Check that model's block against the note and decide. |
-| `<model> failed on this note; the consensus rests on the other 2 models; see Failure reason` | Information only, added at the front of the reasons when the row is flagged for another reason, so you know how many models the answer rests on. | Nothing on its own. |
+| `note too long for the context window, not sent to any model; see each model's Failure reason` | The note exceeds what the models can read in one piece (about 18,000 characters), so no model saw it: the row is empty because the note was skipped, not because it holds nothing. | Read the note yourself. |
+| `the model call failed for every model, so none read the note; see each model's Failure reason` | The server or a model returned an error for every model, so the note was never analysed. | Ask for the models' results on this note to be cleared and the run resumed, or read the note yourself. |
+| `no model gave an answer the note supports; see each model's Failure reason` | Every model read the note and failed: each answer it gave was contradicted by the note's text. Raised only when something suggests the note documents a procedure (section 4); on a note of another type with no procedure wording the row is released instead. | Read the note; the Failure reason of each model shows what it tried to claim. |
+| `no model answered: <models> failed on this note (<why>) and <models> (<why>); see each model's Failure reason` | The models failed in different ways: not sent the note, a failed call, or an answer the note did not support. | As the three rows above, model by model. |
+| `<models> failed on this note (<why>); see Failure reason` together with `only <model> gave an answer the note supports, which is not a consensus; its own columns hold that answer` | One model answered; one answer is never written as consensus, so columns L to U are empty. The parenthesis says why the others gave none: "no answer the note supports", "the model call failed" or "not sent the note, too long for the context window". | Check that model's block against the note and decide. |
+| `<model> failed on this note (<why>); the consensus rests on the other 2 models; see Failure reason` | Information only, added at the front of the reasons when the row is flagged for another reason, so you know how many models the answer rests on. | Nothing on its own. |
 | `models disagree on <field> (majority answer given), <field> (no majority, left empty); see How the models voted` | The answering models split on the named fields. A majority answer was written where there was one; the field was left empty where there was none. | Read column X for each model's value, and the evidence quotes in the models' blocks; decide from the note. |
 | `FellowPresent left empty: a fellow takes part in a procedure, and the consensus has none` | The per-field votes gave a fellow present with no procedure; the dependent field was emptied. | Decide from the note. |
 | `DuodenalBiopsiesTaken and NumberOfDuodenalBiopsies left empty: duodenal biopsies need an upper endoscopy, and the consensus has none` | As above, for the biopsy fields. | Decide from the note. |
 | `ScopeType left empty: the consensus has no upper endoscopy` | As above, for the scope. | Decide from the note. |
 | `upper endoscopy documented but no scope name found` | The models agree on an upper endoscopy but none found a scope name the note states. | Look in the note for a brand or model the models missed; if there is none, the empty value is right. |
+| `<field> is 1 but no model that gave it quoted the note, so <quote field> is empty` | An agreed TRUE without the sentence behind it. Only results stored before the program required the quote can produce this. | Find the sentence in the note, or correct the answer. |
 | `note carries a teaching attestation but FellowPresent is 0` (or `is empty`) | The note has a Teaching Statement (or "was present and actively participated"), which means a trainee performed, but the consensus says no fellow. | Decide from the attestation in the note. Fellow present is the field the models most often miss. |
 | `note carries a Staff Only or no-trainee line but FellowPresent is 1` (or `is empty`) | The note says Staff Only, "Fellow: None" or the like, but the consensus says a fellow was present. | Decide from the note. |
 | `NumberOfDuodenalBiopsies <n> is the sum of the counts the quoted sentence gives for different parts of the duodenum; confirm the study counts them together` | The quoted sentence counts biopsies from two parts of the duodenum ("4 biopsies of the duodenum and 2 from the bulb") and the program wrote the sum. The study's examples confirm only the "6 including 2 from the bulb" form, so this reading waits for your confirmation; the value stays. | Confirm or correct the count. Once the reading is confirmed, this reason can be retired. |
@@ -258,24 +263,46 @@ Statement. Read the attestation in the note (column CB), or the Fellow evidence 
 second model's block, and decide.
 
 **No consensus on a procedure note.** G `TRUE`; H "medgemma:27b@8192, gpt-oss:20b@8192 failed
-on this note; see Failure reason; only gemma4:26b-a4b-it-q4_K_M@8192 gave an answer the note
-supports, which is not a consensus; its own columns hold that answer"; I `none`; J `1`;
-K "No consensus: 1 of 3 models answered"; L to U empty; X "1 of 3 models answered
-(medgemma:27b@8192, gpt-oss:20b@8192 failed); no consensus from one model". Read the second
-model's block for its answer and the other two models' Failure reason for what they got wrong,
-then decide from the note.
+on this note (no answer the note supports); see Failure reason; only
+gemma4:26b-a4b-it-q4_K_M@8192 gave an answer the note supports, which is not a consensus; its
+own columns hold that answer"; I `none`; J `1`; K "No consensus: 1 of 3 models answered"; L to
+U empty; X "1 of 3 models answered (medgemma:27b@8192, gpt-oss:20b@8192 failed); no consensus
+from one model; the note may document a procedure: a procedure note type, upper endoscopy
+wording in the note, gemma4:26b-a4b-it-q4_K_M@8192 found a procedure". Read the second model's
+block for its answer and the other two models' Failure reason for what they got wrong, then
+decide from the note.
+
+**No consensus, note too long to send.** F `Progress Notes`; G `TRUE`; H "note too long for the
+context window, not sent to any model; see each model's Failure reason"; I `none`; J `0`;
+K "No consensus: the note was too long to send to any model"; L to U empty; X "0 of 3 models
+answered (medgemma:27b@8192, gemma4:26b-a4b-it-q4_K_M@8192, gpt-oss:20b@8192 failed); no
+consensus; nothing suggests the note documents a procedure, but medgemma:27b@8192,
+gemma4:26b-a4b-it-q4_K_M@8192, gpt-oss:20b@8192 did not read it, so it is flagged". No model
+read this note, so the empty row says nothing about it. Read it yourself; a progress note with
+no procedure wording is usually quick to clear, but the program will not clear it for you,
+because it cannot know what the note holds.
 
 **No consensus, released.** F `Progress Notes`; G `FALSE`; I `none`; J `0`; K "No consensus: 0
-of 3 models answered"; X "0 of 3 models answered (all three failed); no consensus; not flagged:
-not a procedure note type, no upper endoscopy wording in the note and no model found a
-procedure, so there is no study value to recover". Nothing to do: an empty row for a progress
-note costs the study nothing.
+of 3 models answered"; X "0 of 3 models answered (medgemma:27b@8192,
+gemma4:26b-a4b-it-q4_K_M@8192, gpt-oss:20b@8192 failed); no consensus; not flagged: every model
+read the note, and nothing suggests it documents a procedure: not a procedure note type, no
+upper endoscopy wording in the note and no model found a procedure". Nothing to do: every
+model read this note and each claimed a procedure the note's text refuted, and the note is a
+progress note with no procedure wording, so the empty row is the answer.
 
 ## 7. Things to know
 
 - **Empty is neither FALSE nor 0.** Empty means no answer: no consensus, a failed model, or a
   count the note does not state. FALSE means the models agreed the thing did not happen; 0 in
   Number of duodenal biopsies means none were taken.
+- **An empty consensus row is flagged unless it is a true empty.** A row on which fewer than
+  two models answered has every field empty. It is G TRUE when a model never read the note
+  (too long to send, or the model call failed): the note may hold study data nobody checked,
+  so read it yourself. It is G FALSE only when every model read the note, no model found a
+  procedure, and the note is of another type with no upper endoscopy wording: the models were
+  asked, the note refuted every claim, and the empty row is the answer for a note about
+  something else. On any unflagged row the other empty cells are the agreed ones: a count the
+  note does not state, no quote behind a FALSE, no scope where there was no upper endoscopy.
 - **"Duodenal biopsies taken" TRUE with an empty count means taken, count not stated.** The
   study accepts that; it is not flagged. The Summary spells it out.
 - **Two models agreeing on "no scope named" is a consensus.** Scope type is then empty, and the

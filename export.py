@@ -167,7 +167,8 @@ def export_results(conn, output_folder="output", report=print) -> Path | None:
     output_folder/results.csv, creating the folder if needed, in the layout export_columns
     gives. The file is written only if it does not already exist (write-once); an existing
     file is left alone and a message is reported. Reports what was written, where the review
-    flag sits and how many rows it marks. Returns the path written, or None when it was not.
+    flag sits and how many rows it marks (and how many rows have no consensus block at all,
+    should there be any). Returns the path written, or None when it was not.
     """
     started = time.perf_counter()
     output_path = Path(output_folder)
@@ -189,7 +190,7 @@ def export_results(conn, output_folder="output", report=print) -> Path | None:
     titles = [column.title for column in columns]
     review = titles.index(REVIEW_COLUMN) if REVIEW_COLUMN in titles else None
 
-    row_count = flagged = 0
+    row_count = flagged = unbuilt = 0
     with output_file.open(mode="w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(titles)
@@ -197,8 +198,11 @@ def export_results(conn, output_folder="output", report=print) -> Path | None:
             values = [cell(column.field, value) for column, value in zip(columns, row)]
             writer.writerow(values)
             row_count += 1
-            if review is not None and values[review] == "TRUE":
-                flagged += 1
+            if review is not None:
+                if values[review] == "TRUE":
+                    flagged += 1
+                elif values[review] == "":
+                    unbuilt += 1
 
     size = output_file.stat().st_size
     report(
@@ -210,6 +214,11 @@ def export_results(conn, output_folder="output", report=print) -> Path | None:
             f'The review queue is the {flagged} row(s) with "{REVIEW_COLUMN}" TRUE '
             f"(column {column_letter(review)}); results-csv-guide.md explains the columns."
         )
+        if unbuilt:
+            report(
+                f'{unbuilt} row(s) have an empty "{REVIEW_COLUMN}": no consensus has been built for them, '
+                f"so they are in neither half of the queue; run --analyze to build it."
+            )
     else:
         report("No consensus block in the database yet; results-csv-guide.md explains the columns.")
     return output_file
