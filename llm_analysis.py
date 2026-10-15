@@ -75,7 +75,7 @@ MODELS = (
 # the 14 to 18 GB study models. Not fetched by setup.sh; pull them with `ollama pull`. Gemma 4
 # and Qwen 3.5 reason by default, so think=False keeps their answers to the JSON.
 LOCAL_MODELS = (
-    ModelSpec("gemma3:4b", CONTEXT_LENGTH),
+    ModelSpec("ministral-3:3b", CONTEXT_LENGTH),
     ModelSpec("gemma4:e2b", CONTEXT_LENGTH),
     ModelSpec("qwen3.5:4b", CONTEXT_LENGTH),
 )
