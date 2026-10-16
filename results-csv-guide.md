@@ -155,7 +155,7 @@ In the consensus block, each evidence quote is the one most models gave for the 
 Every title in a model's block ends in the model's label in parentheses: the model's name and
 the size of the text window it was given, in tokens, for example `(mistral-small3.2:24b-instruct-2506-q4_K_M@8192)`. The
 blocks come in the order the models ran. With the three study models the first block is
-columns Y to AN, the second AO to BD, the third BE to BT.
+columns Y to AP, the second AQ to BH, the third BI to BZ.
 
 | Position | Title | Meaning |
 | --- | --- | --- |
@@ -163,11 +163,13 @@ columns Y to AN, the second AO to BD, the third BE to BT.
 | 2 to 11 | The ten fields | This model's own answers, in the same order and with the same meanings as in the consensus (section 3.3). |
 | 12 | Needs review | This model's own flag, about how it reached its answer (section 5.2). It does not feed column G: three models agreeing on a grounded answer outweigh one model's bumpy path to it. |
 | 13 | Review reasons | Why, when Needs review is TRUE. |
-| 14 | Attempts | How many times the model was asked, 1 to 5. 0 means the note was too long to send. |
-| 15 | Seconds | Wall-clock time the model spent on the note, all attempts included. |
-| 16 | Failure reason | Why the model failed, when it did: the reason its last answer was rejected, naming the field and the rejected value; or that the note was too long; or the error from the server. Empty when the model did not fail. |
+| 14 | Input shortened | TRUE when the note was too long for the model's text window (about 18,000 characters) and the model was sent a shortened copy: boilerplate removed, then if still too long only the sections about the procedure, findings, specimens and staff, then if still too long only the lines that mention the study's terms and the lines around them. Every model was sent the same shortened copy, and every quote was checked against the full note. Being shortened does not on its own set Needs review. FALSE when the note was sent whole. Empty for results stored before this column existed. |
+| 15 | How the input was shortened | The shortening steps applied and the note's length before and after, e.g. "boilerplate removed, relevant sections kept; 31,204 to 16,880 characters". Empty when Input shortened is FALSE. |
+| 16 | Attempts | How many times the model was asked, 1 to 5. 0 means the note was too long to send even after shortening. |
+| 17 | Seconds | Wall-clock time the model spent on the note, all attempts included. |
+| 18 | Failure reason | Why the model failed, when it did: the reason its last answer was rejected, naming the field and the rejected value; or that the note was too long; or the error from the server. Empty when the model did not fail. |
 
-### 3.5 Audit text (columns BU to BZ with three models)
+### 3.5 Audit text (columns CA to CF with three models)
 
 | Title | Meaning |
 | --- | --- |

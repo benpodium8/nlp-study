@@ -1056,7 +1056,7 @@ def verify_against_note(result: dict, note: str):
 
 def llm_analysis(
     id: int, note: str, model: ModelSpec | str = LOCAL_MODEL, attempt: int = 1, rejected: str | None = None,
-    observer=None,
+    observer=None, source: str | None = None,
 ) -> Tuple[dict, str]:
     """
     Analyzes a clinical note using an LLM (the Ollama model given by model, a ModelSpec or a
@@ -1066,6 +1066,9 @@ def llm_analysis(
     The response is streamed; observer, when given, is called with every chunk (an ollama
     ChatResponse: a token of thinking or content, and last the done chunk with the server's
     token counts and timings), so the caller can show what the model is doing.
+    source, when given, is the stored note that note was shortened from (note_shortening): the
+    answer is checked against it too, so a quote that runs across a gap the shortening left
+    is rejected like any other quote the note does not hold.
 
     Raises:
         RetryableLLMError: the output was unusable or the note does not support the answer;
@@ -1119,18 +1122,19 @@ def llm_analysis(
 
     raw = "".join(content)
     try:
-        parsed = _parse_and_check(id, note, raw)
+        parsed = _parse_and_check(id, note, raw, source)
     except RetryableLLMError as e:
         e.raw = raw
         raise
     return parsed, raw
 
 
-def _parse_and_check(id: int, note: str, raw: str) -> dict:
+def _parse_and_check(id: int, note: str, raw: str, source: str | None = None) -> dict:
     """
     Turns the model text into the validated field dictionary: parses the JSON (repairing
     common slips), normalises near-miss values, checks the schema, then checks the answer
-    against the note. Raises RetryableLLMError at the first problem.
+    against the note, and against source too when the note sent was shortened from it.
+    Raises RetryableLLMError at the first problem.
     """
     clean = _strip_markdown_fences(raw)
 
@@ -1155,5 +1159,7 @@ def _parse_and_check(id: int, note: str, raw: str) -> dict:
     _validate_llm_result(parsed)
 
     verify_against_note(parsed, note)
+    if source is not None:
+        verify_against_note(parsed, source)
 
     return parsed

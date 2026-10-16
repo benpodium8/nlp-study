@@ -91,6 +91,8 @@ MODEL_LAYOUT = (
     *FIELD_TITLES.items(),
     ("ManualReviewRequired", "Needs review"),
     ("ManualReviewReason", "Review reasons"),
+    ("InputReduced", "Input shortened"),
+    ("InputReduction", "How the input was shortened"),
     ("LLM_Attempts", "Attempts"),
     ("LLM_Seconds", "Seconds"),
     ("LLM_Error", "Failure reason"),
@@ -110,7 +112,7 @@ assert sorted(field for field, _ in MODEL_LAYOUT + AUDIT_LAYOUT) == sorted(field
 
 # The columns written TRUE or FALSE: the 0/1 flags, and the "true"/"false" review flags.
 FLAG_FIELDS = BOOL_FIELDS | {"LLM_Failed"}
-TEXT_FLAG_FIELDS = {"ManualReviewRequired"}
+TEXT_FLAG_FIELDS = {"ManualReviewRequired", "InputReduced"}
 
 # The title of the column a reader filters or highlights on (the consensus review flag).
 REVIEW_COLUMN = f"Needs human review ({CONSENSUS_LABEL})"
