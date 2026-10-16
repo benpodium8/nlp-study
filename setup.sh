@@ -915,6 +915,9 @@ export NLP_MODELS="${MODELS[*]:-}"
 export NLP_PREFLIGHT="${PREFLIGHT_PY}"
 export NLP_LOG_DIR="${LOG_DIR}"
 export APPTAINER_CACHEDIR="${APPT_CACHE}" APPTAINER_TMPDIR="${APPT_TMP}"
+# stdout is a pipe (setup.sh's tee) or a file (SGE -o), where Python buffers it whole;
+# unbuffered, the preflight and app.py show progress while a model loads instead of going silent.
+export PYTHONUNBUFFERED=1
 EOF
         cat <<'EOF'
 
