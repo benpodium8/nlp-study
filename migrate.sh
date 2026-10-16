@@ -588,7 +588,7 @@ if [[ ${#PRESERVE_REL[@]} -gt 0 && -z "$KEEP_DATA" ]]; then
     done
 fi
 cat <<EOF
-    3. qlogin -q UI -pe smp 8   then   ./setup.sh      # live LLM check on a compute node
+    3. qlogin -q UI-GPU -pe smp 8 -l ngpus=1   then   ./setup.sh      # live LLM check on a GPU node
     4. qsub ~/nlp-study.job --analyze --csv ./notes.csv
 EOF
 [[ ${#WARNINGS[@]} -eq 0 ]] || { printf '\n'; warn "${#WARNINGS[@]} warning(s) above; read them before running setup.sh."; }

@@ -4,7 +4,7 @@
 
 This project is a **local, offline-first clinical note analysis pipeline** that extracts structured data from endoscopy procedure notes with a **local Large Language Model (LLM via Ollama)**.
 
-Notes are loaded from a CSV into a local SQLite database, each note is sent once to each of the three default models (`medgemma:27b`, `gemma4:26b-a4b-it-q4_K_M` and `gpt-oss:20b`, one model at a time), every model's answers are stored next to the note in columns labelled with the model name and context window (`medgemma:27b@8192` and so on), the three answers are consolidated into a cautious consensus block labelled `(consensus)` (a value only where at least two models agree, a review flag wherever they do not), and the results are exported to CSV with the consensus first and every model's answers beside it.
+Notes are loaded from a CSV into a local SQLite database, each note is sent once to each of the three default models (`mistral-small3.2:24b-instruct-2506-q4_K_M`, `gemma4:26b-a4b-it-q4_K_M` and `gpt-oss:20b`, one model at a time), every model's answers are stored next to the note in columns labelled with the model name and context window (`mistral-small3.2:24b-instruct-2506-q4_K_M@8192` and so on), the three answers are consolidated into a cautious consensus block labelled `(consensus)` (a value only where at least two models agree, a review flag wherever they do not), and the results are exported to CSV with the consensus first and every model's answers beside it.
 
 > **Key design goals**
 >
@@ -146,10 +146,10 @@ Install Ollama on Linux or Mac:
 curl -fsSL https://ollama.com/install.sh | sh
 ```
 
-Pull the three models (about 49 GB in all):
+Pull the three models (about 47 GB in all):
 
 ```powershell
-ollama pull medgemma:27b
+ollama pull mistral-small3.2:24b-instruct-2506-q4_K_M
 ollama pull gemma4:26b-a4b-it-q4_K_M
 ollama pull gpt-oss:20b
 ```
@@ -157,7 +157,7 @@ ollama pull gpt-oss:20b
 Every note goes through all three, one model at a time, and each model's answers land in
 their own columns so the three can be compared:
 
-- `medgemma:27b`: MedGemma 27B (Gemma 3 based, Q4_K_M, about 17.4 GB), called with thinking off (`think=False`).
+- `mistral-small3.2:24b-instruct-2506-q4_K_M`: Mistral Small 3.2 24B instruct (dense, Q4_K_M, about 15.2 GB, Apache 2.0), not a reasoning model, called with `think=False`. It replaced `medgemma:27b` on 2026-10-16: on the 275-note sample medgemma failed three times as many notes as either other model, had 157 answers rejected for breaking the quoting rules, and took five times longer per note (`model_candidates.md` section 8).
 - `gemma4:26b-a4b-it-q4_K_M`: Gemma 4 26B mixture of experts (3.8B active, Q4_K_M, about 18.0 GB), thinking off. This exact tag matters: the default `gemma4:26b` tag does not load on Ollama 0.24.0.
 - `gpt-oss:20b`: OpenAI gpt-oss 20B mixture of experts (3.6B active, MXFP4, about 13.8 GB), a reasoning model called with `think="low"` (a boolean `think=False` makes it return nothing).
 
@@ -167,13 +167,15 @@ To match Argon exactly, install Ollama 0.24.0:
 `curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=0.24.0 sh`.
 
 For a workstation test without the large models, `--location local` runs the same pipeline
-with three small stand-ins instead (about 11 GB in all; these need a current Ollama, not 0.24.0):
+with three small stand-ins instead, one per study-model family, each fitting an 8 GB GPU with its 8K cache (about 12 GB of disk in all; these need a current Ollama, 0.30.5 or newer, not 0.24.0):
 
 ```powershell
-ollama pull ministral-3:3b
-ollama pull gemma4:e2b
-ollama pull qwen3.5:4b
+ollama pull ministral-3:3b-instruct-2512-q4_K_M
+ollama pull gemma4:e4b-it-qat
+ollama pull nemotron-3-nano:4b
 ```
+
+`ministral-3:3b-instruct-2512-q4_K_M` (3.0 GB) stands in for Mistral Small 3.2, `gemma4:e4b-it-qat` (6.2 GB, Google's quantization-aware Q4_0 build of Gemma 4 E4B) for Gemma 4 26B A4B, and `nemotron-3-nano:4b` (2.8 GB, a reasoning model run with reasoning off) for gpt-oss, which has no size under 20B. `qwen3.5:4b` and `gemma4:e2b` were replaced on 2026-10-16 (`model_candidates.md` section 8).
 
 Ollama runs locally and does **not** require internet access after model download.
 
@@ -196,7 +198,7 @@ With no options it prints what the program needs (the packages, Ollama and the m
 | `--clean`      | Delete `data.db` (with any SQLite journal files and its backup `data.db.backup`) and the two exports (`output/results.csv`, `output/results-review.csv`) from earlier runs, before anything else. Discards every stored result. Refused while another run holds the database |
 | `--stop-after DURATION` | Stop starting new notes after this long (`23.5`, `23h30m`, `90m`, `5400s`; a bare number is hours; default `NLP_STOP_AFTER`). The note in progress is finished and stored, the consensus rebuilt, and the run exits 2 so the next `--analyze` resumes. For batch jobs: set it below the walltime |
 | `--work-left`  | Read-only: print each model's pending notes and whether the exports exist; exit 0 when `--analyze` has work, 4 when it has none |
-| `--location`   | Which model set to run: `server` (the default) is the three study models; `local` is three small stand-ins (`ministral-3:3b`, `gemma4:e2b`, `qwen3.5:4b`) for a workstation test. Either way each model gets its own labelled columns |
+| `--location`   | Which model set to run: `server` (the default) is the three study models; `local` is three small stand-ins (`ministral-3:3b-instruct-2512-q4_K_M`, `gemma4:e4b-it-qat`, `nemotron-3-nano:4b`) for a workstation test. Either way each model gets its own labelled columns |
 
 ---
 
@@ -261,7 +263,7 @@ While it runs, the program reports what it is doing in two layers.
 
 **The live panel.** In a terminal, a panel at the bottom of the screen (refreshed four times a second, with the log lines scrolling above it) shows the note and attempt in progress, what the model is doing right now (waiting for the first token while the server reads the prompt, thinking, or answering, with the token count and the tokens per second over the last five seconds; its spinner turns faster the more tokens a second arrive, and crawls while none do), the progress bar, the running totals and rates, the time left for the model and for the run, and the field tally. `NLP_PLAIN=1` turns the panel off and gives the heartbeat lines instead.
 
-A workstation test (`--location local`, three small models, three notes, interrupted once and resumed) looks like this in a log. It was recorded on 2026-10-14, when the first stand-in was `gemma3:4b` (replaced by `ministral-3:3b` the same day) and a review reason still said `see LLM_Rejections` (now `see Rejected attempts`); the shape is unchanged:
+A workstation test (`--location local`, three small models, three notes, interrupted once and resumed) looks like this in a log. It was recorded on 2026-10-14, when the stand-ins were `gemma3:4b`, `gemma4:e2b` and `qwen3.5:4b` (since 2026-10-16 they are `ministral-3:3b-instruct-2512-q4_K_M`, `gemma4:e4b-it-qat`, `nemotron-3-nano:4b`) and a review reason still said `see LLM_Rejections` (now `see Rejected attempts`); the shape is unchanged:
 
 ```
 [10:55:21] database  /home/ben/nlp-study/data.db · 0 notes
@@ -345,10 +347,10 @@ Before each model the program checks that Ollama is reachable (otherwise the run
 
 ### Inspecting the Data
 
-The program never prints note text to the terminal. Use `output/results.csv`, or query `data.db` directly. The result columns carry the model label (`LLM_Failed (medgemma:27b@8192)`), so they must be double-quoted in SQL, for example:
+The program never prints note text to the terminal. Use `output/results.csv`, or query `data.db` directly. The result columns carry the model label (`LLM_Failed (mistral-small3.2:24b-instruct-2506-q4_K_M@8192)`), so they must be double-quoted in SQL, for example:
 
 ```bash
-sqlite3 data.db 'select count(*) notes, (select count(*) from results where "LLM_Failed (medgemma:27b@8192)" is not null) done, (select count(*) from results where "LLM_Failed (medgemma:27b@8192)"=1) failed from notes;'
+sqlite3 data.db 'select count(*) notes, (select count(*) from results where "LLM_Failed (mistral-small3.2:24b-instruct-2506-q4_K_M@8192)" is not null) done, (select count(*) from results where "LLM_Failed (mistral-small3.2:24b-instruct-2506-q4_K_M@8192)"=1) failed from notes;'
 ```
 
 ---
@@ -407,7 +409,7 @@ HIPAA:
 Tables:
 
 - `notes` – raw clinical notes
-- `results` – one row per note, with one block of columns per model, each column named `<field> (<model>@<context>)`, for example `ScopeType (medgemma:27b@8192)`: the ten extracted fields, the review columns `ManualReviewRequired` and `ManualReviewReason`, and the debugging columns `LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `LLM_Rejections` and `RawResponse`. The label is the model's full name and the context window it was called with, so two models, or one model at two window sizes, never share a column. The same row also holds the consensus block, labelled `(consensus)`: the ten fields the models agree on, its own `ManualReviewRequired` and `ManualReviewReason`, and `Summary`, `Outcome`, `Answered`, `Models`, `Disputed` and `Agreement` (see `consensus.py` below). These are the storage names; `export.py` writes the table out under plain-words titles (see Output Files)
+- `results` – one row per note, with one block of columns per model, each column named `<field> (<model>@<context>)`, for example `ScopeType (mistral-small3.2:24b-instruct-2506-q4_K_M@8192)`: the ten extracted fields, the review columns `ManualReviewRequired` and `ManualReviewReason`, and the debugging columns `LLM_Failed`, `LLM_Attempts`, `LLM_Seconds`, `LLM_Error`, `LLM_Rejections` and `RawResponse`. The label is the model's full name and the context window it was called with, so two models, or one model at two window sizes, never share a column. The same row also holds the consensus block, labelled `(consensus)`: the ten fields the models agree on, its own `ManualReviewRequired` and `ManualReviewReason`, and `Summary`, `Outcome`, `Answered`, `Models`, `Disputed` and `Agreement` (see `consensus.py` below). These are the storage names; `export.py` writes the table out under plain-words titles (see Output Files)
 
 A `data.db` from before the columns were labelled is converted on startup: its unlabelled columns become the first model's block, since those answers came from that model. A column a block lacks is added on startup (existing rows get an empty value, except the review columns, which are computed for them), a model that has not yet run on the database gets a whole new block, and so does the consensus.
 
@@ -504,7 +506,7 @@ After every model has run, `consolidate` builds a consensus for every note from 
 
 The consensus needs at least two models: a run with one model gets an empty block with `Outcome` `none` on every note.
 
-**Notes too long for the context window are not sent to the model.** Ollama does not refuse an over-long prompt: it keeps a few leading tokens and the tail that fits, silently dropping the instructions and the start of the note, so any answer would be a guess. `data_worker` checks the length first (`llm_analysis.note_fits_context`, a conservative estimate of 3 characters per token plus the prompt overhead) and records such a note with `LLM_Failed = 1`, `LLM_Attempts = 0` and the reason in `LLM_Error`, without a model call. At the default 8192-token window the cut is about 18,000 characters of note; 7 of the 275 sample notes and 111 of the 5,000 corpus notes (about 2%) are longer and are recorded as failed. 8192 is the window at which medgemma:27b and its KV cache fit on Argon's A10; a larger `NLP_CONTEXT_LENGTH` raises the cut but spills the model to the CPU there. The estimate is one tokenizer's ratio, and the study runs three models with different tokenizers, so the server's own counts are checked as well: when the last chunk of a call reports more prompt and answer tokens than the window holds, the model answered from a shifted or cut context, and `llm_analysis` discards that answer and records the note as too long (`PromptCutError`; `LLM_Error` begins the same way as for a note not sent; no retry, since the same prompt would be cut again). A count below the window proves nothing, because a cached prefix may be left out of it, so this never fails a note the server did not count as over.
+**Notes too long for the context window are not sent to the model.** Ollama does not refuse an over-long prompt: it keeps a few leading tokens and the tail that fits, silently dropping the instructions and the start of the note, so any answer would be a guess. `data_worker` checks the length first (`llm_analysis.note_fits_context`, a conservative estimate of 3 characters per token plus the prompt overhead) and records such a note with `LLM_Failed = 1`, `LLM_Attempts = 0` and the reason in `LLM_Error`, without a model call. At the default 8192-token window the cut is about 18,000 characters of note; 7 of the 275 sample notes and 111 of the 5,000 corpus notes (about 2%) are longer and are recorded as failed. 8192 is the study's window, and every model fits Argon's A10 with its 8K cache (it was also the largest window medgemma:27b, replaced on 2026-10-16, fitted in); a larger `NLP_CONTEXT_LENGTH` raises the cut but needs more VRAM for every model. The estimate is one tokenizer's ratio, and the study runs three models with different tokenizers, so the server's own counts are checked as well: when the last chunk of a call reports more prompt and answer tokens than the window holds, the model answered from a shifted or cut context, and `llm_analysis` discards that answer and records the note as too long (`PromptCutError`; `LLM_Error` begins the same way as for a note not sent; no retry, since the same prompt would be cut again). A count below the window proves nothing, because a cached prefix may be left out of it, so this never fails a note the server did not count as over.
 
 ---
 
@@ -512,7 +514,7 @@ The consensus needs at least two models: a run with one model gets an empty bloc
 
 **Purpose:** Writes `output/results.csv`, the human-readable view of the database, and `output/results-review.csv`, its review-sized copy: the same rows with only the identifiers, the consensus block and the note length (columns A to X as in `results.csv`, then the length), about 4% of the size, written from the same pass over the database and write-once together with it, so the full study corpus still opens in Google Sheets
 
-The database keeps machine names (`Endoscopy (medgemma:27b@8192)`, 0/1 flags, `"true"`/`"false"` review flags). `export_results` presents the same data for a researcher in Google Sheets or Excel: every column gets a title in plain words with its source in parentheses (`Upper endoscopy performed (consensus)`, `Scope type (medgemma:27b@8192)`); every yes/no value is written `TRUE` or `FALSE`, which both spreadsheets read as a boolean, so the review queue is highlighted with one rule; the consensus block comes first with its review flag in a fixed position (column G); each model's block follows in the same field order; the bulky audit text (rejected attempts, raw responses) sits at the far right, before the note. Nothing is changed: a cell is empty exactly where the database holds NULL. The layout is three tables at the top of the module (`CONSENSUS_LAYOUT`, `MODEL_LAYOUT`, `AUDIT_LAYOUT`), checked against the database columns on import so a new column cannot go missing from the export. The export line reports the rows, columns and size, and how many rows the review flag marks. `results-csv-guide.md` explains the file to its readers; keep it in step with the layout.
+The database keeps machine names (`Endoscopy (mistral-small3.2:24b-instruct-2506-q4_K_M@8192)`, 0/1 flags, `"true"`/`"false"` review flags). `export_results` presents the same data for a researcher in Google Sheets or Excel: every column gets a title in plain words with its source in parentheses (`Upper endoscopy performed (consensus)`, `Scope type (mistral-small3.2:24b-instruct-2506-q4_K_M@8192)`); every yes/no value is written `TRUE` or `FALSE`, which both spreadsheets read as a boolean, so the review queue is highlighted with one rule; the consensus block comes first with its review flag in a fixed position (column G); each model's block follows in the same field order; the bulky audit text (rejected attempts, raw responses) sits at the far right, before the note. Nothing is changed: a cell is empty exactly where the database holds NULL. The layout is three tables at the top of the module (`CONSENSUS_LAYOUT`, `MODEL_LAYOUT`, `AUDIT_LAYOUT`), checked against the database columns on import so a new column cannot go missing from the export. The export line reports the rows, columns and size, and how many rows the review flag marks. `results-csv-guide.md` explains the file to its readers; keep it in step with the layout.
 
 ---
 
@@ -570,8 +572,8 @@ Key Safeguards:
   0.8 with a repeat penalty of 1.1 and the attempt number as the seed, since a greedy retry
   would repeat the loop
 - Output capped at 2048 tokens (`num_predict`); context window `NLP_CONTEXT_LENGTH` tokens
-  (default 8192, `num_ctx`) on every call, the same as an Argon job. 8192 is what medgemma:27b
-  fits in on the A10 with its KV cache; anything larger spills to the CPU. Notes that do not
+  (default 8192, `num_ctx`) on every call, the same as an Argon job. 8192 is the study's window:
+  every model sees the same notes, and each fits the A10 with its 8K cache. Notes that do not
   fit the window are failed without a model call rather than silently truncated, and an answer
   whose prompt the server itself counted as too long is discarded (see below)
 - Each call and the model load use an HTTP timeout of `NLP_LLM_TIMEOUT` seconds (default 1800):
@@ -581,7 +583,7 @@ Key Safeguards:
 
 Model:
 
-- `MODELS` in `llm_analysis.py` lists the models every note is sent to, in run order, each with its context window and `think` setting: `medgemma:27b` (`LOCAL_MODEL`, MedGemma 27B, thinking off), `gemma4:26b-a4b-it-q4_K_M` (Gemma 4 26B A4B, thinking off) and `gpt-oss:20b` (reasoning at `"low"`). All three use the 8192-token window, so they see the same notes, and their columns are labelled `medgemma:27b@8192`, `gemma4:26b-a4b-it-q4_K_M@8192` and `gpt-oss:20b@8192`. To change the list, edit that block (one `ModelSpec` per line, the name as a quoted literal: `setup.sh` reads it) and pull the models. `LOCAL_MODELS` is the small set that `--location local` runs instead (`ministral-3:3b`, `gemma4:e2b`, `qwen3.5:4b`, about 11 GB in all, all with thinking off and the same window), for exercising the pipeline on a workstation; its columns are labelled `ministral-3:3b@8192` and so on, so a local test never mixes with study results. Study runs use the default, `--location server`
+- `MODELS` in `llm_analysis.py` lists the models every note is sent to, in run order, each with its context window and `think` setting: `mistral-small3.2:24b-instruct-2506-q4_K_M` (`LOCAL_MODEL`, Mistral Small 3.2 24B, no reasoning), `gemma4:26b-a4b-it-q4_K_M` (Gemma 4 26B A4B, thinking off) and `gpt-oss:20b` (reasoning at `"low"`). All three use the 8192-token window, so they see the same notes, and their columns are labelled `mistral-small3.2:24b-instruct-2506-q4_K_M@8192`, `gemma4:26b-a4b-it-q4_K_M@8192` and `gpt-oss:20b@8192`. To change the list, edit that block (one `ModelSpec` per line, the name as a quoted literal: `setup.sh` reads it) and pull the models. `LOCAL_MODELS` is the small set that `--location local` runs instead (`ministral-3:3b-instruct-2512-q4_K_M`, `gemma4:e4b-it-qat`, `nemotron-3-nano:4b`: one per study-model family, about 12 GB in all, each fitting an 8 GB GPU, all with thinking off and the same window), for exercising the pipeline on a workstation; its columns are labelled `ministral-3:3b-instruct-2512-q4_K_M@8192` and so on, so a local test never mixes with study results. Study runs use the default, `--location server`
 
 HIPAA:
 
@@ -635,7 +637,7 @@ Columns, in order (`export.py`):
 
 - the note identifiers, columns A to F: `Note id` (the database row, as the run log names the note), `MRN`, `Encounter`, `NoteCsnID`, `NoteDate`, `NoteType`;
 - the consensus block, columns G to X, every column titled `<what> (consensus)`: `Needs human review` (TRUE or FALSE, column G: the review queue) and `Review reasons`; `Outcome` (`unanimous`, `agreed`, `majority`, `partial`, `none`) and `Models answered`; `Summary`, one line in words of what the consensus found; the ten fields in reading order, `Upper endoscopy performed`, `Scope type`, `Upper endoscopy evidence quote`, `Duodenal biopsies taken`, `Number of duodenal biopsies`, `Duodenal biopsies evidence quote`, `Colonoscopy performed`, `Colonoscopy evidence quote`, `Fellow present`, `Fellow evidence quote`; then `Models consulted`, `Disputed fields` and `How the models voted`;
-- one block of 16 columns per model, in run order, every column titled `<what> (<model>@<context>)`, for example `Scope type (medgemma:27b@8192)`: `Failed`, the same ten fields, the model's own `Needs review` and `Review reasons`, `Attempts`, `Seconds`, `Failure reason`;
+- one block of 16 columns per model, in run order, every column titled `<what> (<model>@<context>)`, for example `Scope type (mistral-small3.2:24b-instruct-2506-q4_K_M@8192)`: `Failed`, the same ten fields, the model's own `Needs review` and `Review reasons`, `Attempts`, `Seconds`, `Failure reason`;
 - every model's `Rejected attempts` and `Raw model response`;
 - `Note length (characters)` and `Note`.
 

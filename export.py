@@ -2,7 +2,7 @@
 Writes output/results.csv: the human-readable export of everything the database holds for
 every note, one row per note, laid out for a researcher reading it in Google Sheets or Excel.
 
-The database keeps the data under machine names ("Endoscopy (medgemma:27b@8192)", 0/1 flags,
+The database keeps the data under machine names ("Endoscopy (mistral-small3.2:24b-instruct-2506-q4_K_M@8192)", 0/1 flags,
 "true"/"false" review flags; database.py). The export presents the same data: every column
 has a title in plain words with its source in parentheses, "(consensus)" or the model's
 label; every yes/no value is written TRUE or FALSE, which both spreadsheets read as a

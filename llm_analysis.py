@@ -4,21 +4,26 @@ import re
 from typing import NamedTuple, Tuple
 import ollama
 
-# MedGemma 27B (Gemma 3 base), Q4_K_M, 17.4 GB. The registry build declares no "requires" and ships
-# no separate projector layer, so it loads on Argon's pinned Ollama 0.24.0 (driver 535).
-# Model blob digest as of 2026-10-13: sha256:4b97da6b21a8fb1405a0d1efee462bfd6c4d3c46307bac8b34373835f07ca758
-LOCAL_MODEL = "medgemma:27b"
+# Mistral Small 3.2 24B instruct (2506), dense, Q4_K_M, 15.2 GB, Apache 2.0; about 17.7 GB on the A10
+# with the 8K KV cache. The registry build declares no "requires" and ships no separate projector
+# layer (vision is merged into the GGUF), and the tag was published in June 2025 for Ollama 0.9 and
+# never re-published, so it passes setup.sh's check and loads on Argon's pinned Ollama 0.24.0
+# (driver 535); its first load on a 0.24.0 build is the preflight's job. It replaced medgemma:27b on
+# 2026-10-16 (model_candidates.md section 8). Model blob digest as of 2026-10-16: sha256:41a5b0c36a28...
+LOCAL_MODEL = "mistral-small3.2:24b-instruct-2506-q4_K_M"
 
 # Where the ollama client connects when OLLAMA_HOST is not set.
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 
 # Context window in tokens, passed on every call so a workstation run uses the same window
 # as an Argon job (setup.sh starts Ollama with OLLAMA_CONTEXT_LENGTH from the same variable).
-# Without it Ollama picks its own default, 4096 on a CPU-only machine. 8192 is the window at
-# which medgemma:27b and its KV cache fit on Argon's A10 (24 GB); anything larger spills the
-# model to the CPU. A note that does not fit this window (about 18,000 characters, roughly 2%
-# of the corpus) is failed without a model call rather than silently truncated (see
-# note_fits_context); raise NLP_CONTEXT_LENGTH only on a GPU with room for the larger cache.
+# Without it Ollama picks its own default, 4096 on a CPU-only machine. 8192 is the study's
+# window: every model is called with it, so they all see the same notes, and each of the three
+# fits Argon's A10 (24 GB) with its 8K KV cache (it was also the largest window medgemma:27b,
+# replaced on 2026-10-16, fitted in). A note that does not fit this window (about 18,000
+# characters, roughly 2% of the corpus) is failed without a model call rather than silently
+# truncated (see note_fits_context); raise NLP_CONTEXT_LENGTH only on a GPU with room for the
+# larger cache of every model.
 CONTEXT_LENGTH = int(os.environ.get("NLP_CONTEXT_LENGTH", "8192"))
 
 
@@ -26,13 +31,13 @@ class ModelSpec(NamedTuple):
     """
     One model the program sends every note to: the Ollama model name, the context window
     (num_ctx) it is called with, and the chat call's think setting. Its label,
-    "<name>@<num_ctx>" such as "medgemma:27b@8192", names the result columns that hold its
+    "<name>@<num_ctx>" such as "gpt-oss:20b@8192", names the result columns that hold its
     answers (database.column_name), so two models, or one model called with two window
     sizes, never share a column.
 
     think goes to Ollama as it is. False turns reasoning off for a model that would otherwise
-    think before answering (Gemma 4) and is accepted for one that cannot think at all
-    (MedGemma; Ollama 0.24.0 rejects think only when it is true for such a model). A level
+    think before answering (Gemma 4, Nemotron 3) and is accepted for one that cannot think at
+    all (Mistral Small; Ollama 0.24.0 rejects think only when it is true for such a model). A level
     ("low", "medium" or "high") is for a reasoning model that returns empty content when
     given a boolean False (gpt-oss on 0.24.0). None leaves the model's own default.
     """
@@ -55,6 +60,12 @@ class ModelSpec(NamedTuple):
 # the first with LOCAL_MODEL and every other with its name as a double-quoted literal first
 # argument (ARGON_RUNBOOK.md 15.2). --location local swaps in LOCAL_MODELS for a workstation test.
 #
+#   mistral-small3.2:24b-instruct-2506-q4_K_M (LOCAL_MODEL)  Mistral Small 3.2 24B instruct, dense,
+#       Q4_K_M, 15.2 GB, Apache 2.0; 17.7 GB loaded with the 8K cache (1.3 GB of KV: 40 layers,
+#       8 KV heads, full attention). Not a reasoning model: think=False is accepted and changes
+#       nothing. Chosen on 2026-10-16 over medgemma:27b, whose answers broke the quoting rules far
+#       more often (157 rejected attempts and 21 notes failed after five attempts on the 275-note
+#       sample, against 27 and 2 for gemma4) and which took five times longer per note.
 #   gemma4:26b-a4b-it-q4_K_M  Gemma 4 26B mixture of experts (3.8B active), Q4_K_M, 18.0 GB,
 #       Apache 2.0. Vision is merged into its GGUF and its config requires only Ollama 0.20,
 #       so it loads on 0.24.0 (the default gemma4:26b tag does not). Blob digest as of
@@ -72,20 +83,30 @@ MODELS = (
 
 # Small stand-ins for a workstation run (--location local): the same pipeline, prompt, window
 # and checks, each model in its own labelled block, so the mechanics can be exercised without
-# the 14 to 18 GB study models. Not fetched by setup.sh; pull them with `ollama pull`. Gemma 4
-# and Qwen 3.5 reason by default, so think=False keeps their answers to the JSON.
+# the 14 to 18 GB study models. One per study-model family, in the same order, so the test
+# exercises the same tokenizers and chat templates: Ministral 3 3B for Mistral Small 3.2,
+# Gemma 4 E4B (Google's quantization-aware Q4_0 build, 6.2 GB) for Gemma 4 26B A4B, and
+# Nemotron 3 Nano 4B, a reasoning model with its reasoning turned off, in gpt-oss's slot
+# (gpt-oss has no size under 20B). Each fits an 8 GB GPU with its 8K cache (about 5.0, 6.7 and
+# 4.2 GB loaded), about 12 GB of disk in all. Not fetched by setup.sh; pull them with
+# `ollama pull`. They need a current Ollama (gemma4:e4b-it-qat requires 0.30.5), not Argon's
+# 0.24.0. Gemma 4 and Nemotron 3 reason by default, so think=False keeps their answers to the
+# JSON. Chosen on 2026-10-16 (model_candidates.md section 8); qwen3.5:4b left because the study
+# excludes models from non-US labs, gemma4:e2b because E4B fits the card too and reads better.
 LOCAL_MODELS = (
-    ModelSpec("ministral-3:3b", CONTEXT_LENGTH),
-    ModelSpec("gemma4:e2b", CONTEXT_LENGTH),
-    ModelSpec("qwen3.5:4b", CONTEXT_LENGTH),
+    ModelSpec("ministral-3:3b-instruct-2512-q4_K_M", CONTEXT_LENGTH),
+    ModelSpec("gemma4:e4b-it-qat", CONTEXT_LENGTH),
+    ModelSpec("nemotron-3-nano:4b", CONTEXT_LENGTH),
 )
 
 # The model set each --location value selects. "server" (the default) is the study set.
 LOCATIONS = {"server": MODELS, "local": LOCAL_MODELS}
 
-# How much of the context window a note may take. Measured with the Gemma 3 tokenizer, which
-# medgemma:27b and gemma3 share: the system prompt and user template take 1,664 tokens, and
-# this clinical text runs 3.2 to 3.8 characters per token. Ollama does not refuse a prompt
+# How much of the context window a note may take. Measured with the Gemma 3 tokenizer (the
+# model of the time, medgemma:27b): the system prompt and user template take 1,664 tokens, and
+# this clinical text runs 3.2 to 3.8 characters per token; the tokenizers in use since (Mistral's
+# Tekken, Gemma 4's, gpt-oss's) are in the same range, and the server's own count is checked
+# after every call (PromptCutError, below). Ollama does not refuse a prompt
 # that exceeds num_ctx: it keeps the first few tokens and the tail that fits, dropping the
 # instructions and the start of the note, and logs "truncating input prompt" only on the
 # server. The estimate is conservative (3 characters per token, room kept for the answer), and

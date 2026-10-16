@@ -13,12 +13,12 @@ removed. What it means for the install:
 
 | Area | September version (`main`) | nlp-study 2.0 |
 | --- | --- | --- |
-| Extraction | spaCy rules (`nlp_analysis.py`) beside one LLM, reconciled by `reconcile_working_results.py` into `final_results`; `display.py` with `--print` | The LLM is the only extractor. Every note goes to three models in turn (`medgemma:27b`, `gemma4:26b-a4b-it-q4_K_M`, `gpt-oss:20b`); every answer is checked against the note (`verify_against_note`) and retried up to five times; `consensus.py` consolidates the three answers into the study's answer with a review flag; `review.py` flags each model's own row |
+| Extraction | spaCy rules (`nlp_analysis.py`) beside one LLM, reconciled by `reconcile_working_results.py` into `final_results`; `display.py` with `--print` | The LLM is the only extractor. Every note goes to three models in turn (`mistral-small3.2:24b-instruct-2506-q4_K_M`, `gemma4:26b-a4b-it-q4_K_M`, `gpt-oss:20b`); every answer is checked against the note (`verify_against_note`) and retried up to five times; `consensus.py` consolidates the three answers into the study's answer with a review flag; `review.py` flags each model's own row |
 | Files removed | `display.py`, `nlp_analysis.py`, `reconcile_working_results.py` | |
 | Files added | | `consensus.py`, `export.py`, `reporter.py`, `review.py`, `migrate.sh`, `tests/test_robustness.py`, `ARGON_RUNBOOK.md`, `BACKLOG.md`, `model_candidates.md`, `results-csv-guide.md`, this guide |
 | Rewritten | | `cli.py` (`--location {server,local}` replaces `--model`; `--clean`; a run header, numbered steps and a closing summary), `data_worker.py` (one model at a time, streamed answers, retries, a stop after three consecutive failed calls), `database.py` (one labelled block of result columns per model, the consensus block, the input contract below), `llm_analysis.py` (the study prompt, JSON-schema output, greedy decoding, the checks against the note, the token-count and timeout guards), `setup.sh` (`ENV_VERSION=2`: image pinned to `ollama/ollama:0.24.0`, model downloads with curl, a lock, a three-model preflight) |
 | Dependencies | `rich`, `click`, `spacy`, `ollama`, unpinned; Python 3.12.13 | `rich==15.0.0`, `ollama==0.6.2` (with `httpx` and `pydantic` as recorded on Argon), wheels only; `.python-version` 3.12.14 |
-| Models on scratch | `gemma4:e2b` (the code later asked for `gemma3:12b`) | The three above, about 49 GB, fetched by `setup.sh` with curl into Ollama's own store layout; the September weights are pruned |
+| Models on scratch | `gemma4:e2b` (the code later asked for `gemma3:12b`) | The three above, about 47 GB, fetched by `setup.sh` with curl into Ollama's own store layout; the September weights are pruned |
 | Input CSV | header exactly `MRN,Encounter,NoteCsnID,NoteDate,NoteType,Note`, UTF-8 without a byte-order mark | header names matched in any case with spaces, underscores, dashes and a byte-order mark ignored; `EncounterID`, `note_csn_id` and the like accepted; bytes that are not UTF-8 replaced and counted; notes of any length; the file is read in batches |
 | Database | `notes`, `working_results`, `final_results` | `notes` (with an index for the duplicate check) and `results`: one block of columns per model plus the consensus block. **The September `data.db` is not read**: its tables are ignored and every note is analysed again, which is why the migration moves it to `preserved/` |
 | Outputs | three CSVs | `output/results.csv` (everything, plain-words titles, TRUE/FALSE values) and `output/results-review.csv` (identifiers, the consensus block and the note length, about 4% of the size), written together and write-once as a pair; `results-csv-guide.md` explains them to the researcher |
@@ -76,7 +76,7 @@ produced what you need, then copy it to durable storage or delete it.
 ```
 
 Writes the venv's dependency stamp (one pip run against the pinned `requirements.txt`),
-pulls the pinned Ollama image, downloads the three models (about 49 GB, resumable,
+pulls the pinned Ollama image, downloads the three models (about 47 GB, resumable,
 checksummed), regenerates the two `$HOME` scripts, and runs the static checks. Allow time
 for the downloads.
 
@@ -94,7 +94,7 @@ accepted as they come.
 ## 6. Prove the models work, then submit
 
 ```bash
-qlogin -q UI -pe smp 8
+qlogin -q UI-GPU -pe smp 8 -l ngpus=1
 ```
 
 ```bash

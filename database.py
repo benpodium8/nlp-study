@@ -74,8 +74,8 @@ CONSENSUS_FIELDS = (
 CONSENSUS_COLUMNS = RESULT_FIELDS + REVIEW_FIELDS + CONSENSUS_FIELDS
 
 # Every model's block is labelled with the model's name and context window, as
-# llm_analysis.ModelSpec.label gives it ("medgemma:27b@8192"): the column that holds a field
-# for that model is named "<field> (<label>)", e.g. "ScopeType (medgemma:27b@8192)". Two
+# llm_analysis.ModelSpec.label gives it ("mistral-small3.2:24b-instruct-2506-q4_K_M@8192"): the column that holds a
+# field for that model is named "<field> (<label>)", e.g. "ScopeType (mistral-small3.2:24b-instruct-2506-q4_K_M@8192)". Two
 # models, or one model called with two window sizes, therefore never share a column. The
 # names contain ':', '@' and spaces, so SQL must double-quote them (quoted()).
 COLUMN_NAME_RE = re.compile(r"^(?P<field>\w+) \((?P<label>.+)\)$")
@@ -405,7 +405,7 @@ def check_and_back_up(db_path: Path, report=print) -> bool:
 
 
 def label_context_length(label: str) -> int | None:
-    """The context window a label records ("medgemma:27b@8192" gives 8192), or None."""
+    """The context window a label records ("mistral-small3.2:24b-instruct-2506-q4_K_M@8192" gives 8192), or None."""
     _, _, ctx = label.rpartition("@")
     return int(ctx) if ctx.isdigit() else None
 

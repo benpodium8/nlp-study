@@ -32,7 +32,7 @@ Run them on a **login node** unless a step says otherwise.
    ```
 
    ```bash
-   qlogin -q UI -pe smp 8
+   qlogin -q UI-GPU -pe smp 8 -l ngpus=1
    ```
 
    ```bash
@@ -49,7 +49,7 @@ Run them on a **login node** unless a step says otherwise.
    | --- | --- |
    | about 12 s | about 19 |
    | about 17 s | about 27 |
-   | 60 s or more | too slow: use the GPU queue (`NLP_JOB_QUEUE=UI-GPU NLP_JOB_GPU=1 ./setup.sh`) or a longer walltime first |
+   | 60 s or more | too slow: the models are not on the GPU (the job requests one by default; read the placement line, and pin a 24 GB card with `NLP_JOB_GPU_TYPE` if a smaller one was given) or set a longer walltime first |
 
    Submitting too many jobs costs almost nothing: a job that finds no work left ends within
    seconds, before it starts Ollama.
@@ -131,13 +131,13 @@ cd /nfsscratch/Users/apkane/nlp-study/repo && source ~/nlp-study-env.sh && pytho
 starting new notes, finishes the one in progress, and ends with:
 
 ```
-STOPPED medgemma:27b@8192 after 4210 of 61,300 notes: the time limit (--stop-after 22:58:12) is reached
+STOPPED mistral-small3.2:24b-instruct-2506-q4_K_M@8192 after 4210 of 61,300 notes: the time limit (--stop-after 22:58:12) is reached
 outcome   paused: the time limit (--stop-after 22:58:12) is reached
 app.py stopped at ... with work left (time limit, or stopped early: see above); every stored result is kept.
 ```
 
 That is expected; the exit status is 2 and the next job in the chain starts. The models run
-one after another over the whole corpus, so the log shows `medgemma:27b` for the first third
+one after another over the whole corpus, so the log shows `mistral-small3.2` for the first third
 or so of the jobs, then `gemma4`, then `gpt-oss`.
 
 ---

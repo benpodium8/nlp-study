@@ -153,7 +153,7 @@ In the consensus block, each evidence quote is the one most models gave for the 
 ### 3.4 Each model's block (16 columns per model)
 
 Every title in a model's block ends in the model's label in parentheses: the model's name and
-the size of the text window it was given, in tokens, for example `(medgemma:27b@8192)`. The
+the size of the text window it was given, in tokens, for example `(mistral-small3.2:24b-instruct-2506-q4_K_M@8192)`. The
 blocks come in the order the models ran. With the three study models the first block is
 columns Y to AN, the second AO to BD, the third BE to BT.
 
@@ -267,7 +267,7 @@ endoscopy with Olympus GIF-H190; 4 duodenal biopsies; fellow present"; L `TRUE`;
 GIF-H190"; N "The patient's esophagus was easily intubated with an Olympus GIF-H190
 endoscope."; O `TRUE`; P `4`; Q "4 biopsies were taken of the duodenum for histopathology.";
 R `FALSE`; S empty; T `TRUE`; U "Teaching Statement: Dr. A was present and actively
-participated in the entire procedure"; V "medgemma:27b@8192; gemma4:26b-a4b-it-q4_K_M@8192;
+participated in the entire procedure"; V "mistral-small3.2:24b-instruct-2506-q4_K_M@8192; gemma4:26b-a4b-it-q4_K_M@8192;
 gpt-oss:20b@8192"; W empty; X "3 of 3 models answered; they agree on every field". Nothing to
 decide.
 
@@ -275,16 +275,16 @@ decide.
 answer given); see How the models voted; note carries a teaching attestation but FellowPresent
 is 0"; I `majority`; J `3`; K "Upper endoscopy with GIF-H 190; 6 duodenal biopsies; no
 fellow"; T `FALSE`; W "FellowPresent (majority answer given)"; X "3 of 3 models answered;
-FellowPresent: 0 (medgemma:27b@8192, gpt-oss:20b@8192), 1 (gemma4:26b-a4b-it-q4_K_M@8192): 0
+FellowPresent: 0 (mistral-small3.2:24b-instruct-2506-q4_K_M@8192, gpt-oss:20b@8192), 1 (gemma4:26b-a4b-it-q4_K_M@8192): 0
 by 2 of 3". Two models said no fellow, one said yes, and the note carries a Teaching
 Statement. Read the attestation in the note (column CB), or the Fellow evidence quote in the
 second model's block, and decide.
 
-**No consensus on a procedure note.** G `TRUE`; H "medgemma:27b@8192, gpt-oss:20b@8192 failed
+**No consensus on a procedure note.** G `TRUE`; H "mistral-small3.2:24b-instruct-2506-q4_K_M@8192, gpt-oss:20b@8192 failed
 on this note (no answer the note supports); see Failure reason; only
 gemma4:26b-a4b-it-q4_K_M@8192 gave an answer the note supports, which is not a consensus; its
 own columns hold that answer"; I `none`; J `1`; K "No consensus: 1 of 3 models answered"; L to
-U empty; X "1 of 3 models answered (medgemma:27b@8192, gpt-oss:20b@8192 failed); no consensus
+U empty; X "1 of 3 models answered (mistral-small3.2:24b-instruct-2506-q4_K_M@8192, gpt-oss:20b@8192 failed); no consensus
 from one model; the note may document a procedure: a procedure note type, upper endoscopy
 wording in the note, gemma4:26b-a4b-it-q4_K_M@8192 found a procedure". Read the second model's
 block for its answer and the other two models' Failure reason for what they got wrong, then
@@ -293,15 +293,15 @@ decide from the note.
 **No consensus, note too long for the window.** F `Progress Notes`; G `TRUE`; H "note too long for the
 context window, so no model read it in full; see each model's Failure reason"; I `none`; J `0`;
 K "No consensus: the note was too long for the context window"; L to U empty; X "0 of 3 models
-answered (medgemma:27b@8192, gemma4:26b-a4b-it-q4_K_M@8192, gpt-oss:20b@8192 failed); no
-consensus; nothing suggests the note documents a procedure, but medgemma:27b@8192,
+answered (mistral-small3.2:24b-instruct-2506-q4_K_M@8192, gemma4:26b-a4b-it-q4_K_M@8192, gpt-oss:20b@8192 failed); no
+consensus; nothing suggests the note documents a procedure, but mistral-small3.2:24b-instruct-2506-q4_K_M@8192,
 gemma4:26b-a4b-it-q4_K_M@8192, gpt-oss:20b@8192 did not read it, so it is flagged". No model
 read this note, so the empty row says nothing about it. Read it yourself; a progress note with
 no procedure wording is usually quick to clear, but the program will not clear it for you,
 because it cannot know what the note holds.
 
 **No consensus, released.** F `Progress Notes`; G `FALSE`; I `none`; J `0`; K "No consensus: 0
-of 3 models answered"; X "0 of 3 models answered (medgemma:27b@8192,
+of 3 models answered"; X "0 of 3 models answered (mistral-small3.2:24b-instruct-2506-q4_K_M@8192,
 gemma4:26b-a4b-it-q4_K_M@8192, gpt-oss:20b@8192 failed); no consensus; not flagged: every model
 read the note, and nothing suggests it documents a procedure: not a procedure note type, no
 upper endoscopy wording in the note and no model found a procedure". Nothing to do: every
@@ -335,8 +335,8 @@ progress note with no procedure wording, so the empty row is the answer.
   on progress notes, consults and discharge documents.
 - **A model's "Needs review" TRUE with column G FALSE is normal.** It says that model needed a
   correction or left a field open; the row is judged on whether the models agree.
-- **The model label is the model's name and its text window.** `medgemma:27b@8192` is the
-  model `medgemma:27b` reading up to 8,192 tokens at a time. Two models, or one model with a
+- **The model label is the model's name and its text window.** `mistral-small3.2:24b-instruct-2506-q4_K_M@8192` is the
+  model `mistral-small3.2:24b-instruct-2506-q4_K_M` reading up to 8,192 tokens at a time. Two models, or one model with a
   different window, never share a column.
 - **The column letters in this guide assume the three study models in their run order and
   no columns inserted.** A run with a different number of models shifts every letter after X.

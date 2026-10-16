@@ -41,8 +41,10 @@
 #     NLP_REQUIRES_VERIFIED="name:tag ..."   models fetched although their config "requires" a newer Ollama than
 #                                    the image, because they are known to load on it (default: gpt-oss:20b)
 #     PIP_INSTALL_ARGS="..."         default: --only-binary=:all:
-#     NLP_JOB_QUEUE=UI NLP_JOB_SLOTS=8 NLP_JOB_HRT=24:00:00 NLP_JOB_GPU=1
-#     NLP_CONTEXT_LENGTH=8192        Ollama context window used by the job (8192 fits medgemma:27b on the A10; larger spills to CPU)
+#     NLP_JOB_QUEUE=UI-GPU NLP_JOB_SLOTS=8 NLP_JOB_HRT=24:00:00   job directives: queue, slots, walltime
+#     NLP_JOB_GPU=1                  the job requests one GPU (#$ -l ngpus=1); 0 for a CPU-only job on a CPU queue
+#     NLP_JOB_GPU_TYPE=<complex>     pin the card type too (#$ -l <complex>, from qconf -sc); unset: any card on the queue
+#     NLP_CONTEXT_LENGTH=8192        Ollama context window used by the job (the study's window; every model fits the A10 with it, a larger one needs more VRAM for each)
 #     NLP_LLM_TIMEOUT=1800           longest silence (seconds) from Ollama in one model call before it counts as a failed call
 #     NLP_HEARTBEAT_SECONDS=60       seconds between the job log's "..." lines during a long model call
 #     NLP_PREFLIGHT_REPS=3 NLP_PREFLIGHT_BUDGET=600   live calls / seconds each
@@ -68,7 +70,15 @@ readonly ENV_SCRIPT="${HOME}/nlp-study-env.sh"
 readonly LOG_DIR="${HOME}/nlp-study-logs"
 SETUP_LOG="${LOG_DIR}/setup-$(date +%Y%m%d-%H%M%S).log"; readonly SETUP_LOG
 readonly PIP_ARGS_DEFAULT="--only-binary=:all:"   # never build sdists: they fail slowly on old toolchains
-readonly JOB_QUEUE="${NLP_JOB_QUEUE:-UI}" JOB_SLOTS="${NLP_JOB_SLOTS:-8}" JOB_HRT="${NLP_JOB_HRT:-24:00:00}"
+readonly JOB_QUEUE="${NLP_JOB_QUEUE:-UI-GPU}" JOB_SLOTS="${NLP_JOB_SLOTS:-8}" JOB_HRT="${NLP_JOB_HRT:-24:00:00}"
+# The job requests a GPU unless NLP_JOB_GPU is 0 or empty: the study models take minutes per note on
+# CPU. NLP_JOB_GPU_TYPE names a card-type complex to pin as well (the models need a 24 GB card; a
+# 16 GB P100 spills them to the CPU). QLOGIN_CMD is the matching interactive request.
+readonly JOB_GPU="${NLP_JOB_GPU-1}" JOB_GPU_TYPE="${NLP_JOB_GPU_TYPE:-}"
+job_wants_gpu() { [[ -n "$JOB_GPU" && "$JOB_GPU" != 0 ]]; }
+QLOGIN_CMD="qlogin -q ${JOB_QUEUE} -pe smp ${JOB_SLOTS}"
+if job_wants_gpu; then QLOGIN_CMD+=" -l ngpus=1"; [[ -z "$JOB_GPU_TYPE" ]] || QLOGIN_CMD+=" -l ${JOB_GPU_TYPE}"; fi
+readonly QLOGIN_CMD
 readonly MODEL_OVERRIDE="${MODEL:-}"
 readonly ENV_VERSION=2                             # bump when the generated scripts change shape
 readonly HAWKID="${USER:-$(id -un)}"               # SGE sets USER; fall back for stripped environments
@@ -354,7 +364,7 @@ refresh_sif_ollama() {
 # (manifests/<host>/<ns>/<name>/<tag> plus blobs/sha256-<hex>), so no Ollama
 # process ever runs on the login node. The manifest is written last: its
 # presence means every blob is complete. Downloads resume after interruption.
-# Names parse as Ollama does: medgemma:27b is registry.ollama.ai/library/medgemma:27b,
+# Names parse as Ollama does: mistral-small3.2:24b-instruct-2506-q4_K_M is registry.ollama.ai/library/mistral-small3.2:24b-instruct-2506-q4_K_M,
 # and hf.co/<user>/<repo>:<quant> is served by Hugging Face over the same protocol.
 model_parts() {
     local ref="${MODEL%%:*}"
@@ -716,7 +726,7 @@ def tier0(repo, models, models_dir):
         if total and too_long:
             warn(f"notes.csv: {too_long} of {total} notes exceed the cut and will be recorded as failed "
                  "(LLM_Attempts 0). Expected at 8192 (about 2% of the corpus); a larger window only "
-                 "helps on a GPU with room for the bigger KV cache, which the A10 does not have with medgemma:27b")
+                 "helps on a GPU with room for the bigger KV cache of every model (gemma4:26b-a4b has about 3.5 GB to spare on the A10)")
         elif total:
             ok(f"notes.csv: all {total} notes fit the context window")
     return mods
@@ -849,7 +859,7 @@ def tier1(mods, models, reps, budget, notes):
             if n > 0:
                 print(f"        {n:>6} notes  ~{total * n / 3600:6.1f} h  (single-threaded, no retries, every model)")
         if total > 60:
-            warn("over a minute per note across the models: use a GPU queue (NLP_JOB_QUEUE=UI-GPU NLP_JOB_GPU=1) or a longer NLP_JOB_HRT")
+            warn("over a minute per note across the models: the models are not on a GPU (read the placement lines; the job requests a GPU by default, NLP_JOB_GPU=1 on NLP_JOB_QUEUE=UI-GPU, and a 16 GB card does not hold them: pin a 24 GB one with NLP_JOB_GPU_TYPE), or set a longer NLP_JOB_HRT")
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -892,12 +902,21 @@ PREFLIGHT_EOF
 # the job script, --preflight and interactive qlogin sessions all source it.
 write_runtime_scripts() {
     local gpu_directives
-    if [[ -n "${NLP_JOB_GPU:-}" ]]; then
-        gpu_directives='#$ -l ngpus=1'$'\n''# To pin a card type add "#$ -l <complex>" (see qconf -sc); the preflight reports whether the model landed on the GPU.'
+    if job_wants_gpu; then
+        gpu_directives='# One GPU (NLP_JOB_GPU=1, the default; 0 drops the request).'$'\n''#$ -l ngpus=1'
+        if [[ -n "$JOB_GPU_TYPE" ]]; then
+            gpu_directives+=$'\n''# Card type pinned (NLP_JOB_GPU_TYPE).'$'\n''#$ -l '"${JOB_GPU_TYPE}"
+        else
+            gpu_directives+=$'\n''# Any card on the queue. The study models need a 24 GB card (the A10 holds each; a 16 GB P100 spills them to'
+            gpu_directives+=$'\n''# the CPU): to pin one, regenerate with NLP_JOB_GPU_TYPE=<complex> (qconf -sc | grep -i gpu lists the complexes).'
+            gpu_directives+=$'\n''# The preflight placement line says whether each model landed on the GPU.'
+        fi
         [[ "$JOB_QUEUE" == *GPU* || "$JOB_QUEUE" == "all.q" ]] \
-            || warn "NLP_JOB_GPU=1 but queue '${JOB_QUEUE}' has no GPUs; the job would never start. Use NLP_JOB_QUEUE=UI-GPU."
+            || warn "the job requests a GPU (NLP_JOB_GPU=${JOB_GPU}, the default) but queue '${JOB_QUEUE}' has no GPUs; it would never start. Use NLP_JOB_QUEUE=UI-GPU, or NLP_JOB_GPU=0 for a CPU-only job."
     else
-        gpu_directives="# No GPU requested. For one, regenerate with: NLP_JOB_QUEUE=UI-GPU NLP_JOB_GPU=1 ${SELF}"
+        gpu_directives="# No GPU requested (NLP_JOB_GPU=0): CPU inference, minutes per note. For a GPU regenerate with: NLP_JOB_GPU=1 NLP_JOB_QUEUE=UI-GPU ${SELF}"
+        [[ "$JOB_QUEUE" != *GPU* ]] \
+            || warn "NLP_JOB_GPU=0 on queue '${JOB_QUEUE}': a CPU-only job on a GPU queue. Set NLP_JOB_QUEUE=UI for CPU work."
     fi
 
     {
@@ -989,7 +1008,7 @@ EOF
         cat <<EOF
 #!/bin/bash
 # Generated by setup.sh on $(date); regenerated on every setup run. Tune the directives
-# through NLP_JOB_QUEUE / NLP_JOB_SLOTS / NLP_JOB_HRT / NLP_JOB_GPU and re-run setup.sh.
+# through NLP_JOB_QUEUE / NLP_JOB_SLOTS / NLP_JOB_HRT / NLP_JOB_GPU / NLP_JOB_GPU_TYPE and re-run setup.sh.
 # Submit:  qsub ${JOB_SCRIPT} --analyze --csv ./notes.csv     (arguments go to app.py)
 #\$ -N nlp-study
 #\$ -q ${JOB_QUEUE}
@@ -1097,7 +1116,7 @@ preflight_next_steps() {
     if [[ "$PREFLIGHT_TIER" -eq 1 ]]; then
         ok "LLM path works end to end on $(hostname). Submit from a login node:  qsub ${JOB_SCRIPT} --analyze --csv ./notes.csv"
     else
-        log "Static checks passed. Prove inference on a compute node:  qlogin -q ${JOB_QUEUE} -pe smp ${JOB_SLOTS}   then   ${SELF}"
+        log "Static checks passed. Prove inference on a compute node:  ${QLOGIN_CMD}   then   ${SELF}"
     fi
 }
 
@@ -1359,7 +1378,7 @@ section "Done"
 if [[ "$PREFLIGHT_TIER" -eq 1 ]]; then
     NEXT_STEP="(done on $(hostname): the live LLM check passed)"
 else
-    NEXT_STEP="qlogin -q ${JOB_QUEUE} -pe smp ${JOB_SLOTS}   then   ${SELF}      # live LLM check on a compute node; do not skip"
+    NEXT_STEP="${QLOGIN_CMD}   then   ${SELF}      # live LLM check on a compute node; do not skip"
 fi
 cat <<EOF
   repo        ${REPO_DIR}
