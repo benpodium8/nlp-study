@@ -10,6 +10,10 @@ be, without losing any finished work.
 This page is the day-to-day procedure. `ARGON_RUNBOOK.md` has the background (section 7.4
 for the time estimates and the safeguards, section 14 for troubleshooting).
 
+If the install on Argon still runs 2.0 (its `data.db` holds a `medgemma:27b` block), migrate it
+to 2.1 first: `migration-procedure.md`. It keeps the stored gemma4 and gpt-oss answers, so the
+chain below only has the new model and the long notes to do.
+
 All commands assume the standard Argon layout: the repository at
 `/nfsscratch/Users/apkane/nlp-study/repo` and job logs in `/Users/apkane/nlp-study-logs/`.
 Run them on a **login node** unless a step says otherwise.

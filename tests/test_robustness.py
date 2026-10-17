@@ -2,8 +2,8 @@
 Checks that the pipeline survives input the sample never showed: CSV files in other
 encodings and header spellings, long or odd fields, scope names and attestation forms from
 a larger corpus, a prompt the server counts as too long, notes too long for the window
-(shortened before sending), and cells a spreadsheet would read
-as formulas. Standard library only; run from the project directory:
+(shortened before sending), cells a spreadsheet would read
+as formulas, and the migration of a 2.0 database (migrate_db.py). Standard library only; run from the project directory:
 
     python -m unittest discover -s tests -v
 """
@@ -20,6 +20,7 @@ import consensus as C  # noqa: E402
 import database as D  # noqa: E402
 import export as E  # noqa: E402
 import llm_analysis as L  # noqa: E402
+import migrate_db as M  # noqa: E402
 import note_shortening as S  # noqa: E402
 import review as R  # noqa: E402
 from data_worker import analyze_note  # noqa: E402
@@ -585,6 +586,71 @@ class LongNoteTests(unittest.TestCase):
             ).fetchall()
             self.assertEqual(rows, [("false", None), ("true", "boilerplate removed; 30,000 to 900 characters")])
             self.assertEqual(E.cell("InputReduced", "true"), "TRUE")
+            conn.close()
+
+
+class MigrationTests(unittest.TestCase):
+    """migrate_db.py on a database shaped as 2.0 left it: medgemma's block first, no InputReduced."""
+
+    RETIRED = "medgemma:27b@8192"
+
+    def make_2_0_db(self, folder: Path) -> Path:
+        path = folder / "data.db"
+        conn = D.create_db(path, [])
+        conn.execute("INSERT INTO notes (id, mrn, encounter, note_csn_id, note_date, note_type, note) "
+                     "VALUES (1, 'a', 'b', 'c', 'd', 'e', 'short note'), (2, 'a', 'b', 'c2', 'd', 'e', 'long note');")
+        fields_2_0 = [f for f in D.RESULTS_COLUMNS if f not in D.INPUT_FIELDS]
+        for label in [self.RETIRED] + [m.label for m in L.MODELS[1:]]:
+            for field, sqltype in fields_2_0:
+                conn.execute(f"ALTER TABLE results ADD COLUMN {D._col(field, label)} {sqltype};")
+        conn.execute("INSERT INTO results (id) VALUES (1), (2);")   # create_db added the consensus block first
+        for label in [self.RETIRED] + [m.label for m in L.MODELS[1:]]:
+            conn.execute(f"UPDATE results SET {D._col('LLM_Failed', label)} = 0, {D._col('LLM_Attempts', label)} = 1 WHERE id = 1;")
+            conn.execute(f"UPDATE results SET {D._col('LLM_Failed', label)} = 1, {D._col('LLM_Attempts', label)} = 0, "
+                         f"{D._col('LLM_Error', label)} = ? WHERE id = 2;", (L.too_long_error("x" * 30000),))
+        conn.execute(f"UPDATE results SET {D._col('Outcome', D.CONSENSUS_LABEL)} = 'unanimous';")
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_a_2_0_database_ends_up_as_a_fresh_2_1_one_lays_it_out(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.make_2_0_db(Path(folder))
+            conn = M.sqlite3.connect(str(path), isolation_level=None)
+            plan = M.Plan(conn, keep_retired=False)
+            self.assertEqual(plan.retired, [self.RETIRED])
+            self.assertEqual({label: ids for label, ids in plan.requeue.items()}, {m.label: [2] for m in L.MODELS[1:]})
+            self.assertTrue(plan.changes and plan.relayout)
+            M.apply(conn, plan)
+            after = M.Plan(conn, keep_retired=False)
+            self.assertFalse(after.changes)
+            conn.close()
+
+            fresh = D.create_db(Path(folder) / "fresh.db", [m.label for m in L.MODELS])
+            migrated = D.create_db(path, [m.label for m in L.MODELS])
+            try:
+                self.assertEqual(D._table_columns(migrated, "results"), D._table_columns(fresh, "results"))
+                labels = [m.label for m in L.MODELS]
+                self.assertEqual([len(D.pending_notes(migrated, label)) for label in labels], [2, 1, 1])
+                kept = migrated.execute(f"SELECT {D._col('LLM_Attempts', labels[1])} FROM results WHERE id = 1;").fetchone()
+                self.assertEqual(kept, (1,))
+                self.assertIsNone(migrated.execute(f"SELECT {D._col('Outcome', D.CONSENSUS_LABEL)} FROM results;").fetchone()[0])
+            finally:
+                fresh.close()
+                migrated.close()
+
+    def test_a_note_2_1_could_not_shorten_is_not_requeued(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.make_2_0_db(Path(folder))
+            conn = M.sqlite3.connect(str(path), isolation_level=None)
+            M.apply(conn, M.Plan(conn, keep_retired=False))
+            label = L.MODELS[1].label
+            conn.execute(f"UPDATE results SET {D._col('LLM_Failed', label)} = 1, {D._col('LLM_Attempts', label)} = 0, "
+                         f"{D._col('LLM_Error', label)} = ?, {D._col('InputReduced', label)} = 'false' WHERE id = 2;",
+                         (L.too_long_error("x" * 30000) + " Shortening found no passage about the study to send.",))
+            conn.execute(f"UPDATE results SET {D._col('Outcome', D.CONSENSUS_LABEL)} = 'none';")
+            plan = M.Plan(conn, keep_retired=False)
+            self.assertFalse(plan.changes)   # nothing requeued, and a current consensus is kept
             conn.close()
 
 

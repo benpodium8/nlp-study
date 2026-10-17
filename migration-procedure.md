@@ -1,95 +1,119 @@
-# Migrating the Argon install to nlp-study 2.0
+# Migrating the Argon install from nlp-study 2.0 to 2.1
 
-One-time procedure for moving `/nfsscratch/Users/apkane/nlp-study/` from the September
-2026 install (built by the `setup.sh` of commits `3657d43` to `1052cdd`; `main` on GitHub
-is at `957c6b8`, 2026-10-13, and still carries that script) to the current version on the
-`nlp-study-2.0` branch. Everything runs on a **login node** unless it says `qlogin`.
-Nothing here starts Ollama.
+One-time procedure for moving `/nfsscratch/Users/apkane/nlp-study/` from 2.0 (`main` at
+`4e50269`, the version that completed the 275-note sample run on 2026-10-15) to 2.1 (branch
+`nlp-study-v2.1`). Everything runs on a **login node** unless it says `qlogin`. Nothing here
+starts Ollama.
+
+An install still on the September 2026 `setup.sh` (no `ENV_VERSION` line in it) must be
+migrated to 2.0 first; `migrate.sh` refuses it and prints the command for the 2.0 script,
+whose procedure is this file at commit `4e50269`.
 
 ## What changes between the two versions
 
-Taken from `git diff main` on 2026-10-15: 24 files, about 8,900 lines added and 2,900
-removed. What it means for the install:
+From `git diff main nlp-study-v2.1`. What it means for the install:
 
-| Area | September version (`main`) | nlp-study 2.0 |
+| Area | 2.0 (`main`) | 2.1 |
 | --- | --- | --- |
-| Extraction | spaCy rules (`nlp_analysis.py`) beside one LLM, reconciled by `reconcile_working_results.py` into `final_results`; `display.py` with `--print` | The LLM is the only extractor. Every note goes to three models in turn (`mistral-small3.2:24b-instruct-2506-q4_K_M`, `gemma4:26b-a4b-it-q4_K_M`, `gpt-oss:20b`); every answer is checked against the note (`verify_against_note`) and retried up to five times; `consensus.py` consolidates the three answers into the study's answer with a review flag; `review.py` flags each model's own row |
-| Files removed | `display.py`, `nlp_analysis.py`, `reconcile_working_results.py` | |
-| Files added | | `consensus.py`, `export.py`, `reporter.py`, `review.py`, `migrate.sh`, `tests/test_robustness.py`, `ARGON_RUNBOOK.md`, `BACKLOG.md`, `model_candidates.md`, `results-csv-guide.md`, this guide |
-| Rewritten | | `cli.py` (`--location {server,local}` replaces `--model`; `--clean`; a run header, numbered steps and a closing summary), `data_worker.py` (one model at a time, streamed answers, retries, a stop after three consecutive failed calls), `database.py` (one labelled block of result columns per model, the consensus block, the input contract below), `llm_analysis.py` (the study prompt, JSON-schema output, greedy decoding, the checks against the note, the token-count and timeout guards), `setup.sh` (`ENV_VERSION=2`: image pinned to `ollama/ollama:0.24.0`, model downloads with curl, a lock, a three-model preflight) |
-| Dependencies | `rich`, `click`, `spacy`, `ollama`, unpinned; Python 3.12.13 | `rich==15.0.0`, `ollama==0.6.2` (with `httpx` and `pydantic` as recorded on Argon), wheels only; `.python-version` 3.12.14 |
-| Models on scratch | `gemma4:e2b` (the code later asked for `gemma3:12b`) | The three above, about 47 GB, fetched by `setup.sh` with curl into Ollama's own store layout; the September weights are pruned |
-| Input CSV | header exactly `MRN,Encounter,NoteCsnID,NoteDate,NoteType,Note`, UTF-8 without a byte-order mark | header names matched in any case with spaces, underscores, dashes and a byte-order mark ignored; `EncounterID`, `note_csn_id` and the like accepted; bytes that are not UTF-8 replaced and counted; notes of any length; the file is read in batches |
-| Database | `notes`, `working_results`, `final_results` | `notes` (with an index for the duplicate check) and `results`: one block of columns per model plus the consensus block. **The September `data.db` is not read**: its tables are ignored and every note is analysed again, which is why the migration moves it to `preserved/` |
-| Outputs | three CSVs | `output/results.csv` (everything, plain-words titles, TRUE/FALSE values) and `output/results-review.csv` (identifiers, the consensus block and the note length, about 4% of the size), written together and write-once as a pair; `results-csv-guide.md` explains them to the researcher |
-| Run time | one model pass | three passes per note; the runbook's open item 7 has the arithmetic (about 20 resubmissions of 24 h at 100,000 notes); resume is automatic and keeps every stored result |
-| Environment variables | | New: `NLP_CONTEXT_LENGTH` (8192), `NLP_LLM_TIMEOUT` (1800), `NLP_HEARTBEAT_SECONDS` (60), `NLP_PLAIN`, `NLP_OLLAMA_IMAGE`, `NLP_REQUIRES_VERIFIED`, the `NLP_JOB_*` family; Appendix A of the runbook lists them |
-| Tests | none | `python -m unittest discover -s tests` from the repo directory (27 cases; no model or server needed) |
+| Models | `medgemma:27b`, `gemma4:26b-a4b-it-q4_K_M`, `gpt-oss:20b` | `mistral-small3.2:24b-instruct-2506-q4_K_M` replaces `medgemma:27b` (on the sample run medgemma failed 28 notes and needed 157 rejected attempts, against 9 and 27 for gemma4, at five times the time per note; `model_candidates.md` section 8). The other two are unchanged |
+| Long notes | a note too long for the 8192-token window (about 18,000 characters; 7 of the 275 sample notes) is recorded as failed for every model without a call | it is shortened (`note_shortening.py`: boilerplate removed, then the relevant sections, then the passages around the study's terms) and the shortened copy is sent; every quote is checked against the full note too. Only a note with no study term left is still failed without a call |
+| Database | one 18-column block per model plus the consensus | two more columns per model, `InputReduced` and `InputReduction`, added by the first run; every other column is unchanged, and so are the prompt and the checks for a note that fits |
+| Outputs | 16 columns per model in `results.csv` (80 columns with three models) | 18 per model (`Input shortened`, `How the input was shortened`; 86 columns). `results-review.csv` is unchanged |
+| Job script | queue `UI`, no GPU unless `NLP_JOB_GPU` was set | queue `UI-GPU` with `#$ -l ngpus=1` by default (`NLP_JOB_GPU=0` for a CPU job; `NLP_JOB_GPU_TYPE` pins a card type) |
+| Image, venv | `ollama/ollama:0.24.0`, pinned `requirements.txt` | the same |
+| Files added | | `note_shortening.py`, `migrate_db.py` (the migration's database step) |
 
-## 1. On your workstation: push the branch
+## What the migration does to the 2.0 data
 
-Commit the working tree yourself and push the branch:
+The 2.0 run is not thrown away. `migrate.sh` keeps every gemma4 and gpt-oss answer, so the
+first 2.1 job has much less to do than a fresh start:
+
+- `data.db` is copied whole to `preserved/migrate-2.1-<timestamp>/data.db` and the copy is
+  checked before anything changes. Then, under the run lock and in one transaction:
+  - the `medgemma:27b@8192` block is removed (it stays in the copy);
+  - the gemma4 and gpt-oss results 2.0 failed as too long without a call are cleared, so 2.1
+    shortens and sends those notes (on the sample: notes 15, 17, 35, 54, 123, 153, 222);
+  - the consensus block is cleared, for `--analyze` to rebuild from the three study models;
+  - the `results` table is rebuilt in the layout a fresh 2.1 database has, the new model's
+    (empty) block first, so `results.csv` has the column letters `results-csv-guide.md` uses.
+    Without this the new model's block would come last.
+- `output/` (the write-once 2.0 exports) is moved to the same `preserved/` directory, so the
+  first 2.1 run writes new ones with the 2.1 columns.
+- `notes.csv` stays where it is.
+- The `medgemma:27b` manifest is removed with the blobs nothing else references (about
+  17 GB); `setup.sh` then downloads `mistral-small3.2` (about 15 GB).
+- A 2.0 `~/nlp-study.job` that requests no GPU is removed, so it cannot be submitted before
+  `setup.sh` writes the 2.1 one.
+
+The first 2.1 job then analyses every note with mistral-small3.2, only the requeued notes
+with gemma4 and gpt-oss, rebuilds the consensus and writes both exports.
+
+## 1. On your workstation: merge and push 2.1
 
 ```bash
-git push origin nlp-study-2.0
+git checkout main && git merge --ff-only nlp-study-v2.1 && git push origin main
 ```
 
-(`main` on GitHub still has the September `setup.sh`. Either merge `nlp-study-2.0` into
-`main` and push, or deploy the branch directly in step 3 with `--branch`.)
+(`main` has no commits that `nlp-study-v2.1` lacks, so this is a fast-forward. To deploy
+the branch without merging, push it with `git push origin nlp-study-v2.1` and add
+`--branch nlp-study-v2.1` to every `migrate.sh` command below.)
 
-## 2. On Argon: get the migration script
+## 2. On Argon: make sure no job is running
 
 ```bash
-cd /nfsscratch/Users/apkane/nlp-study/repo && git fetch origin && git checkout nlp-study-2.0
+qstat -u apkane
 ```
 
-If `main` already carries the new version, `git pull --ff-only` is enough.
+Wait for an `nlp-study` job to finish, or `qdel` it: the migration refuses while one is
+queued or running, because it changes the database the job writes.
 
-## 3. Preview, then migrate
+## 3. Get the migration script
+
+```bash
+cd /nfsscratch/Users/apkane/nlp-study/repo && git pull --ff-only
+```
+
+This brings the checkout to 2.1, with the 2.1 `migrate.sh` and `migrate_db.py`. (The pull
+cannot collide with `notes.csv`, `data.db` or `output/`: git ignores them.) Running the
+2.0 `migrate.sh` instead would do the September clean-up and move `data.db` aside without
+migrating it, so pull first.
+
+## 4. Preview, then migrate
 
 ```bash
 ./migrate.sh --dry-run
 ```
 
-Read the plan. Then:
+Read the plan. The database section should list the three study models, the 7 requeued notes
+for each of gemma4 and gpt-oss, `retire medgemma:27b@8192`, `clear` for the consensus and
+`layout`. Then:
 
 ```bash
 ./migrate.sh
 ```
 
-Type `yes`. It deletes build junk and the September model weights (the `gemma4:e2b`
-manifest and every blob no remaining manifest references), removes the September
-`~/nlp-study.job`, `~/nlp-study-env.sh` and preflight script, moves the old setup
-transcripts into `~/nlp-study-logs/`, and moves `notes.csv`, `data.db` and `output/` to
-`preserved/migrate-<timestamp>/`. Nothing that could be PHI is deleted. The venv and the
-user-built Python are not touched; the September container image is left for `setup.sh`
-to replace.
+Type `yes`. The transcript is in `~/nlp-study-logs/migrate-<timestamp>.log`. The end of it
+says where the 2.0 database and exports went; keep them until a 2.1 run has produced what
+you need, then copy them to durable storage or delete them.
 
-The preserved `data.db` holds the September tables (`working_results`, `final_results`),
-which the new code never reads; keep it with the other preserved data until the new run has
-produced what you need, then copy it to durable storage or delete it.
+Options, if the defaults are not what you want:
 
-## 4. Rebuild what was removed
+| Option | Effect |
+| --- | --- |
+| `--keep-retired` | the medgemma block stays in `data.db`, and `results.csv` shows it as a fourth block after the three study models |
+| `--keep-exports` | `output/` stays in place; 2.1 then writes no new `results.csv` until it is moved aside |
+| `--keep-data` | neither `data.db` nor `output/` is touched: the too-long notes stay failed, and the new model's block lands after the others |
+| `--keep-models` | the medgemma weights stay on scratch |
+
+## 5. Fetch the new model and rewrite the job script
 
 ```bash
 ./setup.sh
 ```
 
-Writes the venv's dependency stamp (one pip run against the pinned `requirements.txt`),
-pulls the pinned Ollama image, downloads the three models (about 47 GB, resumable,
-checksummed), regenerates the two `$HOME` scripts, and runs the static checks. Allow time
-for the downloads.
-
-## 5. Put the input back
-
-Use the `mv` line the migration printed, which looks like:
-
-```bash
-mv /nfsscratch/Users/apkane/nlp-study/preserved/migrate-<timestamp>/notes.csv /nfsscratch/Users/apkane/nlp-study/repo/notes.csv
-```
-
-The file no longer needs its header edited: a byte-order mark and `EncounterID` are
-accepted as they come.
+Re-checks the venv, keeps the pinned image, downloads `mistral-small3.2` (about 15 GB,
+resumable, checksummed), writes the 2.1 `~/nlp-study.job` (queue `UI-GPU`, one GPU) and
+`~/nlp-study-env.sh`, and runs the static checks. It does not touch `data.db`.
 
 ## 6. Prove the models work, then submit
 
@@ -101,31 +125,35 @@ qlogin -q UI-GPU -pe smp 8 -l ngpus=1
 /nfsscratch/Users/apkane/nlp-study/repo/setup.sh && exit
 ```
 
-Wait for `PREFLIGHT PASSED` (tier 1 runs every model on a synthetic note and prints each
-one's placement and seconds per note, then a projection for the real row count), then
-from a login node:
+Wait for `PREFLIGHT PASSED`. This is the first load of `mistral-small3.2` on Ollama 0.24.0,
+so read its placement line (it should be on the GPU, about 17.7 GB) and its seconds per note.
+Then, from a login node:
 
 ```bash
 qsub ~/nlp-study.job --analyze --csv ./notes.csv
 ```
 
-The job ingests `notes.csv` afresh and analyses every note with each model. Expect several
-resubmissions on a large corpus (`qsub ~/nlp-study.job --analyze`, without `--csv`); the
-exports are written by the first run that completes, and must be moved aside to be
-regenerated.
+The notes are already in the database, so the ingest only reports duplicates. The run header
+should show about 275 pending for mistral-small3.2 and 7 for each of the other two models.
 
-Optional, inside the venv on any node: `python -m unittest discover -s tests` runs the
-test battery without a model.
+To check the result, `results.csv` should have 86 columns with the mistral-small3.2 block
+first (columns Y to AP), and each model's `Input shortened` column should be TRUE on the 7
+long notes. Answers carried over from 2.0 have it empty.
 
 ## If something stops it
 
 | Message | Do |
 | --- | --- |
+| `this install predates 2.0` | migrate it to 2.0 first with the command the message prints, then run this procedure |
+| `origin/main ... is still 2.0` | step 1 was not pushed: push it, or pass `--branch nlp-study-v2.1` |
 | `tracked files are modified in the Argon checkout` | `git stash`, or re-run with `./migrate.sh --reset` to discard them |
-| `still carries the September setup.sh` | the branch you are on lacks the rewrite: `./migrate.sh --branch nlp-study-2.0` |
-| `A setup run is active` | wait, or `rm -rf /nfsscratch/Users/apkane/nlp-study/.setup.lock` if you know it is dead |
 | `An nlp-study job is queued or running` | wait for it, or `qdel` it |
+| `a pipeline run holds data.db.lock` | an interactive run is using the database: let it finish |
+| `A setup run is active` | wait, or `rm -rf /nfsscratch/Users/apkane/nlp-study/.setup.lock` if you know it is dead |
+| `the database step needs the venv` | run `./setup.sh` (it does not touch `data.db`), then `./migrate.sh` again |
 
-Re-running `./migrate.sh` is always safe; once migrated it reports nothing to do.
-`./migrate.sh --keep-data` leaves `notes.csv`, `data.db` and `output/` in place
-instead of moving them aside.
+Re-running `./migrate.sh` is always safe: it plans again from what is there, and once the
+install is migrated it reports nothing to do. The database is changed in one transaction
+after its backup, so it is never half 2.0 and half 2.1. To go back, put the copy back:
+`cp /nfsscratch/Users/apkane/nlp-study/preserved/migrate-2.1-<timestamp>/data.db
+/nfsscratch/Users/apkane/nlp-study/repo/data.db` (with 2.0 checked out again).

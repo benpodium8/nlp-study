@@ -42,8 +42,9 @@ Evidence comes from running `nlp_analysis.py` over `samples/notes.csv` (10 notes
 > section 8 is the record: a registry probe of some 40 tags (size, quantization, `requires`, projector, KV cache at 8K), the published
 > evidence, and what was rejected and why. Open: the new study model has not been loaded on Ollama 0.24.0 or run on Argon (`./setup.sh`
 > on a login node fetches it and prunes medgemma; the tier 1 preflight exercises it), and the new stand-ins have not been run on the
-> workstation. An existing `data.db` keeps its medgemma block and gets the new model's block beside it on the next run (its
-> `results.csv` then has four model blocks, medgemma's first, shifting the guide's column letters; a fresh `data.db` avoids that).
+> workstation. The 2.0 `data.db` on Argon no longer needs replacing: `migrate.sh` (2.1, with `migrate_db.py`) removes its medgemma block,
+> requeues the notes 2.0 failed as too long, and lays the table out as a fresh 2.1 one, so `results.csv` keeps the guide's column
+> letters (`migration-procedure.md`; rehearsed on a workstation copy of the sample on 2026-10-16, not yet run on Argon).
 
 ---
 
@@ -240,6 +241,8 @@ Matters more at the full corpus (noted 2026-10-15): a 100,000-note run spans som
 ### B19 (M) No schema migration (do this before B20 and B21, which add columns)
 
 `CREATE TABLE IF NOT EXISTS` (`database.py:126-129`) leaves an old `data.db` with old columns, so any column added by a later fix is silently absent on an existing database and the `INSERT` fails. Fix: a `schema_version` table and `ALTER TABLE ... ADD COLUMN` steps on open.
+
+Partly done: `create_db` adds every missing `results` column on open (since 2026-10-14), and the one change that needs more, the 2.0-to-2.1 move (a retired model's block removed, the table reordered), has its own step, `migrate_db.py`, run by `migrate.sh`, with tests. Still no `schema_version` table: `migrate_db.py` recognises 2.0 data by its shape (no `InputReduced` column or value).
 
 ### B20 (M) `final_results` lacks the fields needed to filter the study cohort
 

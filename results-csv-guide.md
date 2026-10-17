@@ -29,8 +29,8 @@ A row then holds three kinds of information, from left to right:
    majority the field is left empty. Where fewer than two models answered there is no
    consensus: every field is empty, and the row is flagged unless every model read the note
    and nothing in it suggests a procedure (section 4).
-2. **Each model's own answers** (one block of 16 columns per model), with whether it failed,
-   how many attempts it needed and why it failed. These are the evidence behind the consensus.
+2. **Each model's own answers** (one block of 18 columns per model), with whether it failed,
+   whether it was sent a shortened copy of a long note, how many attempts it needed and why it failed. These are the evidence behind the consensus.
 3. **Audit text** (each model's rejected attempts and raw response), the length of the note,
    and the note itself, in the last column.
 
@@ -59,7 +59,7 @@ real yes/no values, so one formatting rule highlights the whole queue.
    "Convert text to numbers, dates and formulas" on, so TRUE and FALSE become yes/no values.
 2. Freeze the header and the identifiers: View, Freeze, 1 row; then click the letter F, View,
    Freeze, Up to column F.
-3. Highlight the queue: Format, Conditional formatting. In "Apply to range" type `A2:CB`
+3. Highlight the queue: Format, Conditional formatting. In "Apply to range" type `A2:CH`
    (every column, from row 2 down; `A2:Y` in results-review.csv). Under "Format rules" choose "Custom formula is" and enter
    `=$G2=TRUE`. Pick a fill colour. Done.
 4. Filter or sort: Data, Create a filter; on column G keep only TRUE. Or sort column G from Z to
@@ -82,7 +82,7 @@ rule `=$G2="TRUE"` works instead; `=OR($G2=TRUE,$G2="TRUE")` works either way.
 Two habits that keep the file usable:
 
 - Record your decisions in **new columns at the far right**, after the last column ("Note",
-  CB, in results.csv; the note length, Y, in results-review.csv), for
+  CH, in results.csv; the note length, Y, in results-review.csv), for
   example "Reviewer decision" and "Reviewer notes". Inserting or deleting columns in the middle
   changes the column letters this guide uses.
 - A cell in Excel holds at most 32,767 characters, and a few notes are longer than that (the
@@ -150,7 +150,7 @@ second column of this table.
 In the consensus block, each evidence quote is the one most models gave for the agreed answer
 (for the biopsy sentence, from a model that also gave the agreed count).
 
-### 3.4 Each model's block (16 columns per model)
+### 3.4 Each model's block (18 columns per model)
 
 Every title in a model's block ends in the model's label in parentheses: the model's name and
 the size of the text window it was given, in tokens, for example `(mistral-small3.2:24b-instruct-2506-q4_K_M@8192)`. The
@@ -159,11 +159,11 @@ columns Y to AP, the second AQ to BH, the third BI to BZ.
 
 | Position | Title | Meaning |
 | --- | --- | --- |
-| 1 | Failed | TRUE when the model gave no answer the note supports after every attempt, when the note was too long to be sent to it, or when the call to the model failed. Its ten fields are then empty. FALSE when its answer was accepted. Empty when the model has not analysed the note (the run was interrupted). |
+| 1 | Failed | TRUE when the model gave no answer the note supports after every attempt, when the note was too long to send even after shortening, or when the call to the model failed. Its ten fields are then empty. FALSE when its answer was accepted. Empty when the model has not analysed the note (the run was interrupted). |
 | 2 to 11 | The ten fields | This model's own answers, in the same order and with the same meanings as in the consensus (section 3.3). |
 | 12 | Needs review | This model's own flag, about how it reached its answer (section 5.2). It does not feed column G: three models agreeing on a grounded answer outweigh one model's bumpy path to it. |
 | 13 | Review reasons | Why, when Needs review is TRUE. |
-| 14 | Input shortened | TRUE when the note was too long for the model's text window (about 18,000 characters) and the model was sent a shortened copy: boilerplate removed, then if still too long only the sections about the procedure, findings, specimens and staff, then if still too long only the lines that mention the study's terms and the lines around them. Every model was sent the same shortened copy, and every quote was checked against the full note. Being shortened does not on its own set Needs review. FALSE when the note was sent whole. Empty for results stored before this column existed. |
+| 14 | Input shortened | TRUE when the note was too long for the model's text window (about 18,000 characters) and the model was sent a shortened copy: boilerplate removed, then if still too long only the sections about the procedure, findings, specimens and staff, then if still too long only the lines that mention the study's terms and the lines around them. Every model was sent the same shortened copy, and every quote was checked against the full note. Being shortened does not on its own set Needs review. FALSE when the note was sent whole. Empty for results stored before this column existed: answers carried over from version 2.0 by the 2.1 migration (none of them is for a note over the window, since 2.0 sent those notes to no model and the migration had them analysed again). |
 | 15 | How the input was shortened | The shortening steps applied and the note's length before and after, e.g. "boilerplate removed, relevant sections kept; 31,204 to 16,880 characters". Empty when Input shortened is FALSE. |
 | 16 | Attempts | How many times the model was asked, 1 to 5. 0 means the note was too long to send even after shortening. |
 | 17 | Seconds | Wall-clock time the model spent on the note, all attempts included. |
@@ -176,12 +176,12 @@ columns Y to AP, the second AQ to BH, the third BI to BZ.
 | Rejected attempts (model) | One line per rejected attempt, "attempt 1: ...", for failed and accepted notes alike, so an answer accepted on the third attempt shows what the first two got wrong. Empty when no attempt was rejected. |
 | Raw model response (model) | The model's text exactly as it returned it (a small block of JSON): the accepted attempt, or the last rejected one when the model failed. |
 
-### 3.6 The note (columns CA and CB)
+### 3.6 The note (columns CG and CH)
 
 | Column | Title | Meaning |
 | --- | --- | --- |
-| CA | Note length (characters) | How long the note is. Notes over about 18,000 characters do not fit the models' text window and are recorded as failed for every model without being sent. |
-| CB | Note | The note, in full, as it was in the input CSV. |
+| CG | Note length (characters) | How long the note is. Notes over about 18,000 characters do not fit the models' text window: they are shortened before they are sent (Input shortened in each model's block), and only a note that cannot be shortened enough is recorded as failed for every model without being sent. |
+| CH | Note | The note, in full, as it was in the input CSV. |
 
 ## 4. The Outcome column
 
@@ -200,7 +200,7 @@ columns Y to AP, the second AQ to BH, the third BI to BZ.
 | Reason, as written | What it means | What to do |
 | --- | --- | --- |
 | `<model> has not analysed this note; run --analyze again` | The run did not finish, so there is nothing to review yet. | Ask for the run to be completed, then regenerate the file. |
-| `note too long for the context window, so no model read it in full; see each model's Failure reason` | The note exceeds what the models can read in one piece (about 18,000 characters), so it was not sent, or a model's own token count showed that the server had cut it: the row is empty because no model read the note in full, not because it holds nothing. | Read the note yourself. |
+| `note too long for the context window, so no model read it in full; see each model's Failure reason` | The note exceeds what the models can read in one piece (about 18,000 characters) and could not be shortened enough to send, or a model's own token count showed that the server had cut it: the row is empty because no model read the note in full, not because it holds nothing. | Read the note yourself. |
 | `the model call failed for every model, so none read the note; see each model's Failure reason` | The server or a model returned an error for every model, so the note was never analysed. | Ask for the models' results on this note to be cleared and the run resumed, or read the note yourself. |
 | `no model gave an answer the note supports; see each model's Failure reason` | Every model read the note and failed: each answer it gave was contradicted by the note's text. Raised only when something suggests the note documents a procedure (section 4); on a note of another type with no procedure wording the row is released instead. | Read the note; the Failure reason of each model shows what it tried to claim. |
 | `no model answered: <models> failed on this note (<why>) and <models> (<why>); see each model's Failure reason` | The models failed in different ways: not sent the note, a failed call, or an answer the note did not support. | As the three rows above, model by model. |
@@ -227,7 +227,7 @@ These describe how one model reached its answer. They do not flag the row.
 | --- | --- |
 | `no answer the note supports; see Failure reason` | Every attempt was rejected because the note did not support it. |
 | `the model call failed; see Failure reason` | The server or the model returned an error. |
-| `note too long for the context window, so the model did not read it in full; see Failure reason` | The note was not sent at all, or it was sent and the server's token count showed it had been cut; Failure reason says which. |
+| `note too long for the context window, so the model did not read it in full; see Failure reason` | The note was not sent at all (too long even after shortening), or it was sent and the server's token count showed it had been cut; Failure reason says which. |
 | `accepted on attempt <n> after <k> rejected answer(s), repetition loops not counted; see Rejected attempts` | The model's first answers were rejected (a quote not in the note, an invented scope name, an unsupported count); the accepted answer passed every check, but only after correction. A retry caused by the model repeating itself is not counted. |
 | `upper endoscopy documented but no scope name found` | This model's answer has an upper endoscopy and no scope. |
 | `duodenal biopsies taken but no count stated` | This model's answer has biopsies taken and no count. |
@@ -255,7 +255,7 @@ A model's Failure reason is the message its last answer was rejected with. The c
 | `NumberOfDuodenalBiopsies is <n>, which is not a plausible number` | A count above 20: some other number from the note. |
 | `the output was not valid JSON` or `... repeated text until it reached the 1000-character limit` | The model's text could not be used; in the second case it was a repetition loop. |
 | `NumberOfDuodenalBiopsies ... is not a number the quoted sentence states` | The count does not match the sentence. |
-| `the note is too long for the model: about <n> prompt tokens ...; no model call was made.` | Not sent. |
+| `the note is too long for the model: about <n> prompt tokens ...; no model call was made. Shortening found no passage about the study to send.` | Not sent: too long, and shortening left nothing about the study (section 3.4, Input shortened). Files from version 2.0 have the first sentence alone, for every note over the window. |
 | `the note is too long for the model: the server counted <n> prompt tokens and <m> answer tokens, more than the ... window holds ...; the answer was discarded.` | Sent, but the model's own token count showed the prompt did not fit together with the answer, so the model lost the instructions; the answer was discarded and the note counts as too long. |
 | `the model repeated itself until Ollama stopped it` | A repetition loop on the last attempt. |
 | `LLM call failed: ...` | The server or model failed; nothing about the note. |
@@ -279,7 +279,7 @@ is 0"; I `majority`; J `3`; K "Upper endoscopy with GIF-H 190; 6 duodenal biopsi
 fellow"; T `FALSE`; W "FellowPresent (majority answer given)"; X "3 of 3 models answered;
 FellowPresent: 0 (mistral-small3.2:24b-instruct-2506-q4_K_M@8192, gpt-oss:20b@8192), 1 (gemma4:26b-a4b-it-q4_K_M@8192): 0
 by 2 of 3". Two models said no fellow, one said yes, and the note carries a Teaching
-Statement. Read the attestation in the note (column CB), or the Fellow evidence quote in the
+Statement. Read the attestation in the note (column CH), or the Fellow evidence quote in the
 second model's block, and decide.
 
 **No consensus on a procedure note.** G `TRUE`; H "mistral-small3.2:24b-instruct-2506-q4_K_M@8192, gpt-oss:20b@8192 failed

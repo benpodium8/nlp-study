@@ -719,14 +719,15 @@ def tier0(repo, models, models_dir):
         source = "from NLP_CONTEXT_LENGTH" if os.environ.get("NLP_CONTEXT_LENGTH") else "the default"
         try:
             cut = int((ctx - llm.ANSWER_RESERVE_TOKENS - llm.PROMPT_OVERHEAD_TOKENS) * llm.NOTE_CHARS_PER_TOKEN)
-            ok(f"num_ctx {ctx} ({source}); notes over about {cut:,} characters are failed without a model call")
+            ok(f"num_ctx {ctx} ({source}); notes over about {cut:,} characters are shortened before sending "
+               "(note_shortening), and failed without a model call only when they cannot be shortened enough")
         except AttributeError:
             ok(f"num_ctx {ctx} ({source})")
         total, too_long = count_notes(repo, fits)
         if total and too_long:
-            warn(f"notes.csv: {too_long} of {total} notes exceed the cut and will be recorded as failed "
-                 "(LLM_Attempts 0). Expected at 8192 (about 2% of the corpus); a larger window only "
-                 "helps on a GPU with room for the bigger KV cache of every model (gemma4:26b-a4b has about 3.5 GB to spare on the A10)")
+            ok(f"notes.csv: {too_long} of {total} notes exceed the cut and will be shortened before sending "
+               "(InputReduced in results.csv). Expected at 8192 (about 2% of the corpus); a larger window only "
+               "helps on a GPU with room for the bigger KV cache of every model (gemma4:26b-a4b has about 3.5 GB to spare on the A10)")
         elif total:
             ok(f"notes.csv: all {total} notes fit the context window")
     return mods
