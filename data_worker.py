@@ -6,6 +6,7 @@ from llm_analysis import (
     CALL_FAILED_PREFIX, MODELS, ModelSpec, llm_analysis, LLMAnalysisError, RetryableLLMError, estimated_prompt_tokens,
     load_model, model_served, note_fits_context, ollama_status, too_long_error,
 )
+from note_shortening import shorten_note
 from reporter import CallProgress, Reporter
 from review import manual_review
 
@@ -33,6 +34,8 @@ class Analysis(NamedTuple):
     brief_error: str | None = None     # error without the rejected value, safe to log (no note text)
     brief_rejections: tuple = ()       # each rejection without its value, safe to log and tally
     note_id: int | None = None
+    sent_note: str | None = None       # the shortened text the model was sent, when the note was too long to send whole
+    input_reduction: str | None = None  # how it was shortened (Shortened.describe), when it was
 
 
 class WorkerOutcome(NamedTuple):
@@ -59,14 +62,23 @@ def analyze_note(
     the review reasons treat the note as one the model never answered.
     Every rejection is kept, so the export shows why an accepted answer needed retries and
     why a failed note failed on each attempt.
-    A note too long for the model's context window is not sent at all (Ollama would silently
-    drop the instructions and the start of the note); it is recorded as failed with 0 attempts.
+    A note too long for the model's context window is never sent whole (Ollama would silently
+    drop the instructions and the start of the note): it is shortened (note_shortening) and
+    the shortened text is sent, the answer checked against both texts; when it cannot be
+    shortened enough it is recorded as failed with 0 attempts. A note that fits is sent as it is.
     call, when given, is fed the streamed response so the reporter can show what the model
     is doing; reporter, when given, logs each retry.
     """
+    sent, source, reduction = note, None, None
     if not note_fits_context(note, model.num_ctx):
-        error = too_long_error(note, model.num_ctx)
-        return Analysis(None, None, 1, 0, error, [], error, (), note_id)
+        shortened = shorten_note(note, model.num_ctx)
+        if shortened is None:
+            error = too_long_error(note, model.num_ctx) + " Shortening found no passage about the study to send."
+            return Analysis(None, None, 1, 0, error, [], error, (), note_id)
+        sent, source, reduction = shortened.text, note, shortened.describe()
+
+    def analysis(*fields) -> Analysis:
+        return Analysis(*fields, note_id, sent if reduction else None, reduction)
 
     rejected = None
     rejections = []
@@ -76,8 +88,9 @@ def analyze_note(
         if call is not None:
             call.start_attempt(attempt)
         try:
-            result, raw_response = llm_analysis(note_id, note, model, attempt, rejected, observer=observer)
-            return Analysis(result, raw_response, 0, attempt, None, rejections, None, tuple(briefs), note_id)
+            extra = {"source": source} if source is not None else {}
+            result, raw_response = llm_analysis(note_id, sent, model, attempt, rejected, observer=observer, **extra)
+            return analysis(result, raw_response, 0, attempt, None, rejections, None, tuple(briefs))
         except RetryableLLMError as e:
             if call is not None:
                 call.end_attempt()
@@ -88,18 +101,18 @@ def analyze_note(
                 if reporter is not None and call is not None:
                     reporter.note_retry(call, attempt, e.brief)
                 continue
-            return Analysis(None, e.raw, 1, attempt, str(e), rejections, e.brief, tuple(briefs), note_id)
+            return analysis(None, e.raw, 1, attempt, str(e), rejections, e.brief, tuple(briefs))
         except LLMAnalysisError as e:
             if call is not None:
                 call.end_attempt()
-            return Analysis(None, None, 1, attempt, str(e), rejections, str(e), tuple(briefs), note_id)
+            return analysis(None, None, 1, attempt, str(e), rejections, str(e), tuple(briefs))
         except KeyboardInterrupt:
             raise
         except Exception as e:
             if call is not None:
                 call.end_attempt()
             error = f"{CALL_FAILED_PREFIX}: {type(e).__name__}: {e}"
-            return Analysis(None, None, 1, attempt, error, rejections, error, tuple(briefs), note_id)
+            return analysis(None, None, 1, attempt, error, rejections, error, tuple(briefs))
 
 
 def data_worker(
@@ -159,23 +172,24 @@ def _run_model(
     """
     rows = pending_notes(conn, model.label)   # (id, length): the text is fetched note by note below
     pending = len(rows)
+    # Notes over the window are shortened and sent (analyze_note), so every pending note counts as one to send.
     too_long = sum(not note_fits_context(length, model.num_ctx) for _, length in rows)
-    run = reporter.begin_model(model, index, count, total_notes, total_notes - pending, pending, too_long)
+    run = reporter.begin_model(model, index, count, total_notes, total_notes - pending, pending, 0)
 
     details = f"{model.name}: {info.describe()}" if info else model.name
     reporter.log(f"[bold]model[/bold]     {details}; context {model.num_ctx:,} tokens; think={model.think!r}")
     plan = f"{total_notes:,} note(s) in the database, {total_notes - pending:,} already analysed with {model.label}, {pending:,} to process"
     if too_long:
         plan += (
-            f" ({pending - too_long:,} to send to the model; too long for the {model.num_ctx:,}-token window, "
-            f"recorded as failed without a call: {too_long:,})"
+            f" ({too_long:,} too long for the {model.num_ctx:,}-token window, to be shortened before "
+            f"sending; see InputReduced)"
         )
     reporter.log(f"[bold]notes[/bold]     {plan}.")
     if pending == 0:
         reporter.model_nothing_to_do()
         return 0, None
 
-    if pending > too_long:
+    if pending:
         reporter.model_loading()
         try:
             loaded = load_model(model)
@@ -198,8 +212,10 @@ def _run_model(
         seconds = round(time.perf_counter() - note_started, 2)
         call.phase = "storing"
         rejections = "\n".join(analysis.rejections) or None
+        # The review judges the text the model was sent: a shortened note fits the window, and
+        # being shortened is not on its own a reason for review (InputReduced records it).
         review_required, review_reason = manual_review(
-            note, analysis.result, analysis.llm_failed, analysis.attempts, analysis.error,
+            analysis.sent_note or note, analysis.result, analysis.llm_failed, analysis.attempts, analysis.error,
             rejections, model.num_ctx,
         )
 
@@ -216,6 +232,7 @@ def _run_model(
             rejections,
             review_required,
             review_reason,
+            analysis.input_reduction,
         )
 
         run.finish_note(analysis, seconds, review_required, review_reason)

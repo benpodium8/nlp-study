@@ -44,6 +44,13 @@ REVIEW_FIELDS = (
     ("ManualReviewReason", "TEXT"),    # every trigger, separated by "; ", when "true"
 )
 
+# Whether the model was sent a shortened note because the stored one is too long for its
+# context window (note_shortening), and how it was shortened. A note that fits is sent whole.
+INPUT_FIELDS = (
+    ("InputReduced", "TEXT"),    # "true" or "false"; null for results stored before the column existed
+    ("InputReduction", "TEXT"),  # the shortening steps and the lengths, when "true"; no note text
+)
+
 # Debugging columns data_worker records for every note next to the extracted fields.
 DEBUG_FIELDS = (
     ("LLM_Failed", "INTEGER"),      # 1 when no attempt gave an answer the note supports (or the call failed); the extracted fields are then null
@@ -56,7 +63,7 @@ DEBUG_FIELDS = (
 
 # The columns one model produces for a note. The results table holds one copy of this block
 # per model, and so does the export.
-RESULTS_COLUMNS = RESULT_FIELDS + REVIEW_FIELDS + DEBUG_FIELDS
+RESULTS_COLUMNS = RESULT_FIELDS + REVIEW_FIELDS + INPUT_FIELDS + DEBUG_FIELDS
 
 # The consensus block (consensus.py) consolidates the models' answers for a note. It is
 # stored and exported under this label, "ScopeType (consensus)" and so on, with the ten
@@ -74,8 +81,8 @@ CONSENSUS_FIELDS = (
 CONSENSUS_COLUMNS = RESULT_FIELDS + REVIEW_FIELDS + CONSENSUS_FIELDS
 
 # Every model's block is labelled with the model's name and context window, as
-# llm_analysis.ModelSpec.label gives it ("medgemma:27b@8192"): the column that holds a field
-# for that model is named "<field> (<label>)", e.g. "ScopeType (medgemma:27b@8192)". Two
+# llm_analysis.ModelSpec.label gives it ("mistral-small3.2:24b-instruct-2506-q4_K_M@8192"): the column that holds a
+# field for that model is named "<field> (<label>)", e.g. "ScopeType (mistral-small3.2:24b-instruct-2506-q4_K_M@8192)". Two
 # models, or one model called with two window sizes, therefore never share a column. The
 # names contain ':', '@' and spaces, so SQL must double-quote them (quoted()).
 COLUMN_NAME_RE = re.compile(r"^(?P<field>\w+) \((?P<label>.+)\)$")
@@ -405,7 +412,7 @@ def check_and_back_up(db_path: Path, report=print) -> bool:
 
 
 def label_context_length(label: str) -> int | None:
-    """The context window a label records ("medgemma:27b@8192" gives 8192), or None."""
+    """The context window a label records ("mistral-small3.2:24b-instruct-2506-q4_K_M@8192" gives 8192), or None."""
     _, _, ctx = label.rpartition("@")
     return int(ctx) if ctx.isdigit() else None
 
@@ -694,6 +701,7 @@ def insert_result(
     rejections: str | None = None,
     review_required: bool = False,
     review_reason: str | None = None,
+    input_reduction: str | None = None,
 ):
     """
     Stores one note's analysis by one model, with its review and debugging columns, in the
@@ -713,9 +721,12 @@ def insert_result(
         rejections: Why each rejected attempt was rejected, one per line, else None.
         review_required: Whether a human should look at this row (review.manual_review).
         review_reason: Why, when review_required; else None.
+        input_reduction: How the note was shortened before it was sent
+            (note_shortening.Shortened.describe), or None when it was sent whole.
     """
     extracted = tuple(result.get(name) if result else None for name, _ in RESULT_FIELDS)
     review = ("true" if review_required else "false", review_reason)
+    reduced = ("true" if input_reduction else "false", input_reduction)
     debug = {
         "LLM_Failed": llm_failed,
         "LLM_Attempts": attempts,
@@ -724,7 +735,7 @@ def insert_result(
         "LLM_Rejections": rejections,
         "RawResponse": raw_response,
     }
-    values = (*extracted, *review, *(debug[name] for name, _ in DEBUG_FIELDS))
+    values = (*extracted, *review, *reduced, *(debug[name] for name, _ in DEBUG_FIELDS))
 
     with conn:
         _write_block(conn, id, label, RESULTS_COLUMNS, values)

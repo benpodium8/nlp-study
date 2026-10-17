@@ -1,11 +1,13 @@
 """
 Checks that the pipeline survives input the sample never showed: CSV files in other
 encodings and header spellings, long or odd fields, scope names and attestation forms from
-a larger corpus, a prompt the server counts as too long, and cells a spreadsheet would read
-as formulas. Standard library only; run from the project directory:
+a larger corpus, a prompt the server counts as too long, notes too long for the window
+(shortened before sending), cells a spreadsheet would read
+as formulas, and the migration of a 2.0 database (migrate_db.py). Standard library only; run from the project directory:
 
     python -m unittest discover -s tests -v
 """
+import json
 import sys
 import tempfile
 import unittest
@@ -18,6 +20,8 @@ import consensus as C  # noqa: E402
 import database as D  # noqa: E402
 import export as E  # noqa: E402
 import llm_analysis as L  # noqa: E402
+import migrate_db as M  # noqa: E402
+import note_shortening as S  # noqa: E402
 import review as R  # noqa: E402
 from data_worker import analyze_note  # noqa: E402
 
@@ -450,6 +454,204 @@ class ResumeSafetyTests(unittest.TestCase):
         self.assertEqual(parse_duration("1d"), 86400)
         with self.assertRaises(Exception):
             parse_duration("soon")
+
+
+LONG_FILLER = "Current Medications:\n" + "\n".join(f"- drug{i} 10 mg tablet, take one daily" for i in range(500))
+LONG_BODY = (
+    "Procedure: EGD\nInstrument: Olympus GIF-H190\n"
+    "Findings: Biopsies were taken from the duodenal bulb x2 and D2 x4.\n"
+    "Attestation: I was present for the entire procedure. Dr. Smith, GI fellow, assisted.\n"
+)
+LONG_NOTE = "PROCEDURE NOTE\n" + LONG_FILLER + "\n\nAllergies: penicillin\n\n" + LONG_BODY
+
+
+class LongNoteTests(unittest.TestCase):
+    """Notes over the context window are shortened and sent; notes that fit are untouched."""
+
+    def capture(self, note, specs):
+        """Runs analyze_note for each spec with a fake model call; returns (analyses, calls as (text, kwargs))."""
+        import data_worker as W
+        calls = []
+        saved = W.llm_analysis
+
+        def fake(id, text, model, attempt, rejected, observer=None, **kwargs):
+            calls.append((text, kwargs))
+            return answer(id=id), "{}"
+
+        W.llm_analysis = fake
+        try:
+            return [W.analyze_note(1, note, spec) for spec in specs], calls
+        finally:
+            W.llm_analysis = saved
+
+    def test_a_note_that_fits_is_sent_as_it_is(self):
+        note = "  Procedure:   EGD.\n\n\n\nMedications: aspirin  "
+        self.assertTrue(L.note_fits_context(note))
+        (analysis,), calls = self.capture(note, [L.ModelSpec("a", 8192)])
+        self.assertEqual(calls, [(note, {})])
+        self.assertIsNone(analysis.sent_note)
+        self.assertIsNone(analysis.input_reduction)
+
+    def test_a_long_note_is_shortened_the_same_way_for_every_model(self):
+        self.assertFalse(L.note_fits_context(LONG_NOTE))
+        specs = [L.ModelSpec("a", 8192), L.ModelSpec("b", 8192), L.ModelSpec("c", 8192)]
+        analyses, calls = self.capture(LONG_NOTE, specs)
+        sent = {text for text, _ in calls}
+        self.assertEqual(len(sent), 1)
+        text = sent.pop()
+        self.assertTrue(L.note_fits_context(text))
+        self.assertIn("Biopsies were taken from the duodenal bulb x2 and D2 x4.", text)
+        self.assertIn("Dr. Smith, GI fellow, assisted.", text)
+        self.assertNotIn("drug1", text)
+        self.assertTrue(all(kwargs == {"source": LONG_NOTE} for _, kwargs in calls))
+        self.assertEqual({a.input_reduction for a in analyses}, {S.shorten_note(LONG_NOTE, 8192).describe()})
+        self.assertTrue(analyses[0].input_reduction.startswith(S.STEP_BOILERPLATE + ";"))
+
+    def test_shortening_alone_does_not_flag_the_note_for_review(self):
+        (analysis,), _ = self.capture(LONG_NOTE, [L.ModelSpec("a", 8192)])
+        required, reason = R.manual_review(analysis.sent_note, analysis.result, 0, 1, None, None, 8192)
+        self.assertEqual((required, reason), (False, None))
+
+    def test_boilerplate_with_a_study_term_is_kept(self):
+        text = S.remove_boilerplate("Medications: aspirin\nPast Medical History: prior EGD with duodenal biopsies\nFindings: normal")
+        self.assertNotIn("aspirin", text)
+        self.assertIn("duodenal biopsies", text)
+
+    def test_steps_run_in_order_until_the_note_fits(self):
+        filler = "\n".join(f"Section {i}: routine narrative text about the visit, nothing else here." for i in range(400))
+        note = "Medications: aspirin\n" + filler + "\n" + LONG_BODY
+        shortened = S.shorten_note(note, 8192)
+        self.assertEqual(shortened.steps, (S.STEP_BOILERPLATE, S.STEP_SECTIONS))
+        self.assertIn(S.GAP, shortened.text)
+        self.assertNotIn("Section 3:", shortened.text)
+
+        prose = ("Routine narrative text about the visit with nothing of interest in it. " * 20 + "\n") * 60
+        note = prose + "Six biopsies were taken from the duodenum.\n" + prose
+        shortened = S.shorten_note(note, 8192)
+        self.assertEqual(shortened.steps, (S.STEP_BOILERPLATE, S.STEP_KEYWORDS))
+        self.assertIn("Six biopsies were taken from the duodenum.", shortened.text)
+        self.assertTrue(L.note_fits_context(shortened.text))
+
+    def test_a_long_note_without_study_terms_is_still_not_sent(self):
+        note = "Routine narrative text about the visit. " * 2000
+        (analysis,), calls = self.capture(note, [L.ModelSpec("a", 8192)])
+        self.assertEqual(calls, [])
+        self.assertEqual((analysis.llm_failed, analysis.attempts), (1, 0))
+        self.assertEqual(L.failure_kind(analysis.error), L.NOT_SENT)
+
+    def test_a_quote_across_a_gap_is_rejected(self):
+        source = "The esophagus was intubated\n" + "Unrelated line.\n" * 5 + "with an Olympus XP180 endoscope."
+        sent = "The esophagus was intubated\n[...]\nwith an Olympus XP180 endoscope."
+        quote = "The esophagus was intubated with an Olympus XP180 endoscope."
+        raw = json.dumps(answer(Endoscopy=1, EndoscopyInformation=quote))
+        self.assertEqual(L._parse_and_check(1, sent, raw)["Endoscopy"], 1)
+        with self.assertRaises(L.RetryableLLMError):
+            L._parse_and_check(1, sent, raw, source)
+
+    def test_flattened_notes_have_their_headers_found(self):
+        # The corpus export turned line breaks into runs of spaces; no stored note has a newline.
+        exam = "    ".join(f"{system}: normal, no distress noted on today's exam" for system in ("HEENT", "NEURO", "SKIN", "LUNGS"))
+        note = (
+            "PROGRESS NOTE    HISTORY OF PRESENT ILLNESS: presents with abdominal pain, present on admission.  "
+            "Medications: vitamin D3 1000 units daily    PHYSICAL EXAM:  " + exam + "    "
+            "PROCEDURE: EGD with biopsies of the duodenum x4.    TEACHING STATEMENT: Dr. A was not present but immediately available."
+        )
+        text = S.remove_boilerplate(note)
+        self.assertNotIn("abdominal pain", text)   # the header's own "present" does not protect the section
+        self.assertNotIn("vitamin D3", text)       # nor does the vitamin
+        self.assertNotIn("HEENT", text)
+        self.assertIn("PROCEDURE: EGD with biopsies of the duodenum x4.", text.split("\n"))
+        self.assertIn("immediately available", S.keep_relevant_sections(text))
+
+    def test_step_three_takes_procedure_lines_before_staff_lines(self):
+        procedure = "EGD with biopsies of the duodenum x4."
+        staff = "The attending was present for the procedure."
+        filler = ["Routine narrative text about the visit."] * 3
+        text = "\n".join([staff, *filler, procedure, *filler])
+        real = S.max_note_chars
+        S.max_note_chars = lambda context_length: len(procedure) + 10
+        try:
+            self.assertEqual(S.keep_keyword_passages(text, 8192), S.GAP + "\n" + procedure)
+        finally:
+            S.max_note_chars = real
+
+    def test_input_reduced_is_stored_and_exported(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conn = D.create_db(Path(folder) / "t.db", ["a@8192"])
+            conn.execute("INSERT INTO notes (id, note) VALUES (1, 'x'), (2, 'y');")
+            D.insert_result(conn, 1, "a@8192", answer(id=1), "{}", 0, 1, 1.0, None)
+            D.insert_result(conn, 2, "a@8192", answer(id=2), "{}", 0, 1, 1.0, None, input_reduction="boilerplate removed; 30,000 to 900 characters")
+            rows = conn.execute(
+                f"SELECT {D.quoted('InputReduced (a@8192)')}, {D.quoted('InputReduction (a@8192)')} FROM results ORDER BY id"
+            ).fetchall()
+            self.assertEqual(rows, [("false", None), ("true", "boilerplate removed; 30,000 to 900 characters")])
+            self.assertEqual(E.cell("InputReduced", "true"), "TRUE")
+            conn.close()
+
+
+class MigrationTests(unittest.TestCase):
+    """migrate_db.py on a database shaped as 2.0 left it: medgemma's block first, no InputReduced."""
+
+    RETIRED = "medgemma:27b@8192"
+
+    def make_2_0_db(self, folder: Path) -> Path:
+        path = folder / "data.db"
+        conn = D.create_db(path, [])
+        conn.execute("INSERT INTO notes (id, mrn, encounter, note_csn_id, note_date, note_type, note) "
+                     "VALUES (1, 'a', 'b', 'c', 'd', 'e', 'short note'), (2, 'a', 'b', 'c2', 'd', 'e', 'long note');")
+        fields_2_0 = [f for f in D.RESULTS_COLUMNS if f not in D.INPUT_FIELDS]
+        for label in [self.RETIRED] + [m.label for m in L.MODELS[1:]]:
+            for field, sqltype in fields_2_0:
+                conn.execute(f"ALTER TABLE results ADD COLUMN {D._col(field, label)} {sqltype};")
+        conn.execute("INSERT INTO results (id) VALUES (1), (2);")   # create_db added the consensus block first
+        for label in [self.RETIRED] + [m.label for m in L.MODELS[1:]]:
+            conn.execute(f"UPDATE results SET {D._col('LLM_Failed', label)} = 0, {D._col('LLM_Attempts', label)} = 1 WHERE id = 1;")
+            conn.execute(f"UPDATE results SET {D._col('LLM_Failed', label)} = 1, {D._col('LLM_Attempts', label)} = 0, "
+                         f"{D._col('LLM_Error', label)} = ? WHERE id = 2;", (L.too_long_error("x" * 30000),))
+        conn.execute(f"UPDATE results SET {D._col('Outcome', D.CONSENSUS_LABEL)} = 'unanimous';")
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_a_2_0_database_ends_up_as_a_fresh_2_1_one_lays_it_out(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.make_2_0_db(Path(folder))
+            conn = M.sqlite3.connect(str(path), isolation_level=None)
+            plan = M.Plan(conn, keep_retired=False)
+            self.assertEqual(plan.retired, [self.RETIRED])
+            self.assertEqual({label: ids for label, ids in plan.requeue.items()}, {m.label: [2] for m in L.MODELS[1:]})
+            self.assertTrue(plan.changes and plan.relayout)
+            M.apply(conn, plan)
+            after = M.Plan(conn, keep_retired=False)
+            self.assertFalse(after.changes)
+            conn.close()
+
+            fresh = D.create_db(Path(folder) / "fresh.db", [m.label for m in L.MODELS])
+            migrated = D.create_db(path, [m.label for m in L.MODELS])
+            try:
+                self.assertEqual(D._table_columns(migrated, "results"), D._table_columns(fresh, "results"))
+                labels = [m.label for m in L.MODELS]
+                self.assertEqual([len(D.pending_notes(migrated, label)) for label in labels], [2, 1, 1])
+                kept = migrated.execute(f"SELECT {D._col('LLM_Attempts', labels[1])} FROM results WHERE id = 1;").fetchone()
+                self.assertEqual(kept, (1,))
+                self.assertIsNone(migrated.execute(f"SELECT {D._col('Outcome', D.CONSENSUS_LABEL)} FROM results;").fetchone()[0])
+            finally:
+                fresh.close()
+                migrated.close()
+
+    def test_a_note_2_1_could_not_shorten_is_not_requeued(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.make_2_0_db(Path(folder))
+            conn = M.sqlite3.connect(str(path), isolation_level=None)
+            M.apply(conn, M.Plan(conn, keep_retired=False))
+            label = L.MODELS[1].label
+            conn.execute(f"UPDATE results SET {D._col('LLM_Failed', label)} = 1, {D._col('LLM_Attempts', label)} = 0, "
+                         f"{D._col('LLM_Error', label)} = ?, {D._col('InputReduced', label)} = 'false' WHERE id = 2;",
+                         (L.too_long_error("x" * 30000) + " Shortening found no passage about the study to send.",))
+            conn.execute(f"UPDATE results SET {D._col('Outcome', D.CONSENSUS_LABEL)} = 'none';")
+            plan = M.Plan(conn, keep_retired=False)
+            self.assertFalse(plan.changes)   # nothing requeued, and a current consensus is kept
+            conn.close()
 
 
 if __name__ == "__main__":

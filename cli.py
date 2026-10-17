@@ -405,24 +405,27 @@ def run_header(reporter: Reporter, conn, args, models: tuple[ModelSpec, ...], st
 def work_plan(reporter: Reporter, conn, models: tuple[ModelSpec, ...]) -> dict:
     """
     What --analyze has to do: each model's pending notes (and how many of them are too long
-    to send), with the model's own time per note from stored results when it has enough.
+    for the window and will be shortened before sending), with the model's own time per note from stored results when it has enough.
     Logged as one line and handed to the reporter for the run-level estimate.
     """
     plan = {}
+    shortened = {}
     for model in models:
         rows = pending_notes(conn, model.label)
         too_long = sum(not note_fits_context(length, model.num_ctx) for _, length in rows)
         stats = model_statistics(conn, model.label)
         stored = stats.mean_seconds if stats and len(stats.seconds) >= STORED_RATE_MIN_NOTES else None
-        plan[model.label] = ModelPlan(len(rows), too_long, stored)
+        # A note over the window is shortened and sent (note_shortening), so it is a call too.
+        plan[model.label] = ModelPlan(len(rows), 0, stored)
+        shortened[model.label] = too_long
     reporter.set_plan(plan)
 
     parts = []
     total_sent = 0
     for label, item in plan.items():
         text = f"{escape(label)} {item.pending:,} pending"
-        if item.too_long:
-            text += f" ({item.too_long:,} too long to send)"
+        if shortened[label]:
+            text += f" ({shortened[label]:,} to shorten before sending)"
         if item.stored_mean is not None:
             text += f", {item.stored_mean:.1f}s per note so far"
         parts.append(text)
@@ -444,7 +447,7 @@ def ingest_summary_lines(reporter: Reporter, summary, models: tuple[ModelSpec, .
         if over:
             reporter.warn(
                 f"too long for the {window:,}-token context window (more than {limit:,} characters), "
-                f"to be recorded as failed without a model call: {over:,} of the {plural(summary.new, 'new note')}"
+                f"to be shortened before sending (InputReduced): {over:,} of the {plural(summary.new, 'new note')}"
             )
 
 
